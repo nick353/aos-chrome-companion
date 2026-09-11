@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "aos-chrome-companion": {
+      "command": "node",
+      "args": [
+        "scripts/start-mcp.mjs"
+      ],
+      "cwd": ".",
+      "env": {
+        "AOS_CHROME_COMPANION_ROOT": ""
+      },
+      "enabled": true,
+      "startup_timeout_sec": 15,
+      "tool_timeout_sec": 90
+    }
+  }
+}

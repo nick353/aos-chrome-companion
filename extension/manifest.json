@@ -1,0 +1,39 @@
+{
+  "manifest_version": 3,
+  "name": "AOS Chrome Companion",
+  "version": "0.3.2",
+  "description": "Stable exact-tab Chrome execution for Codex and Automation OS.",
+  "minimum_chrome_version": "120",
+  "permissions": [
+    "alarms",
+    "debugger",
+    "nativeMessaging",
+    "offscreen",
+    "scripting",
+    "storage",
+    "tabs",
+    "tabGroups",
+    "sidePanel"
+  ],
+  "optional_permissions": [
+    "downloads",
+    "clipboardRead",
+    "clipboardWrite",
+    "history",
+    "bookmarks"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "service-worker.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "AOS Chrome Companion",
+    "default_popup": "popup.html"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  }
+}

@@ -1,0 +1,10 @@
+<!doctype html>
+<html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Companion</title><link rel="stylesheet" href="sidepanel.css"></head>
+<body><main>
+<header><span class="mark">C</span><div><h1>Companion</h1><p id="connection" role="status">接続を確認しています</p></div><button id="refresh" class="quiet" aria-label="最新の状態を表示">更新</button></header>
+<section class="control"><div class="eyebrow">ブラウザの操作</div><h2 id="activity">操作を受け付けています</h2><p id="pause-note">一時停止しても、ページと入力内容はそのまま残ります。</p><button id="pause" class="primary">新しい操作を一時停止</button></section>
+<section><h2>このサイト</h2><p id="site" class="site">表示中のサイトを確認しています</p><button id="site-toggle" class="secondary">このサイトへのアクセスを停止</button><details><summary>停止したサイト</summary><ul id="blocked-sites" class="sites"></ul></details></section>
+<section><div class="row"><h2>最近の操作</h2><button id="clear" class="quiet">表示を消去</button></div><ol id="operations" class="operations"><li class="empty">まだ操作はありません</li></ol></section>
+<section><h2>Codexへ文脈を渡す</h2><p>ページ内で文章を選択してから取得します。コピーした文脈を、Codexの元のタスクに貼り付けて続けられます。</p><button id="context" class="secondary">ページと選択文を取得</button><textarea id="context-text" aria-label="Codexへ渡す文脈" readonly placeholder="取得したページと選択文が表示されます"></textarea><button id="copy" class="secondary" disabled>文脈をコピー</button><p id="context-status" role="status"></p></section>
+<footer><details><summary>履歴・ブックマークへのアクセス</summary><p>必要な機能だけを許可できます。検索結果のコピーはCompanionに保存しません。</p><button id="history-access" class="secondary">履歴検索を許可</button><button id="bookmarks-access" class="secondary">ブックマークを許可</button></details><details><summary>保存される情報</summary><p>一時停止とサイト設定はこのプロファイルに保存します。操作の表示は最大32件で、拡張機能の再起動で消去されます。ページ本文・入力値・クリップボードの内容は操作の表示に保存しません。</p></details><p id="error" role="alert"></p></footer>
+</main><script src="sidepanel.js" type="module"></script></body></html>

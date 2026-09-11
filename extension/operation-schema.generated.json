@@ -1,0 +1,532 @@
+{
+  "schema": "aos.chrome_companion.operation_schema.v1",
+  "version": 1,
+  "schemaDigest": "4975f94895d5bcd43d08fe51e7b9b5b13c55da5ba27c24831836501b0360f04d",
+  "methods": [
+    {
+      "method": "extension.reload",
+      "targetScoped": false,
+      "mutation": true,
+      "profileGlobal": true
+    },
+    {
+      "method": "tabs.list",
+      "targetScoped": false,
+      "mutation": false,
+      "profileGlobal": false
+    },
+    {
+      "method": "tabs.get",
+      "targetScoped": true,
+      "mutation": false,
+      "profileGlobal": false
+    },
+    {
+      "method": "tabs.create",
+      "targetScoped": false,
+      "mutation": true,
+      "profileGlobal": true
+    },
+    {
+      "method": "tabs.close",
+      "targetScoped": true,
+      "mutation": true,
+      "profileGlobal": false
+    },
+    {
+      "method": "tabs.activate",
+      "targetScoped": true,
+      "mutation": true,
+      "profileGlobal": true
+    },
+    {
+      "method": "tabs.navigate",
+      "targetScoped": true,
+      "mutation": true,
+      "profileGlobal": false
+    },
+    {
+      "method": "tabs.back",
+      "targetScoped": true,
+      "mutation": true,
+      "profileGlobal": true
+    },
+    {
+      "method": "tabs.forward",
+      "targetScoped": true,
+      "mutation": true,
+      "profileGlobal": true
+    },
+    {
+      "method": "tabs.reload",
+      "targetScoped": true,
+      "mutation": true,
+      "profileGlobal": true
+    },
+    {
+      "method": "tabs.groupTask",
+      "targetScoped": true,
+      "mutation": true,
+      "profileGlobal": true
+    },
+    {
+      "method": "tabs.configure",
+      "targetScoped": true,
+      "mutation": true,
+      "profileGlobal": true
+    },
+    {
+      "method": "page.configureViewport",
+      "targetScoped": true,
+      "mutation": true,
+      "profileGlobal": true
+    },
+    {
+      "method": "page.bookmark",
+      "targetScoped": true,
+      "mutation": true,
+      "profileGlobal": true
+    },
+    {
+      "method": "browser.searchLibrary",
+      "targetScoped": false,
+      "mutation": false,
+      "profileGlobal": false
+    },
+    {
+      "method": "browser.listWindows",
+      "targetScoped": false,
+      "mutation": false,
+      "profileGlobal": false
+    },
+    {
+      "method": "page.snapshot",
+      "targetScoped": true,
+      "mutation": false,
+      "profileGlobal": false
+    },
+    {
+      "method": "page.accessibilitySnapshot",
+      "targetScoped": true,
+      "mutation": false,
+      "profileGlobal": true
+    },
+    {
+      "method": "page.screenshot",
+      "targetScoped": true,
+      "mutation": false,
+      "profileGlobal": true
+    },
+    {
+      "method": "page.inspectDropdown",
+      "targetScoped": true,
+      "mutation": false,
+      "profileGlobal": false
+    },
+    {
+      "method": "visual.inspectTarget",
+      "targetScoped": true,
+      "mutation": false,
+      "profileGlobal": false
+    },
+    {
+      "method": "visual.inspectPoint",
+      "targetScoped": true,
+      "mutation": false,
+      "profileGlobal": false
+    },
+    {
+      "method": "visual.pointerMove",
+      "targetScoped": true,
+      "mutation": true,
+      "profileGlobal": true
+    },
+    {
+      "method": "visual.click",
+      "targetScoped": true,
+      "mutation": true,
+      "profileGlobal": true
+    },
+    {
+      "method": "visual.doubleClick",
+      "targetScoped": true,
+      "mutation": true,
+      "profileGlobal": true
+    },
+    {
+      "method": "visual.drag",
+      "targetScoped": true,
+      "mutation": true,
+      "profileGlobal": true
+    },
+    {
+      "method": "visual.scroll",
+      "targetScoped": true,
+      "mutation": true,
+      "profileGlobal": true
+    },
+    {
+      "method": "visual.pressKey",
+      "targetScoped": true,
+      "mutation": true,
+      "profileGlobal": true
+    },
+    {
+      "method": "visual.keyDown",
+      "targetScoped": true,
+      "mutation": true,
+      "profileGlobal": true
+    },
+    {
+      "method": "visual.keyUp",
+      "targetScoped": true,
+      "mutation": true,
+      "profileGlobal": true
+    },
+    {
+      "method": "visual.typeText",
+      "targetScoped": true,
+      "mutation": true,
+      "profileGlobal": true
+    },
+    {
+      "method": "page.query",
+      "targetScoped": true,
+      "mutation": false,
+      "profileGlobal": false
+    },
+    {
+      "method": "page.assets",
+      "targetScoped": true,
+      "mutation": false,
+      "profileGlobal": false
+    },
+    {
+      "method": "page.exportContent",
+      "targetScoped": true,
+      "mutation": false,
+      "profileGlobal": false
+    },
+    {
+      "method": "page.webMcpDiscover",
+      "targetScoped": true,
+      "mutation": false,
+      "profileGlobal": false
+    },
+    {
+      "method": "page.webMcpCall",
+      "targetScoped": true,
+      "mutation": true,
+      "profileGlobal": false
+    },
+    {
+      "method": "page.exportArtifact",
+      "targetScoped": true,
+      "mutation": false,
+      "profileGlobal": false
+    },
+    {
+      "method": "page.inspectCaptcha",
+      "targetScoped": true,
+      "mutation": false,
+      "profileGlobal": false
+    },
+    {
+      "method": "page.domDiff",
+      "targetScoped": true,
+      "mutation": false,
+      "profileGlobal": false
+    },
+    {
+      "method": "page.readNetwork",
+      "targetScoped": true,
+      "mutation": false,
+      "profileGlobal": false
+    },
+    {
+      "method": "page.observe",
+      "targetScoped": true,
+      "mutation": false,
+      "profileGlobal": true
+    },
+    {
+      "method": "page.elementScreenshot",
+      "targetScoped": true,
+      "mutation": false,
+      "profileGlobal": true
+    },
+    {
+      "method": "page.download",
+      "targetScoped": true,
+      "mutation": true,
+      "profileGlobal": true
+    },
+    {
+      "method": "clipboard.read",
+      "targetScoped": true,
+      "mutation": false,
+      "profileGlobal": true
+    },
+    {
+      "method": "clipboard.readBinary",
+      "targetScoped": true,
+      "mutation": false,
+      "profileGlobal": true
+    },
+    {
+      "method": "clipboard.write",
+      "targetScoped": true,
+      "mutation": true,
+      "profileGlobal": true
+    },
+    {
+      "method": "page.inspectDialog",
+      "targetScoped": true,
+      "mutation": false,
+      "profileGlobal": true
+    },
+    {
+      "method": "page.handleDialog",
+      "targetScoped": true,
+      "mutation": true,
+      "profileGlobal": true
+    },
+    {
+      "method": "page.readConsole",
+      "targetScoped": true,
+      "mutation": false,
+      "profileGlobal": true
+    },
+    {
+      "method": "page.click",
+      "targetScoped": true,
+      "mutation": true,
+      "profileGlobal": false
+    },
+    {
+      "method": "page.doubleClick",
+      "targetScoped": true,
+      "mutation": true,
+      "profileGlobal": false
+    },
+    {
+      "method": "page.hover",
+      "targetScoped": true,
+      "mutation": true,
+      "profileGlobal": false
+    },
+    {
+      "method": "page.setChecked",
+      "targetScoped": true,
+      "mutation": true,
+      "profileGlobal": false
+    },
+    {
+      "method": "page.pressKey",
+      "targetScoped": true,
+      "mutation": true,
+      "profileGlobal": false
+    },
+    {
+      "method": "page.selectText",
+      "targetScoped": true,
+      "mutation": true,
+      "profileGlobal": false
+    },
+    {
+      "method": "page.richText",
+      "targetScoped": true,
+      "mutation": true,
+      "profileGlobal": false
+    },
+    {
+      "method": "page.scroll",
+      "targetScoped": true,
+      "mutation": true,
+      "profileGlobal": false
+    },
+    {
+      "method": "page.selectOption",
+      "targetScoped": true,
+      "mutation": true,
+      "profileGlobal": true
+    },
+    {
+      "method": "page.type",
+      "targetScoped": true,
+      "mutation": true,
+      "profileGlobal": false
+    },
+    {
+      "method": "page.upload",
+      "targetScoped": true,
+      "mutation": true,
+      "profileGlobal": false
+    },
+    {
+      "method": "page.uploadMultiple",
+      "targetScoped": true,
+      "mutation": true,
+      "profileGlobal": false
+    },
+    {
+      "method": "page.nativeChooser",
+      "targetScoped": true,
+      "mutation": true,
+      "profileGlobal": false
+    },
+    {
+      "method": "page.submit",
+      "targetScoped": true,
+      "mutation": true,
+      "profileGlobal": false
+    },
+    {
+      "method": "tabs.claimExisting",
+      "targetScoped": true,
+      "mutation": true,
+      "profileGlobal": true
+    },
+    {
+      "method": "page.waitFor",
+      "targetScoped": true,
+      "mutation": false,
+      "profileGlobal": false
+    },
+    {
+      "method": "page.delay",
+      "targetScoped": true,
+      "mutation": false,
+      "profileGlobal": false
+    }
+  ],
+  "capabilities": [
+    "extension.reload",
+    "tabs.list",
+    "tabs.get",
+    "tabs.create",
+    "tabs.close",
+    "tabs.activate",
+    "tabs.navigate",
+    "tabs.back",
+    "tabs.forward",
+    "tabs.reload",
+    "tabs.groupTask",
+    "tabs.configure",
+    "page.configureViewport",
+    "page.bookmark",
+    "browser.searchLibrary",
+    "browser.listWindows",
+    "page.snapshot",
+    "page.accessibilitySnapshot",
+    "page.screenshot",
+    "page.inspectDropdown",
+    "visual.inspectTarget",
+    "visual.inspectPoint",
+    "visual.pointerMove",
+    "visual.click",
+    "visual.doubleClick",
+    "visual.drag",
+    "visual.scroll",
+    "visual.pressKey",
+    "visual.keyDown",
+    "visual.keyUp",
+    "visual.typeText",
+    "page.query",
+    "page.assets",
+    "page.exportContent",
+    "page.webMcpDiscover",
+    "page.webMcpCall",
+    "page.exportArtifact",
+    "page.inspectCaptcha",
+    "page.domDiff",
+    "page.readNetwork",
+    "page.observe",
+    "page.elementScreenshot",
+    "page.download",
+    "clipboard.read",
+    "clipboard.readBinary",
+    "clipboard.write",
+    "page.inspectDialog",
+    "page.handleDialog",
+    "page.readConsole",
+    "page.click",
+    "page.doubleClick",
+    "page.hover",
+    "page.setChecked",
+    "page.pressKey",
+    "page.selectText",
+    "page.richText",
+    "page.scroll",
+    "page.selectOption",
+    "page.type",
+    "page.upload",
+    "page.uploadMultiple",
+    "page.nativeChooser",
+    "page.submit",
+    "tabs.claimExisting",
+    "page.waitFor",
+    "page.delay"
+  ],
+  "authorizedTransactionMethods": [
+    "tabs.navigate",
+    "tabs.back",
+    "tabs.forward",
+    "tabs.reload",
+    "tabs.configure",
+    "page.configureViewport",
+    "page.bookmark",
+    "page.click",
+    "page.doubleClick",
+    "page.hover",
+    "page.setChecked",
+    "page.pressKey",
+    "page.selectText",
+    "page.scroll",
+    "visual.pointerMove",
+    "visual.click",
+    "visual.doubleClick",
+    "visual.drag",
+    "visual.scroll",
+    "visual.pressKey",
+    "visual.keyDown",
+    "visual.keyUp",
+    "visual.typeText",
+    "page.download",
+    "clipboard.write",
+    "page.handleDialog",
+    "page.webMcpCall",
+    "page.nativeChooser",
+    "tabs.claimExisting",
+    "page.query",
+    "page.selectOption",
+    "page.type",
+    "page.upload",
+    "page.uploadMultiple",
+    "page.submit",
+    "page.richText",
+    "page.waitFor",
+    "page.delay"
+  ],
+  "actionEvents": {
+    "types": [
+      "dialog"
+    ],
+    "methods": [
+      "page.click",
+      "page.doubleClick",
+      "page.pressKey",
+      "page.submit",
+      "visual.click",
+      "visual.doubleClick",
+      "visual.pressKey",
+      "tabs.navigate",
+      "tabs.back",
+      "tabs.forward",
+      "tabs.reload"
+    ],
+    "defaultTimeoutMs": 5000,
+    "minTimeoutMs": 100,
+    "maxTimeoutMs": 15000
+  }
+}

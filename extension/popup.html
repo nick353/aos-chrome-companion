@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>AOS Chrome Companion</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main>
+      <div class="heading">
+        <span id="indicator" class="indicator"></span>
+        <div>
+          <h1>AOS Chrome Companion</h1>
+          <p id="status">Checking connection…</p>
+        </div>
+      </div>
+      <dl>
+        <dt>Extension</dt>
+        <dd id="extension-version">—</dd>
+        <dt>Profile instance</dt>
+        <dd id="profile">—</dd>
+        <dt>Generation</dt>
+        <dd id="generation">—</dd>
+        <dt>Automatic setup</dt>
+        <dd id="setup">Checking…</dd>
+        <dt>Last error</dt>
+        <dd id="error">None</dd>
+      </dl>
+      <button id="retry" type="button">Reconnect</button>
+      <button id="open-controls" type="button">Open control panel</button>
+      <button id="physical-input" type="button">Allow physical input</button>
+      <p id="physical-input-status">Checking physical input permission…</p>
+      <p id="virtual-cursor-status">Blue cursor: in-page preview only — your OS mouse is never moved.</p>
+      <button id="peripheral-access" type="button">Allow downloads and clipboard</button>
+      <p id="peripheral-access-status">Checking peripheral permissions…</p>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>

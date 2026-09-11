@@ -1,0 +1,21 @@
+node_modules/
+coverage/
+.DS_Store
+*.log
+work/
+
+# Local runtime state and diagnostic artifacts
+outputs/
+artifacts/
+STATE.md
+GOAL.md
+Plan.md
+INTEGRATION_CANDIDATE.md
+.env
+.env.*
+!.env.example
+
+# Local IDE and OS metadata
+.vscode/
+.idea/
+

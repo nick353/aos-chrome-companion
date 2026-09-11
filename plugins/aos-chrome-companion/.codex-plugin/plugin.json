@@ -1,0 +1,27 @@
+{
+  "name": "aos-chrome-companion",
+  "version": "0.3.2+codex.20260905082123",
+  "description": "Exact-tab Chrome execution with proactive visual confirmation and one safe no-effect handoff to the official Extension.",
+  "author": {
+    "name": "AOS Chrome Companion"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "AOS Chrome Companion",
+    "shortDescription": "Exact-tab Chrome work with proactive visual proof.",
+    "longDescription": "Connect Codex to the independently owned AOS Chrome Companion Extension and broker. Codex-task binding, grouped reusable tabs, exact-tab leases, proactive semantic-plus-screenshot readback, generation fencing, and no-replay errors keep concurrent Chrome work isolated. A terminal read-only no-effect failure may hand off once to a fresh target-scoped official Extension attempt.",
+    "developerName": "AOS Chrome Companion",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Show the connected Chrome profile and Companion status.",
+      "Open isolated browser sessions on separate tabs.",
+      "Read and visually confirm the exact leased tab.",
+      "Use one safe official-Extension handoff only after terminal no-effect proof."
+    ]
+  },
+  "mcpServers": "./.mcp.json"
+}
