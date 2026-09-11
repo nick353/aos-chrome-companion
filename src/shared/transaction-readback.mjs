@@ -76,6 +76,8 @@ export function transactionOutcome(receipt) {
   const applied = progress?.applied_action_indices ?? receipt.actions?.map(action => action.index) ?? [];
   const remaining = progress?.remaining_action_indices ?? [];
   const uncertain = progress?.uncertain_action_indices ?? [];
+  const providerCompletion = receipt.provider_completion ?? 'unverified';
+  const sourceSync = receipt.source_sync ?? 'unverified';
   return {
     schema: 'aos.chrome_companion.transaction_outcome.v1',
     browser_effect: receipt.effect_state ?? 'no_dispatch',
@@ -85,8 +87,18 @@ export function transactionOutcome(receipt) {
     visual_readback: receipt.visual_readback?.kind === 'screenshot' ? 'verified' : 'unavailable',
     // A UI transition or upload control is not a provider receipt or a
     // source-system sync. These fields are populated only by that workflow.
-    provider_completion: 'unverified',
-    source_sync: 'unverified',
+    provider_completion: providerCompletion,
+    source_sync: sourceSync,
+    // This is intentionally false unless the owning workflow supplies both
+    // provider and source-system evidence. A successful browser transaction
+    // must never be presented as business completion.
+    business_completion: providerCompletion === 'verified' && sourceSync === 'verified' ? 'verified' : 'unverified',
+    completion_gate: {
+      browser_readback: receipt.result === 'verified' ? 'verified' : 'unverified',
+      provider_receipt: providerCompletion,
+      source_sync: sourceSync,
+      cleanup: receipt.cleanup?.verified === true || receipt.cleanup?.closed === true ? 'verified' : 'unverified',
+    },
     reconciliation_required: receipt.capsule?.state === 'reconciliation_required' || Boolean(receipt.reconciliation),
     replay_allowed: false,
     next_action: receipt.result === 'verified' ? 'continue_from_verified_page'

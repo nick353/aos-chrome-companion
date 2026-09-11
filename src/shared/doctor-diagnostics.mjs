@@ -329,11 +329,15 @@ export async function collectDoctorDiagnostics(options = {}) {
   if (status && connectedProfiles.length === 0) addBlocker(blockers, "no_connected_profiles");
   if (connectedProfiles.length > 1) addBlocker(blockers, "multiple_connected_profiles", { count: connectedProfiles.length });
   if (buildSchema.runtimeMismatch) addBlocker(blockers, "build_or_schema_mismatch");
-  if (buildSchema.sourceDrift) maintenance.push({ code: "source_install_build_drift" });
-  if (ledger.ledger.reconciliationBacklogCount > 0) maintenance.push({ code: "reconciliation_backlog", durable: ledger.ledger.reconciliationBacklogCount });
+  if (buildSchema.sourceDrift) maintenance.push({ code: "source_install_build_drift", severity: "high", nextAction: "refresh_installed_runtime_at_an_idle_boundary" });
+  if (ledger.ledger.reconciliationBacklogCount > 0) maintenance.push({ code: "reconciliation_backlog", severity: "high", durable: ledger.ledger.reconciliationBacklogCount, nextAction: "inspect_exact_targets_and_reconcile_without_replay" });
   if ((status?.reconciliationPendingActiveCount ?? 0) > 0) addBlocker(blockers, "active_reconciliation_backlog", { active: status.reconciliationPendingActiveCount });
   if (sessions.length > 0) maintenance.push({ code: "active_logical_sessions", count: sessions.length });
   if (leases.length > 0) maintenance.push({ code: "active_tab_leases", count: leases.length });
+  const terminalCleanupPending = Number(status?.terminalCleanupPendingTaskTabCount ?? 0);
+  if (terminalCleanupPending > 0) maintenance.push({ code: "terminal_cleanup_pending", count: terminalCleanupPending, severity: "medium", nextAction: "run_owner_scoped_terminal_cleanup_and_verify_no_residual_task_tabs" });
+  const ledgerOperationCount = Math.max(Number(ledger.ledger.operationCount ?? 0), Number(status?.operationLedgerCount ?? 0));
+  if (ledgerOperationCount >= 10_000) maintenance.push({ code: "operation_ledger_large", count: ledgerOperationCount, severity: "medium", nextAction: "archive_or_compact_historical_ledger_at_idle_boundary" });
   // Setup/profile convergence is reported under autoSetup.  It does not make
   // an otherwise reachable broker unhealthy; in particular a stale receipt
   // selection is a setup discrepancy, not a connection-health blocker.
@@ -351,7 +355,7 @@ export async function collectDoctorDiagnostics(options = {}) {
     profiles: { count: profiles.length, connectedCount: connectedProfiles.length, connected: connectedProfiles, all: profiles },
     sessions: { count: sessions.length, items: sessions },
     leases: { count: leases.length, items: leases },
-    live: status ? { pendingOperationCount: status.pendingOperationCount ?? null, queueCount: status.queueCount ?? null, reconciliationPendingCount: status.reconciliationPendingCount ?? null, reconciliationPendingActiveCount: status.reconciliationPendingActiveCount ?? null, taskTabCount: status.taskTabCount ?? null, activeTaskTabCount: status.activeTaskTabCount ?? null, recovery: status.recovery ?? null } : null,
+    live: status ? { pendingOperationCount: status.pendingOperationCount ?? null, queueCount: status.queueCount ?? null, reconciliationPendingCount: status.reconciliationPendingCount ?? null, reconciliationPendingActiveCount: status.reconciliationPendingActiveCount ?? null, taskTabCount: status.taskTabCount ?? null, activeTaskTabCount: status.activeTaskTabCount ?? null, terminalCleanupPendingTaskTabCount: status.terminalCleanupPendingTaskTabCount ?? null, operationLedgerCount: status.operationLedgerCount ?? null, recovery: status.recovery ?? null } : null,
     ledger: ledger.ledger,
     autoSetup,
   };
@@ -361,5 +365,6 @@ export function formatDoctorText(report) {
   const lines = [`AOS Chrome Companion doctor: ${report.result}`, `read-only: ${report.readOnly}`, `broker processes: ${report.broker.processCount}`, `broker socket: ${report.broker.socket.exists ? report.broker.socket.type : "missing"}`, `connected profiles: ${report.profiles.connectedCount}/${report.profiles.count}`, `sessions / leases: ${report.sessions.count} / ${report.leases.count}`, `reconciliation backlog: ${report.ledger.reconciliationBacklogCount}`, `maintenance items: ${(report.maintenance ?? []).length}`];
   if (report.blockers.length) lines.push("blockers:", ...report.blockers.map((blocker) => `- ${blocker.code}`));
   else lines.push("blockers: none");
+  if (report.maintenance?.length) lines.push("maintenance:", ...report.maintenance.map((item) => `- ${item.code}${item.count ?? item.durable ? ` (${item.count ?? item.durable})` : ""}${item.nextAction ? ` -> ${item.nextAction}` : ""}`));
   return `${lines.join("\n")}\n`;
 }

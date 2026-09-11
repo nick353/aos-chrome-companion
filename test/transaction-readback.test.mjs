@@ -55,7 +55,22 @@ test('verified UI actions do not become provider completion or source sync', () 
   assert.equal(result.browser_effect, 'known_effect');
   assert.equal(result.provider_completion, 'unverified');
   assert.equal(result.source_sync, 'unverified');
+  assert.equal(result.business_completion, 'unverified');
+  assert.deepEqual(result.completion_gate, {
+    browser_readback: 'verified', provider_receipt: 'unverified', source_sync: 'unverified', cleanup: 'unverified',
+  });
   assert.equal(result.replay_allowed, false);
+});
+
+test('business completion requires both provider receipt and source sync', () => {
+  const result = transactionOutcome({
+    result: 'verified', effect_state: 'known_effect', provider_completion: 'verified', source_sync: 'verified',
+    cleanup: { verified: true }, actions: [{ index: 0 }], visual_readback: image(initial),
+  });
+  assert.equal(result.business_completion, 'verified');
+  assert.deepEqual(result.completion_gate, {
+    browser_readback: 'verified', provider_receipt: 'verified', source_sync: 'verified', cleanup: 'verified',
+  });
 });
 
 test('partial success carries remaining actions and readback recovery to every caller', () => {

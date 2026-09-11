@@ -115,3 +115,21 @@ test("classifies source/install drift as maintenance without a health blocker", 
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("surfaces reconciliation, terminal cleanup, and large-ledger actions", async () => {
+  const root = await mkdtemp(join(tmpdir(), "aos-doctor-maintenance-"));
+  try {
+    const report = await collectDoctorDiagnostics({
+      dataDir: root, socketPath: join(root, "broker.sock"), statePath: join(root, "state.json"),
+      chromeUserDataDir: join(root, "chrome"), sourceRoot: root, installedRoot: join(root, "installed"),
+      brokerProcesses: [], status: {
+        expectedBuildId: "dev-local", profiles: [{ profileInstanceId: "p1", connected: true, buildId: "dev-local" }],
+        terminalCleanupPendingTaskTabCount: 1, operationLedgerCount: 10001,
+      },
+    });
+    assert.ok(report.maintenance.some(({ code, nextAction }) => code === "terminal_cleanup_pending" && nextAction));
+    assert.ok(report.maintenance.some(({ code, nextAction }) => code === "operation_ledger_large" && nextAction));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
