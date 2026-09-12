@@ -133,6 +133,7 @@ export function resolveDynamicTaskTarget({
   const foreignEntries = taskTabs.filter((entry) => entry?.taskId && entry.taskId !== taskId);
   const staleEntries = ownEntries.filter((entry) => entry.generation && entry.generation !== generation);
   const currentEntries = ownEntries.filter((entry) => !entry.generation || entry.generation === generation);
+  const missingCurrentEntries = currentEntries.filter((entry) => !liveById.has(entry.tabId));
   const exact = [];
   const sameOrigin = [];
   const protectedMatches = [];
@@ -183,6 +184,7 @@ export function resolveDynamicTaskTarget({
       generation,
       profileInstanceId,
       staleCount: staleEntries.length,
+      missingCount: missingCurrentEntries.length,
       foreignCount: foreignEntries.length,
       protectedCount: protectedMatches.length,
       busyCount: busyMatches.length,
@@ -256,16 +258,28 @@ export function resolveDynamicTaskTarget({
       diagnostics: { taskId, generation, profileInstanceId, staleCount: staleEntries.length },
     };
   }
+  if (missingCurrentEntries.length > 0 && exactTabId !== undefined) {
+    return {
+      schema: DYNAMIC_TARGET_ADAPTER_SCHEMA,
+      status: DYNAMIC_TARGET_STATUS.NOT_FOUND,
+      exactBlocker: "task_target_tab_missing",
+      candidates: missingCurrentEntries.map((entry) => entry.tabId),
+      diagnostics: { taskId, generation, profileInstanceId, staleCount: staleEntries.length, missingCount: missingCurrentEntries.length },
+    };
+  }
   return {
     schema: DYNAMIC_TARGET_ADAPTER_SCHEMA,
     status: DYNAMIC_TARGET_STATUS.NOT_FOUND,
-    exactBlocker: null,
+    exactBlocker: exactTabId !== undefined
+      ? "task_target_unavailable"
+      : ownEntries.length === 0 ? "task_target_not_provisioned" : "task_target_unavailable",
     candidates: [],
     diagnostics: {
       taskId,
       generation,
       profileInstanceId,
       staleCount: staleEntries.length,
+      missingCount: missingCurrentEntries.length,
       foreignCount: foreignEntries.length,
       protectedCount: protectedMatches.length,
       busyCount: busyMatches.length,

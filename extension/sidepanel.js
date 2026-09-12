@@ -2,7 +2,7 @@ const $ = id => document.getElementById(id);
 let controls = { paused: false, blockedOrigins: [], recentOperations: [] }, activeOrigin = null;
 const labels = { 'page.type':'文字を入力', 'page.click':'クリック', 'page.upload':'ファイルを添付', 'page.uploadMultiple':'ファイルを添付', 'page.query':'ページを読取', 'page.snapshot':'ページを確認', 'page.screenshot':'画面を確認', 'tabs.create':'タブを作成', 'tabs.close':'タブを終了', 'page.richText':'文章の書式を編集', 'clipboard.write':'クリップボードへコピー' };
 Object.assign(labels, { 'browser.searchLibrary':'履歴・ブックマークを検索', 'browser.listWindows':'ウィンドウを確認', 'tabs.configure':'タブを整理', 'page.bookmark':'ブックマークに保存' });
-const errorLabels = { companion_user_paused:'一時停止中', companion_site_blocked:'サイトへのアクセスを停止中', browser_library_permission_required:'追加のアクセス許可が必要です', target_not_found:'対象が見つかりません', operation_timeout:'結果の確認が必要です' };
+const errorLabels = { companion_user_paused:'一時停止中', companion_site_blocked:'サイトへのアクセスを停止中', browser_library_permission_required:'追加のアクセス許可が必要です', target_not_found:'対象が見つかりません', task_target_not_provisioned:'作業用タブがまだ作成されていません', task_target_tab_missing:'作業用タブが閉じられています', task_target_unavailable:'作業用タブを確保できません', target_generation_mismatch:'拡張の世代が変わりました。新しい確認が必要です', operation_timeout:'結果の確認が必要です' };
 async function request(message) { const result = await chrome.runtime.sendMessage(message); if (result?.error) throw Error(result.error); return result; }
 function button(label, action) { const el = document.createElement('button'); el.type='button'; el.className='quiet'; el.textContent=label; el.onclick=()=>run(action); return el; }
 function render() {

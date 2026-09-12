@@ -64,6 +64,9 @@ test("explicit tab targeting preserves current routes and cannot fall back to an
   }
   assert.equal(resolve([entry()], [live({ url: "https://foreign.test/" })]).status, "not_found");
   assert.equal(resolve([entry()], []).status, "not_found");
+  assert.equal(resolve([entry()], []).exactBlocker, "task_target_tab_missing");
+  assert.equal(resolve([], []).exactBlocker, "task_target_unavailable");
+  assert.equal(resolve([], [], { descriptor: { ...descriptor, tabId: 10 } }).exactBlocker, "task_target_unavailable");
   assert.equal(resolve([entry({ targetKey: "different", lifecycleState: "reconciliation_required" })], [changedRoute]).status, "protected");
   assert.equal(resolve([entry({ targetKey: "different" })], [changedRoute], { leases: [{ tabId: 10, sessionId: "another" }] }).status, "busy");
 });
