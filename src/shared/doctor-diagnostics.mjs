@@ -1,6 +1,7 @@
 import { execFile as execFileCallback } from "node:child_process";
 import { connect } from "node:net";
 import { access, lstat, readFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -12,6 +13,7 @@ import { OPERATION_SCHEMA, OPERATION_SCHEMA_DIGEST, OPERATION_SCHEMA_VERSION, PR
 import { operationRequiresReconciliation, operationEffectStateForEntry } from "./task-runtime.mjs";
 import { resolveBrokerSocketPath, resolveDataDir, resolveStatePath } from "./paths.mjs";
 import { detectTwoExtensionProfile, DEFAULT_COMPANION_EXTENSION_ID } from "../setup/auto-setup.mjs";
+import { controlPlaneFiles } from "./control-plane-files.mjs";
 
 const execFileAsync = promisify(execFileCallback);
 const DEFAULT_SOURCE_ROOT = resolve(fileURLToPath(new URL("../..", import.meta.url)));
@@ -224,6 +226,21 @@ async function runtimeBuildSchema({ sourceRoot, installedRoot, status }) {
   const sourceExtensionBuild = await readFile(join(sourceRoot, "extension", "build-info.js"), "utf8").then(buildIdFromText).catch(() => null);
   const installedBuild = await readFile(join(installedRoot, "src", "shared", "build-info.mjs"), "utf8").then(buildIdFromText).catch(() => null);
   const installedExtensionBuild = await readFile(join(installedRoot, "extension", "build-info.js"), "utf8").then(buildIdFromText).catch(() => null);
+  const controlPlaneDrift = [];
+  try {
+    const files = await controlPlaneFiles(sourceRoot, installedRoot);
+    for (const relative of files) {
+      const [sourceBytes, installedBytes] = await Promise.all([
+        readFile(join(sourceRoot, relative)).catch(() => null),
+        readFile(join(installedRoot, relative)).catch(() => null),
+      ]);
+      const sourceHash = sourceBytes ? createHash("sha256").update(sourceBytes).digest("hex") : null;
+      const installedHash = installedBytes ? createHash("sha256").update(installedBytes).digest("hex") : null;
+      if (sourceHash !== installedHash) controlPlaneDrift.push(relative);
+    }
+  } catch (error) {
+    controlPlaneDrift.push(`inspection_failed:${errorText(error)}`);
+  }
   const generated = await readJson(join(sourceRoot, "extension", "operation-schema.generated.json"));
   const profiles = Array.isArray(status?.profiles) ? status.profiles.map(summarizeProfile) : [];
   const connectedMismatches = profiles.filter((profile) => profile.connected && (
@@ -237,15 +254,18 @@ async function runtimeBuildSchema({ sourceRoot, installedRoot, status }) {
     || generated.value.version !== OPERATION_SCHEMA_VERSION
     || generated.value.schemaDigest !== OPERATION_SCHEMA_DIGEST
   );
-  const sourceDrift = Boolean(
+  const installationIdentityDrift = Boolean(
     (installedBuild && sourceBuild && installedBuild !== sourceBuild)
     || (installedExtensionBuild && sourceExtensionBuild && installedExtensionBuild !== sourceExtensionBuild),
   );
+  const sourceDrift = controlPlaneDrift.length > 0;
   const runtimeMismatch = connectedMismatches.length > 0;
   return {
     expected: { buildId: status?.expectedBuildId ?? INSTALL_BUILD_ID, operationSchema: OPERATION_SCHEMA, operationSchemaVersion: OPERATION_SCHEMA_VERSION, operationSchemaDigest: OPERATION_SCHEMA_DIGEST },
     source: { buildId: sourceBuild, extensionBuildId: sourceExtensionBuild },
     installed: { root: installedRoot, buildId: installedBuild, extensionBuildId: installedExtensionBuild, exists: installedBuild !== null || installedExtensionBuild !== null },
+    controlPlaneDrift,
+    installationIdentityDrift,
     generatedSchema: { schema: generated.value?.schema ?? null, version: generated.value?.version ?? null, digest: generated.value?.schemaDigest ?? null, error: generated.error ?? null },
     runtime: { brokerExpectedBuildId: status?.expectedBuildId ?? null, runtimeAttestation: status?.runtimeAttestation ?? null, connectedProfileMismatches: connectedMismatches },
     mismatch: Boolean(generatedMismatch || sourceDrift || runtimeMismatch),
@@ -329,7 +349,7 @@ export async function collectDoctorDiagnostics(options = {}) {
   if (status && connectedProfiles.length === 0) addBlocker(blockers, "no_connected_profiles");
   if (connectedProfiles.length > 1) addBlocker(blockers, "multiple_connected_profiles", { count: connectedProfiles.length });
   if (buildSchema.runtimeMismatch) addBlocker(blockers, "build_or_schema_mismatch");
-  if (buildSchema.sourceDrift) maintenance.push({ code: "source_install_build_drift", severity: "high", nextAction: "refresh_installed_runtime_at_an_idle_boundary" });
+  if (buildSchema.sourceDrift) maintenance.push({ code: "source_install_control_plane_drift", severity: "high", files: buildSchema.controlPlaneDrift.slice(0, 20), nextAction: "refresh_installed_runtime_at_an_idle_boundary" });
   if (ledger.ledger.reconciliationBacklogCount > 0) maintenance.push({ code: "reconciliation_backlog", severity: "high", durable: ledger.ledger.reconciliationBacklogCount, nextAction: "inspect_exact_targets_and_reconcile_without_replay" });
   if ((status?.reconciliationPendingActiveCount ?? 0) > 0) addBlocker(blockers, "active_reconciliation_backlog", { active: status.reconciliationPendingActiveCount });
   if (sessions.length > 0) maintenance.push({ code: "active_logical_sessions", count: sessions.length });

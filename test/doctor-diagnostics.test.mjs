@@ -86,7 +86,7 @@ test("uses broker readback for runtime checks and keeps active usage in maintena
   }
 });
 
-test("classifies source/install drift as maintenance without a health blocker", async () => {
+test("does not treat install identity stamping as runtime source drift", async () => {
   const root = await mkdtemp(join(tmpdir(), "aos-doctor-drift-"));
   try {
     const installed = join(root, "installed");
@@ -107,10 +107,37 @@ test("classifies source/install drift as maintenance without a health blocker", 
         profiles: [{ profileInstanceId: "p1", connected: true, buildId: "dev-local", operationSchema: OPERATION_SCHEMA, operationSchemaDigest: OPERATION_SCHEMA_DIGEST, operationSchemaVersion: OPERATION_SCHEMA_VERSION }],
       },
     });
-    assert.equal(report.buildSchema.sourceDrift, true);
+    assert.equal(report.buildSchema.sourceDrift, false);
+    assert.equal(report.buildSchema.installationIdentityDrift, true);
     assert.equal(report.buildSchema.runtimeMismatch, false);
     assert.equal(report.blockers.some(({ code }) => code === "build_or_schema_mismatch"), false);
-    assert.ok(report.maintenance.some(({ code }) => code === "source_install_build_drift"));
+    assert.equal(report.maintenance.some(({ code }) => code === "source_install_control_plane_drift"), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("detects real control-plane file drift independently of install identity", async () => {
+  const root = await mkdtemp(join(tmpdir(), "aos-doctor-control-plane-drift-"));
+  try {
+    const installed = join(root, "installed");
+    await mkdir(join(root, "src", "shared"), { recursive: true });
+    await mkdir(join(installed, "src", "shared"), { recursive: true });
+    await writeFile(join(root, "src", "shared", "helper.mjs"), "export const value = 2;\n");
+    await writeFile(join(installed, "src", "shared", "helper.mjs"), "export const value = 1;\n");
+    const report = await collectDoctorDiagnostics({
+      dataDir: root,
+      socketPath: join(root, "broker.sock"),
+      statePath: join(root, "state.json"),
+      chromeUserDataDir: join(root, "chrome"),
+      sourceRoot: root,
+      installedRoot: installed,
+      brokerProcesses: [],
+      status: { expectedBuildId: "dev-local", profiles: [{ profileInstanceId: "p1", connected: true, buildId: "dev-local" }] },
+    });
+    assert.equal(report.buildSchema.sourceDrift, true);
+    assert.deepEqual(report.buildSchema.controlPlaneDrift, ["src/shared/helper.mjs"]);
+    assert.ok(report.maintenance.some(({ code }) => code === "source_install_control_plane_drift"));
   } finally {
     await rm(root, { recursive: true, force: true });
   }
