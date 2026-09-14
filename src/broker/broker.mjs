@@ -49,6 +49,7 @@ import {
   TaskOperationLedger,
   taskTabIdentityConsistent,
   targetIdentityDigest,
+  TERMINAL_LEDGER_RETENTION_MS,
 } from "../shared/task-runtime.mjs";
 import { bindTransactionStep, compileTransactionSteps } from "../shared/step-packet.mjs";
 import { captureTransactionReadback, readSubmissionTransition, semanticReadback, transactionOutcome } from "../shared/transaction-readback.mjs";
@@ -717,6 +718,7 @@ export class CompanionBroker extends EventEmitter {
         this.#expireSessions();
         void this.#terminalizeOrphanedReconciliations();
         this.#cleanupOwnerlessLedgerOnlyTabs();
+        void this.taskLedger.gcTerminal({ retentionMs: TERMINAL_LEDGER_RETENTION_MS }).catch(() => null);
       }, 15_000);
       this.cleanupTimer.unref();
       this.emit("listening", { socketPath: this.socketPath });
@@ -758,8 +760,10 @@ export class CompanionBroker extends EventEmitter {
     await new Promise((resolve) => this.server.close(() => resolve()));
   }
 
-  snapshot() {
-    const logicalSessions = [...this.sessions.values()]
+  snapshot({ taskId = null } = {}) {
+    const scopedTaskId = typeof taskId === "string" && taskId.length > 0 ? taskId : null;
+    const sessionEntries = [...this.sessions.values()].filter((session) => !scopedTaskId || session.taskId === scopedTaskId);
+    const logicalSessions = sessionEntries
       .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
       .slice(0, 100)
       .map((session) => ({
@@ -772,6 +776,7 @@ export class CompanionBroker extends EventEmitter {
         leaseIdsTruncated: session.leaseIds.size > 100,
       }));
     const exactTabLeases = [...this.leases.values()]
+      .filter((lease) => !scopedTaskId || this.sessions.get(lease.sessionId)?.taskId === scopedTaskId)
       .sort((left, right) => left.acquiredAt.localeCompare(right.acquiredAt))
       .slice(0, 100)
       .map((lease) => {
@@ -784,7 +789,8 @@ export class CompanionBroker extends EventEmitter {
           sessionLabel: session?.label ?? null,
         };
       });
-    const taskTabEntries = [...this.taskTabs.values()];
+    const taskTabEntries = [...this.taskTabs.values()]
+      .filter((entry) => !scopedTaskId || entry.taskId === scopedTaskId);
     const taskTabs = taskTabEntries
       .sort((left, right) => left.tabId - right.tabId)
       .slice(0, 500)
@@ -814,7 +820,7 @@ export class CompanionBroker extends EventEmitter {
           quarantine: entry.quarantine ?? null,
         };
       });
-    const liveSessionIds = new Set(this.sessions.keys());
+    const liveSessionIds = new Set(sessionEntries.map((session) => session.sessionId));
     const liveTaskTab = (entry) => {
       if (liveSessionIds.has(entry.sessionId)) return true;
       if (this.tabLeaseIndex.has(this.#tabKey(entry.profileInstanceId, entry.tabId))) return true;
@@ -857,16 +863,21 @@ export class CompanionBroker extends EventEmitter {
         queueWaitMsTotal: lane.queueWaitMsTotal,
         queueWaitMsMax: lane.queueWaitMsMax,
       }));
-    const rawPendingOperations = [...this.pendingOperations.values()];
-    const rawTimedOutOperations = [...this.timedOutOperations.values()];
+    const operationBelongsToScope = (operation) => !scopedTaskId
+      || (operation.binding?.taskId ?? operation.taskTabContext?.taskId) === scopedTaskId;
+    const rawPendingOperations = [...this.pendingOperations.values()].filter(operationBelongsToScope);
+    const rawTimedOutOperations = [...this.timedOutOperations.values()].filter(operationBelongsToScope);
     const unresolvedTimedOutOperations = rawTimedOutOperations.filter(timedOutNeedsReconciliation);
     const activeTimedOutOperations = unresolvedTimedOutOperations
       .filter((operation) => timedOutOperationHasLiveTaskReference(operation, taskTabEntries)
         && (liveSessionIds.has(operation.sessionId)
           || this.tabLeaseIndex.has(this.#tabKey(operation.profileInstanceId, operation.binding?.tabId))));
-    const rawReconciliationOperations = this.taskLedger.listOperations()
+    const scopedOperations = this.taskLedger.listOperations()
+      .filter((entry) => !scopedTaskId || entry.binding?.taskId === scopedTaskId);
+    const rawReconciliationOperations = scopedOperations
       .filter((entry) => isUnresolvedOperationEffect(entry));
-    const rawTaskCapsules = this.taskLedger.listTaskCapsules();
+    const rawTaskCapsules = this.taskLedger.listTaskCapsules()
+      .filter((capsule) => !scopedTaskId || capsule.taskId === scopedTaskId);
     const activeReconciliation = deriveActiveReconciliationCounts({
       taskTabs: taskTabEntries,
       capsules: rawTaskCapsules,
@@ -989,14 +1000,18 @@ export class CompanionBroker extends EventEmitter {
       protocolVersion: PROTOCOL_VERSION,
       startedAt: this.startedAt,
       profiles: runtimeProfiles,
-      logicalSessionCount: this.sessions.size,
+      // Counts are authoritative inventory totals; the arrays below are
+      // bounded presentation views and may be truncated at 100 entries.
+      logicalSessionCount: sessionEntries.length,
       logicalSessions,
-      logicalSessionsTruncated: this.sessions.size > logicalSessions.length,
-      exactTabLeaseCount: this.leases.size,
+      logicalSessionsTruncated: sessionEntries.length > logicalSessions.length,
+      exactTabLeaseCount: [...this.leases.values()]
+        .filter((lease) => !scopedTaskId || this.sessions.get(lease.sessionId)?.taskId === scopedTaskId)
+        .length,
       exactTabLeases,
       exactTabLeasesTruncated: this.leases.size > exactTabLeases.length,
-      pendingOperationCount: this.pendingOperations.size,
-      timedOutOperationCount: this.timedOutOperations.size,
+      pendingOperationCount: rawPendingOperations.length,
+      timedOutOperationCount: rawTimedOutOperations.length,
       timedOutOperationUnresolvedCount: unresolvedTimedOutOperations.length,
       // A timed-out mutation remains in the evidence ledger, but once every
       // task-tab reference is ledger-only it is no longer live profile work.
@@ -1054,8 +1069,9 @@ export class CompanionBroker extends EventEmitter {
           mutationDispatchAttempted: operation.mutationDispatchAttempted === true,
           externalActionExecuted: operation.externalActionExecuted ?? null,
         })),
-      pendingOperationsTruncated: this.pendingOperations.size > 100,
-      operationLedgerCount: this.taskLedger.operations.size,
+      pendingOperationsTruncated: rawPendingOperations.length > 100,
+      operationLedgerCount: scopedOperations.length + taskTabEntries.length,
+      operationLedgerScope: scopedTaskId ? { taskId: scopedTaskId, foreignExcluded: true } : { taskId: null, foreignExcluded: false },
       ledgerPersistence: { ...this.taskLedger.persistenceMetrics },
       // `taskTabCount` is the complete retained inventory.  These scoped
       // counts keep terminal evidence tabs from blocking unrelated work.
@@ -1399,20 +1415,26 @@ export class CompanionBroker extends EventEmitter {
       || this.extensionReloadInFlight.has(profileInstanceId)
       || this.ownerlessCleanupInFlight.has(profileInstanceId)) return;
     if (!peer?.authenticated || profile.peerId !== peer.id) return;
+    const pendingTaskIds = new Set([
+      ...this.pendingOperations.values(),
+      ...this.timedOutOperations.values(),
+    ].map((operation) => operation.binding?.taskId ?? operation.taskTabContext?.taskId).filter(Boolean));
     // Avoid issuing a maintenance read on every normal profile handshake.
     // Only a profile with an already-detached ledger-only record can need
     // cleanup; this also keeps status snapshots free of a transient pending
     // maintenance operation during ordinary startup.
-    const hasLedgerOnlyCandidate = [...new Map([
+    const hasOwnerlessCleanupCandidate = [...new Map([
       ...this.taskLedger.listTaskTabs(),
       ...this.taskTabs.values(),
     ].map((entry) => [this.#tabKey(entry.profileInstanceId, entry.tabId), entry])).values()]
       .some((entry) => entry.profileInstanceId === profileInstanceId
-        && isLedgerOnlyTaskTab(entry)
+        && (isLedgerOnlyTaskTab(entry)
+          || (entry.retentionPolicy === "cleanup" && TASK_TAB_TERMINAL_LIFECYCLES.has(entry.lifecycleState)))
         && entry.userHelpRequired !== true
         && !entry.resumeToken
+        && !pendingTaskIds.has(entry.taskId)
         && !this.tabLeaseIndex.has(this.#tabKey(profileInstanceId, entry.tabId)));
-    if (!hasLedgerOnlyCandidate) return;
+    if (!hasOwnerlessCleanupCandidate) return;
     this.ownerlessCleanupInFlight.add(profileInstanceId);
     // This is an internal broker maintenance session. It is never exposed to
     // a client, never claims a user tab, and carries no provider authority.
@@ -1464,9 +1486,11 @@ export class CompanionBroker extends EventEmitter {
         ...this.taskTabs.values(),
       ].map((entry) => [this.#tabKey(entry.profileInstanceId, entry.tabId), entry])).values()]
         .filter((entry) => entry.profileInstanceId === profileInstanceId
-          && isLedgerOnlyTaskTab(entry)
+          && (isLedgerOnlyTaskTab(entry)
+            || (entry.retentionPolicy === "cleanup" && TASK_TAB_TERMINAL_LIFECYCLES.has(entry.lifecycleState)))
           && entry.userHelpRequired !== true
           && !entry.resumeToken
+          && !pendingTaskIds.has(entry.taskId)
           && !this.tabLeaseIndex.has(this.#tabKey(profileInstanceId, entry.tabId))
           && (!entry.sessionId || !liveSessionIds.has(entry.sessionId)))
         .sort((left, right) => left.tabId - right.tabId);
@@ -1873,7 +1897,7 @@ export class CompanionBroker extends EventEmitter {
           },
         };
       case "status.get":
-        return this.snapshot();
+        return this.snapshot({ taskId: params.taskId ?? null });
       case "profile.list":
         return this.snapshot().profiles;
       case "dropdown.inspect":
@@ -1910,6 +1934,8 @@ export class CompanionBroker extends EventEmitter {
         return this.#retireLocalCanary(peer, params);
       case "maintenance.operations.archive":
         return this.#archiveReconciliation(peer, params);
+      case "maintenance.operations.purge":
+        return this.#purgeOwnedOperations(peer, params);
       case "task.status":
         return this.#taskStatus(peer, params);
       case "task.history": {
@@ -2357,6 +2383,27 @@ export class CompanionBroker extends EventEmitter {
       // other session can acquire this tab in the middle of terminal cleanup.
       // Foreign leases and operations still awaiting results remain protected.
       if (leaseId && (lease?.sessionId !== session.sessionId || busyLease)) {
+        // A terminal tab blocked only by this owner's transient lease must
+        // converge after session.close releases that lease. Detach it into
+        // the ownerless cleanup lane. Foreign leases and protected tabs stay
+        // untouched.
+        if (lease?.sessionId === session.sessionId
+          && TASK_TAB_TERMINAL_LIFECYCLES.has(entry.lifecycleState)
+          && entry.userHelpRequired !== true
+          && !entry.resumeToken
+          && !entry.quarantine) {
+          const detached = {
+            ...entry,
+            sessionId: null,
+            retentionPolicy: "cleanup",
+            updatedAt: nowIso(),
+            retentionReason: "terminal_cleanup_pending",
+            whyTabWasKept: "The owner closed before its transient lease settled; the tab is queued for ownerless terminal cleanup.",
+            resumeAction: "cleanup_task_owned_tab",
+          };
+          this.taskTabs.set(this.#tabKey(entry.profileInstanceId, entry.tabId), detached);
+          await this.taskLedger.recordTaskTab(detached);
+        }
         result.skipped.push({ tabId: entry.tabId, reason: "leased" });
         continue;
       }
@@ -5531,6 +5578,56 @@ export class CompanionBroker extends EventEmitter {
         unchanged: true,
       },
       next_action: "owner_signed_readback_before_reconciliation_completion",
+    };
+  }
+
+  async #purgeOwnedOperations(peer, params) {
+    const session = this.#requireOwnedSession(peer, params.sessionId);
+    if (!session.taskId) throw new CompanionError("task_id_required", "Operation purge requires a task-bound logical session");
+    const runId = requireString(params.runId, "runId");
+    const taskId = requireString(params.taskId ?? session.taskId, "taskId");
+    if (taskId !== session.taskId) throw new CompanionError("task_id_mismatch", "Operation purge taskId does not match the logical session task");
+    if (params.confirmPurge !== true) throw new CompanionError("purge_confirmation_required", "Operation purge requires explicit confirmation");
+    if (!Array.isArray(params.operationIds) || params.operationIds.length < 1 || params.operationIds.length > 500) {
+      throw new CompanionError("operation_ids_invalid", "Operation purge requires 1 to 500 exact operation ids");
+    }
+    const idempotencyKey = requireString(params.idempotencyKey, "idempotencyKey");
+    const payload = {
+      runId,
+      taskId,
+      operationIds: params.operationIds,
+      confirmPurge: true,
+    };
+    await this.taskLedger.verifyAndConsumeAuthority(params.authority, {
+      secrets: this.issuerSecrets,
+      payload,
+      expected: {
+        runId,
+        taskId,
+        ownerKey: session.sessionId,
+        method: "maintenance.operations.purge",
+        intent: "purge_terminal_owned_operations",
+        idempotencyKey,
+      },
+    });
+    const purged = await this.taskLedger.purgeOwnedOperations({
+      taskId,
+      runId,
+      operationIds: payload.operationIds,
+      purgeId: idempotencyKey,
+      purgeAuthorityId: params.authority.authorityId,
+    });
+    return {
+      schema: "aos.chrome_companion.operation_purge.v1",
+      status: "purged",
+      task_id: taskId,
+      run_id: runId,
+      purge_id: purged.purgeId,
+      purged_count: purged.purgedCount,
+      operation_ids: purged.operationIds,
+      foreign_operations_mutated: false,
+      unresolved_operations_mutated: false,
+      next_action: "close_task_session_and_verify_owner_scoped_status",
     };
   }
 

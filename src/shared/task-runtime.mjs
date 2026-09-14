@@ -23,6 +23,11 @@ export const OPERATION_EFFECT_STATES = Object.freeze([
   "unknown_effect",
 ]);
 
+// Terminal evidence is useful for a short recovery window, but retaining it
+// forever turns the ledger into an ever-growing second database. Unknown
+// external effects are intentionally excluded from automatic collection.
+export const TERMINAL_LEDGER_RETENTION_MS = 24 * 60 * 60_000;
+
 // A timeout is not automatically a provider-side effect.  These operations
 // only manipulate the currently leased browser surface (typing, selection,
 // scrolling, grouping, and navigation); a late receipt can therefore be
@@ -1046,6 +1051,116 @@ export class TaskOperationLedger {
 
   get(idempotencyKey) { return this.operations.get(idempotencyKey); }
   listOperations() { return [...this.operations.values()].filter((entry) => entry.state !== "task_tab"); }
+
+  /** Remove only old, terminal, non-uncertain records. */
+  async gcTerminal({ now = this.now(), retentionMs = TERMINAL_LEDGER_RETENTION_MS } = {}) {
+    return this.#queue(async () => {
+      await this.ready();
+      const cutoff = now - Math.max(0, Number(retentionMs) || TERMINAL_LEDGER_RETENTION_MS);
+      const terminal = new Set(["applied", "blocked", "reconciled"]);
+      const operationKeys = [], taskTabKeys = [], capsuleKeys = [];
+      const oldEnough = (entry) => {
+        const time = Date.parse(entry?.updatedAt ?? entry?.completedAt ?? entry?.preparedAt ?? "");
+        return Number.isFinite(time) && time <= cutoff;
+      };
+      const reconciliationRequired = (entry) => entry?.reconciliationRequired === true
+        || entry?.reconciliation_required === true
+        || entry?.effect?.reconciliationRequired === true
+        || entry?.effect?.reconciliation_required === true;
+      const unknownEffect = (entry) => operationEffectStateForEntry(entry) === "unknown_effect"
+        || entry?.state === "unknown_effect"
+        || entry?.effect?.effectState === "unknown_effect"
+        || entry?.effect?.effect_state === "unknown_effect";
+      const cleanupIncomplete = (entry) => {
+        const cleanup = entry?.completion?.cleanup ?? entry?.cleanup;
+        if (!cleanup || typeof cleanup !== "object") return false;
+        if (["pending", "incomplete", "required", "started", "partial"].includes(cleanup.state)
+          || ["pending", "incomplete", "required", "started", "partial"].includes(cleanup.status)) return true;
+        if (cleanup.required === true && cleanup.closed !== true && cleanup.complete !== true && cleanup.verified !== true) return true;
+        if (cleanup.complete === false || cleanup.completed === false || cleanup.verified === false) return true;
+        return false;
+      };
+      const capsuleRunKey = (entry) => `${entry?.taskId ?? entry?.binding?.taskId ?? ""}\u0000${entry?.runId ?? entry?.binding?.runId ?? ""}`;
+      const unfinishedCapsuleRuns = new Set([...this.capsules.values()]
+        .filter((capsule) => !["completed", "failed"].includes(capsule.state))
+        .map(capsuleRunKey));
+      const unfinishedTaskRuns = new Set([...this.operations.values()]
+        .filter((entry) => entry.state === "task_tab" && !["completed", "failed"].includes(entry.lifecycleState))
+        .map(capsuleRunKey));
+      const hasUnfinishedReference = (entry) => {
+        const runKey = capsuleRunKey(entry);
+        if (runKey !== "\u0000" && (unfinishedCapsuleRuns.has(runKey) || unfinishedTaskRuns.has(runKey))) return true;
+        if (entry?.capsuleId && this.capsules.get(entry.capsuleId)?.state !== "completed"
+          && this.capsules.get(entry.capsuleId)?.state !== "failed") return true;
+        return false;
+      };
+      for (const [key, entry] of this.operations) {
+        if (entry.state === "task_tab") {
+          if (oldEnough(entry) && ["completed", "failed"].includes(entry.lifecycleState)
+            && entry.userHelpRequired !== true && !entry.resumeToken && !entry.quarantine
+            && !reconciliationRequired(entry) && !unknownEffect(entry) && !cleanupIncomplete(entry)) {
+            this.operations.delete(key); taskTabKeys.push(key);
+          }
+        } else if (terminal.has(entry.state) && oldEnough(entry)
+          && !unknownEffect(entry) && !reconciliationRequired(entry) && !hasUnfinishedReference(entry)
+          && !cleanupIncomplete(entry)) {
+          this.operations.delete(key); operationKeys.push(key);
+        }
+      }
+      for (const [key, capsule] of this.capsules) {
+        const failedNeedsRetention = capsule.state === "failed"
+          && (unknownEffect(capsule)
+            || reconciliationRequired(capsule)
+            || capsule.retention?.policy === "retain_until_resume"
+            || capsule.retention?.userHelpRequired === true
+            || cleanupIncomplete(capsule));
+        if (["completed", "failed"].includes(capsule.state) && oldEnough(capsule) && !failedNeedsRetention) {
+          this.capsules.delete(key); capsuleKeys.push(key);
+        }
+      }
+      if (operationKeys.length || taskTabKeys.length || capsuleKeys.length) await this.#persist();
+      return {
+        operations: operationKeys.length,
+        taskTabs: taskTabKeys.length,
+        capsules: capsuleKeys.length,
+        operationKeys,
+        taskTabKeys,
+        capsuleKeys,
+        cutoff: new Date(cutoff).toISOString(),
+      };
+    });
+  }
+
+  /** Explicit, signed callers may purge their own terminal operation records. */
+  async purgeOwnedOperations({ taskId, runId, operationIds, purgeId, purgeAuthorityId = null } = {}) {
+    return this.#queue(async () => {
+      await this.ready();
+      if (typeof taskId !== "string" || !taskId.trim()) throw authorityError("task_id_required", "Purge requires a task id");
+      if (typeof runId !== "string" || !runId.trim()) throw authorityError("run_id_required", "Purge requires a run id");
+      if (!Array.isArray(operationIds) || operationIds.length < 1 || operationIds.length > 500) throw authorityError("operation_ids_invalid", "Purge requires 1 to 500 operation ids");
+      if (typeof purgeId !== "string" || !purgeId.trim()) throw authorityError("purge_id_required", "Purge requires an idempotent purge id");
+      const requested = [...new Set(operationIds.map((value) => {
+        if (typeof value !== "string" || !value.trim()) throw authorityError("operation_id_invalid", "Purge operation ids must be non-empty strings");
+        return value.trim();
+      }))];
+      if (requested.length !== operationIds.length) throw authorityError("operation_ids_duplicate", "Purge operation ids must be unique");
+      const terminal = new Set(["applied", "blocked", "reconciled"]);
+      const matches = requested.map((id) => {
+        const direct = this.operations.get(id);
+        if (direct) return { key: id, entry: direct };
+        const found = [...this.operations.entries()].find(([, entry]) => entry?.operationId === id);
+        return found ? { key: found[0], entry: found[1] } : null;
+      });
+      if (matches.some((match) => !match)) throw authorityError("operation_not_found", "Every purge target must exist in the operation ledger");
+      const invalid = matches.filter(({ entry }) => entry.state === "task_tab"
+        || entry.binding?.taskId !== taskId || entry.binding?.runId !== runId
+        || !terminal.has(entry.state) || isUnresolvedOperationEffect(entry));
+      if (invalid.length) throw authorityError("operation_purge_target_invalid", "Purge targets must be terminal records owned by the exact task and run", { operationIds: invalid.map(({ entry }) => entry.operationId ?? null) });
+      for (const { key, entry } of matches) this.operations.delete(key);
+      await this.#persist();
+      return { purgeId, purgedCount: matches.length, operationIds: matches.map(({ entry }) => entry.operationId ?? null), purgeAuthorityId };
+    });
+  }
 
   consumeAuthority(authority) {
     return this.#queue(async () => {

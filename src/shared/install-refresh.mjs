@@ -61,11 +61,31 @@ export function automaticRefreshPlan({ restartBroker = false, refreshExtension =
  */
 export function canSyncControlPlaneArtifacts(status = {}) {
   if (!deriveMaintenanceProfile(status)) return false;
+  const sessionList = Array.isArray(status?.logicalSessions) ? status.logicalSessions : [];
+  const leaseSessionIds = new Set((Array.isArray(status?.exactTabLeases) ? status.exactTabLeases : [])
+    .map((lease) => lease?.sessionId).filter(Boolean));
+  const pendingSessionIds = new Set((Array.isArray(status?.pendingOperations) ? status.pendingOperations : [])
+    .map((operation) => operation?.sessionId).filter(Boolean));
+  const taskTabSessionIds = new Set((Array.isArray(status?.taskTabs) ? status.taskTabs : [])
+    .map((tab) => tab?.sessionId).filter(Boolean));
+  const hasAuthoritativeCounts = Number.isFinite(Number(status?.logicalSessionCount))
+    && status?.staleIdleSessionCount !== undefined;
+  const computedStaleIdleSessions = sessionList.filter((session) => {
+    if (leaseSessionIds.has(session.sessionId) || pendingSessionIds.has(session.sessionId) || taskTabSessionIds.has(session.sessionId)) return false;
+    const lastSeen = Date.parse(session.lastSeenAt ?? "");
+    return Number.isFinite(lastSeen) && Date.now() - lastSeen >= 5 * 60_000;
+  }).length;
+  // maintenanceBoundary may already have classified the complete session
+  // inventory. Do not subtract stale sessions twice from its live count.
+  const staleIdleSessions = Math.max(0, Number(status?.staleIdleSessionCount ?? computedStaleIdleSessions));
+  const logicalSessions = hasAuthoritativeCounts
+    ? Math.max(0, Number(status.logicalSessionCount))
+    : Math.max(0, Number(status?.logicalSessionCount ?? sessionList.length) - staleIdleSessions);
   const activeTimedOut = Number(status?.timedOutOperationActiveCount ?? status?.timedOutOperationUnresolvedCount ?? 0);
   const activeReconciliation = Number(status?.reconciliationPendingActiveCount ?? 0);
   const activeTaskTabs = Number(status?.activeTaskTabCount ?? 0);
   return [
-    status?.logicalSessionCount,
+    logicalSessions,
     status?.exactTabLeaseCount,
     status?.pendingOperationCount,
     status?.queueCount,

@@ -7,6 +7,7 @@ function parseArgs(argv) {
   for (let index = 0; index < argv.length; index += 1) {
     const value = argv[index];
     if (value === "--json") options.json = true;
+    else if (value === "--strict") options.strict = true;
     else if (value === "--output" || value.startsWith("--output=")) options.output = value === "--output" ? argv[++index] : value.slice("--output=".length);
     else if (value === "--data-dir") options.dataDir = argv[++index];
     else if (value === "--socket") options.socketPath = argv[++index];
@@ -22,17 +23,22 @@ function parseArgs(argv) {
 
 const options = parseArgs(process.argv.slice(2));
 if (options.help) {
-  process.stdout.write("Usage: npm run doctor -- [--json] [--output <path>] [--data-dir <path>] [--socket <path>] [--state-file <path>] [--source-root <path>] [--installed-root <path>] [--chrome-user-data-dir <path>]\n");
+  process.stdout.write("Usage: npm run doctor -- [--json] [--strict] [--output <path>] [--data-dir <path>] [--socket <path>] [--state-file <path>] [--source-root <path>] [--installed-root <path>] [--chrome-user-data-dir <path>]\n");
   process.exit(0);
 }
 try {
   const report = await collectDoctorDiagnostics(options);
+  const strictMaintenance = (report.maintenance ?? []).filter((item) => item.severity === "high");
+  if (options.strict) {
+    report.strict_ready = report.result === "ok" && strictMaintenance.length === 0;
+    report.strict_blockers = strictMaintenance.map((item) => item.code);
+  }
   // --output was the legacy JSON-file interface; retain that shape unless
   // the caller explicitly asks for text-only output behavior.
   const output = (options.json || options.output) ? `${JSON.stringify(report, null, 2)}\n` : formatDoctorText(report);
   if (options.output) await writeFile(options.output, output, { mode: 0o600 });
   process.stdout.write(output);
-  process.exitCode = report.result === "ok" ? 0 : 1;
+  process.exitCode = report.result === "ok" && (!options.strict || strictMaintenance.length === 0) ? 0 : 1;
 } catch (error) {
   process.stderr.write(`${JSON.stringify({ schema: "aos.chrome_companion.doctor_diagnostics.v1", result: "unavailable", readOnly: true, error: error instanceof Error ? error.message : String(error) })}\n`);
   process.exitCode = 1;

@@ -650,6 +650,35 @@ export class BrokerClient {
     }, { timeoutMs });
   }
 
+  async requestPurgeOwnedOperations(params, { timeoutMs = 30_000 } = {}) {
+    const secret = await this.#issuerSecret();
+    const payload = {
+      runId: params.runId,
+      taskId: params.taskId,
+      operationIds: params.operationIds,
+      confirmPurge: params.confirmPurge === true,
+    };
+    const authority = createAuthorityEnvelope({
+      issuer: this.issuer,
+      secret,
+      runId: params.runId,
+      taskId: params.taskId,
+      ownerKey: params.sessionId,
+      method: "maintenance.operations.purge",
+      intent: "purge_terminal_owned_operations",
+      targetOrigin: "*",
+      idempotencyKey: params.idempotencyKey,
+      payload,
+      approved: true,
+    });
+    return this.request("maintenance.operations.purge", {
+      ...payload,
+      idempotencyKey: params.idempotencyKey,
+      sessionId: params.sessionId,
+      authority,
+    }, { timeoutMs });
+  }
+
   close() {
     this.closed = true;
     this.connected = false;

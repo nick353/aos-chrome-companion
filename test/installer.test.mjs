@@ -20,6 +20,9 @@ test("local installer packages one Companion product and keeps the two-extension
   assert.match(source, /AOS_CHROME_COMPANION_INSTALL_ROOT/);
   assert.match(source, /StartInterval/);
   assert.match(source, /launchctl/);
+  assert.match(source, /codexPlugin/);
+  assert.match(source, /plugin.*marketplace.*add/s);
+  assert.match(source, /plugin.*add/s);
   assert.match(source, /setupComplete/);
   assert.match(source, /chrome_web_store_signed_extension_missing/);
   assert.match(source, /apple_developer_id_pkg_signature_missing/);
@@ -69,4 +72,16 @@ test("local installer packages one Companion product and keeps the two-extension
   assert.match(sync, /extensionRefresh\?\.result\s*!==\s*"reflected"/u);
   assert.match(sync, /companion_profile_not_connected_after_broker_restart/u);
   assert.match(sync, /do_not_repeat_extension_reload/u);
+
+  const server = await readFile(resolve("src/mcp/server.mjs"), "utf8");
+  assert.match(server, /transport\.onerror/);
+  assert.match(server, /transport\.onclose/);
+  assert.match(server, /shutdown\("transport_closed"\)/);
+  assert.match(server, /shuttingDown/);
+
+  const launcher = await readFile(resolve("plugins/aos-chrome-companion/scripts/start-mcp.mjs"), "utf8");
+  assert.match(launcher, /MCP starting root=/);
+  assert.match(launcher, /setup_error/);
+  assert.match(launcher, /let started = false/);
+  assert.match(launcher, /fileURLToPath\(new URL\("\.\.\/\.\.\/\.\.\/"/);
 });

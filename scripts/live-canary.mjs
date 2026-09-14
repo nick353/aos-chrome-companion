@@ -45,7 +45,9 @@ const report = {
 // the client deadline above the per-operation 30s broker deadline so the
 // broker can return its signed unknown-effect receipt instead of leaving a
 // detached discovered tab behind merely because the client gave up first.
-const CANARY_REQUEST_TIMEOUT_MS = 180_000;
+// The Companion operation contract caps one request at 60 seconds. Keep the
+// canary within that same public contract instead of failing before dispatch.
+const CANARY_REQUEST_TIMEOUT_MS = 60_000;
 const CANARY_READ_TIMEOUT_MS = 10_000;
 let currentStep = "startup";
 
@@ -141,7 +143,6 @@ function transaction(record, phase, { keepTaskTab }) {
           { method: "page.type", params: { locator: { testId: "canary-semantic-input" }, text: `semantic-${record.lane}`, clear: true, physicalFallback: "on_verified_no_effect" } },
           { method: "page.type", params: { locator: { testId: "canary-physical-input" }, text: `physical-${record.lane}`, clear: true, physicalFallback: "on_verified_no_effect" } },
           { method: "page.upload", params: uploadParams },
-          { method: "page.waitFor", params: { locator: { role: "status", name: "uploaded" }, timeoutMs: 5_000 } },
         ]
       : [{ method: "page.waitFor", params: { locator: { testId: "ready" }, timeoutMs: 5_000 } }],
     reuseTaskTab: true,
@@ -239,11 +240,18 @@ try {
   };
 
   const createStartedAt = performance.now();
-  const created = await Promise.all(laneRecords.map(async (record) => {
+  // The physical-fallback lane temporarily promotes its exact task tab to
+  // the foreground for trusted CDP input.  Keep those transactions ordered
+  // so another canary lane cannot change the active tab between the visual
+  // proof and the physical dispatch.  Read-only concurrency is covered by
+  // canary:parallel:readonly; this lane specifically proves foreground
+  // ownership and the no-replay boundary for physical input.
+  const created = [];
+  for (const record of laneRecords) {
     const result = await transaction(record, "create", { keepTaskTab: true });
     record.retained = result;
-    return result;
-  }));
+    created.push(result);
+  }
   const createElapsedMs = Math.round(performance.now() - createStartedAt);
   created.forEach((result, index) => {
     const record = laneRecords[index];
@@ -256,15 +264,24 @@ try {
     if (result.tab?.reused !== false || !Number.isSafeInteger(result.tab?.groupId)) {
       throw new CompanionError("grouped_task_tab_not_verified", `Lane ${record.lane} did not create a verified grouped task tab`);
     }
-    const semanticInput = result.actions?.find((action) => action.method === "page.type" && action.params?.locator?.testId === "canary-semantic-input");
-    const physicalInput = result.actions?.find((action) => action.method === "page.type" && action.params?.locator?.testId === "canary-physical-input");
-    if (semanticInput?.result?.inputStrategy !== "semantic" || semanticInput.result.physicalFallbackAttempted !== false) {
+    // Transaction action records intentionally omit replayable input params;
+    // the signed order is the stable identity for these two canary steps.
+    const typeInputs = result.actions?.filter((action) => action.method === "page.type") ?? [];
+    const semanticInput = typeInputs[0];
+    const physicalInput = typeInputs[1];
+    if (semanticInput?.result?.semanticCommitted !== true
+      || (semanticInput.result.inputStrategy !== undefined && semanticInput.result.inputStrategy !== "semantic")
+      || semanticInput.result.physicalFallbackAttempted === true) {
       throw new CompanionError("semantic_input_canary_not_verified", `Lane ${record.lane} did not retain the semantic input path`);
     }
     if (physicalInput?.result?.inputStrategy !== "physical_fallback"
       || physicalInput.result.physicalFallbackAttempted !== true
       || physicalInput.result.physical?.trustedInput !== true) {
       throw new CompanionError("physical_input_canary_not_verified", `Lane ${record.lane} did not complete the verified physical fallback path`);
+    }
+    const upload = result.actions?.find((action) => action.method === "page.upload");
+    if (upload?.result?.uploaded !== true || upload.result.uploadReadbackVerified !== true) {
+      throw new CompanionError("upload_canary_not_verified", `Lane ${record.lane} did not complete the verified file-input upload path`);
     }
   });
 
@@ -322,8 +339,8 @@ try {
       uploadVerified: record.retained.actions?.some((action) => action.method === "page.upload") === true
         && record.retained.actions?.some((action) => action.method === "page.waitFor" && action.result?.ok === true) === true,
       semanticInputStrategy: record.retained.actions?.find((action) => action.method === "page.type" && action.params?.locator?.testId === "canary-semantic-input")?.result?.inputStrategy ?? null,
-      physicalInputStrategy: record.retained.actions?.find((action) => action.method === "page.type" && action.params?.locator?.testId === "canary-physical-input")?.result?.inputStrategy ?? null,
-      physicalTrustedInput: record.retained.actions?.find((action) => action.method === "page.type" && action.params?.locator?.testId === "canary-physical-input")?.result?.physical?.trustedInput === true,
+      physicalInputStrategy: record.retained.actions?.filter((action) => action.method === "page.type")[1]?.result?.inputStrategy ?? null,
+      physicalTrustedInput: record.retained.actions?.filter((action) => action.method === "page.type")[1]?.result?.physical?.trustedInput === true,
       cleanupClosed: true,
     });
   });

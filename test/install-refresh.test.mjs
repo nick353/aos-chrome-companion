@@ -62,6 +62,31 @@ test("control-plane artifacts can converge offline only when the profile is idle
   }), false);
 });
 
+test("authoritative live-session counts are not reduced twice", () => {
+  assert.equal(canSyncControlPlaneArtifacts({
+    profiles: [{ profileInstanceId: "profile-2", connected: false }],
+    logicalSessionCount: 1,
+    staleIdleSessionCount: 1,
+    exactTabLeaseCount: 0,
+    pendingOperationCount: 0,
+    timedOutOperationActiveCount: 0,
+    reconciliationPendingActiveCount: 0,
+    queueCount: 0,
+    activeTaskTabCount: 0,
+  }), false);
+  assert.equal(canSyncControlPlaneArtifacts({
+    profiles: [{ profileInstanceId: "profile-2", connected: false }],
+    logicalSessionCount: 0,
+    staleIdleSessionCount: 1,
+    exactTabLeaseCount: 0,
+    pendingOperationCount: 0,
+    timedOutOperationActiveCount: 0,
+    reconciliationPendingActiveCount: 0,
+    queueCount: 0,
+    activeTaskTabCount: 0,
+  }), true);
+});
+
 test("offline maintenance derives one profile from retained task tabs but rejects ambiguity", () => {
   assert.deepEqual(deriveMaintenanceProfile({
     profiles: [],

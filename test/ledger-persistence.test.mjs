@@ -48,6 +48,62 @@ test('task-tab deletions and profile updates survive restart', async (t) => {
   assert.equal(restored.getTaskTab('p', 42), null);
   assert.equal(restored.getProfileBinding('p').generation, 'gen');
 });
+test('terminal garbage collection removes only old safe records and preserves unknown effects', async (t) => {
+  const old = new Date(Date.now() - 2 * 24 * 60 * 60_000).toISOString();
+  const { ledger } = await fixture(t, { operations: [
+    { idempotencyKey: 'safe-old', operationId: 'op-safe-old', state: 'applied', updatedAt: old, binding: { taskId: 'task-a', runId: 'run-a' } },
+    { idempotencyKey: 'unknown-old', operationId: 'op-unknown-old', state: 'unknown_effect', updatedAt: old, binding: { taskId: 'task-a', runId: 'run-a' } },
+    { idempotencyKey: 'safe-new', operationId: 'op-safe-new', state: 'applied', updatedAt: new Date().toISOString(), binding: { taskId: 'task-a', runId: 'run-a' } },
+  ] });
+  const result = await ledger.gcTerminal({ now: Date.now(), retentionMs: 24 * 60 * 60_000 });
+  assert.equal(result.operations, 1);
+  assert.deepEqual(result.operationKeys, ['safe-old']);
+  assert.deepEqual(result.taskTabKeys, []);
+  assert.deepEqual(result.capsuleKeys, []);
+  assert.equal(ledger.get('safe-old'), undefined);
+  assert.equal(ledger.get('unknown-old').state, 'unknown_effect');
+  assert.equal(ledger.get('safe-new').state, 'applied');
+});
+
+test('terminal GC retains unresolved capsules, referenced operations, and reports exact deletion keys', async (t) => {
+  const old = new Date(Date.now() - 2 * 24 * 60 * 60_000).toISOString();
+  const { ledger } = await fixture(t, {
+    operations: [
+      { idempotencyKey: 'delete-me', operationId: 'op-delete-me', state: 'applied', updatedAt: old },
+      { idempotencyKey: 'unknown', operationId: 'op-unknown', state: 'applied', effectState: 'unknown_effect', updatedAt: old },
+      { idempotencyKey: 'reconcile', operationId: 'op-reconcile', state: 'reconciled', reconciliationRequired: true, updatedAt: old },
+      { idempotencyKey: 'referenced', operationId: 'op-referenced', state: 'blocked', binding: { taskId: 'task-open', runId: 'run-open' }, updatedAt: old },
+      { idempotencyKey: 'task-tab:profile:7', state: 'task_tab', profileInstanceId: 'profile', tabId: 7, taskId: 'task-done', runId: 'run-done', lifecycleState: 'completed', updatedAt: old },
+    ],
+    taskCapsules: [
+      { schema: 'aos.chrome_companion.task_execution_capsule.v1', capsuleId: 'failed-unknown', taskId: 'task-failed', runId: 'run-failed', state: 'failed', updatedAt: old, effect: { effectState: 'unknown_effect' } },
+      { schema: 'aos.chrome_companion.task_execution_capsule.v1', capsuleId: 'failed-reconcile', taskId: 'task-failed', runId: 'run-reconcile', state: 'failed', updatedAt: old, reconciliationRequired: true },
+      { schema: 'aos.chrome_companion.task_execution_capsule.v1', capsuleId: 'failed-retain', taskId: 'task-failed', runId: 'run-retain', state: 'failed', updatedAt: old, retention: { policy: 'retain_until_resume' } },
+      { schema: 'aos.chrome_companion.task_execution_capsule.v1', capsuleId: 'failed-cleanup', taskId: 'task-failed', runId: 'run-cleanup', state: 'failed', updatedAt: old, completion: { cleanup: { state: 'pending' } } },
+      { schema: 'aos.chrome_companion.task_execution_capsule.v1', capsuleId: 'open', taskId: 'task-open', runId: 'run-open', state: 'executing', updatedAt: old },
+      { schema: 'aos.chrome_companion.task_execution_capsule.v1', capsuleId: 'completed', taskId: 'task-done', runId: 'run-done', state: 'completed', updatedAt: old },
+    ],
+  });
+  const result = await ledger.gcTerminal({ now: Date.now(), retentionMs: 24 * 60 * 60_000 });
+  assert.deepEqual(result.operationKeys, ['delete-me']);
+  assert.deepEqual(result.taskTabKeys, ['task-tab:profile:7']);
+  assert.deepEqual(result.capsuleKeys, ['completed']);
+  for (const key of ['unknown', 'reconcile', 'referenced']) assert.ok(ledger.get(key));
+  for (const key of ['failed-unknown', 'failed-reconcile', 'failed-retain', 'failed-cleanup', 'open']) assert.ok(ledger.getTaskCapsule(key));
+});
+
+test('explicit purge is exact-owner and terminal-only', async (t) => {
+  const { ledger } = await fixture(t, { operations: [
+    { idempotencyKey: 'owned', operationId: 'op-owned', state: 'blocked', binding: { taskId: 'task-a', runId: 'run-a' } },
+    { idempotencyKey: 'foreign', operationId: 'op-foreign', state: 'blocked', binding: { taskId: 'task-b', runId: 'run-b' } },
+    { idempotencyKey: 'uncertain', operationId: 'op-uncertain', state: 'unknown_effect', binding: { taskId: 'task-a', runId: 'run-a' } },
+  ] });
+  const result = await ledger.purgeOwnedOperations({ taskId: 'task-a', runId: 'run-a', operationIds: ['op-owned'], purgeId: 'purge-1' });
+  assert.equal(result.purgedCount, 1);
+  assert.equal(ledger.get('owned'), undefined);
+  await assert.rejects(ledger.purgeOwnedOperations({ taskId: 'task-a', runId: 'run-a', operationIds: ['op-foreign'], purgeId: 'purge-2' }), /terminal records owned/);
+  await assert.rejects(ledger.purgeOwnedOperations({ taskId: 'task-a', runId: 'run-a', operationIds: ['op-uncertain'], purgeId: 'purge-3' }), /terminal records owned/);
+});
 test('checkpoint compaction survives a crash before old journal truncation', async (t) => {
   const { ledger, statePath, journal } = await fixture(t);
   for (let n = 0; n < 128; n++) await ledger.prepare(operation(`op-${n}`));

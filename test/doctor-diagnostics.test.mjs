@@ -86,13 +86,13 @@ test("uses broker readback for runtime checks and keeps active usage in maintena
   }
 });
 
-test("does not treat install identity stamping as runtime source drift", async () => {
+test("does not treat intentional dev-local install stamping as identity drift", async () => {
   const root = await mkdtemp(join(tmpdir(), "aos-doctor-drift-"));
   try {
     const installed = join(root, "installed");
     await mkdir(join(root, "src", "shared"), { recursive: true });
     await mkdir(join(installed, "src", "shared"), { recursive: true });
-    await writeFile(join(root, "src", "shared", "build-info.mjs"), 'export const INSTALL_BUILD_ID = "source";\n');
+    await writeFile(join(root, "src", "shared", "build-info.mjs"), 'export const INSTALL_BUILD_ID = "dev-local";\n');
     await writeFile(join(installed, "src", "shared", "build-info.mjs"), 'export const INSTALL_BUILD_ID = "installed";\n');
     const report = await collectDoctorDiagnostics({
       dataDir: root,
@@ -108,7 +108,7 @@ test("does not treat install identity stamping as runtime source drift", async (
       },
     });
     assert.equal(report.buildSchema.sourceDrift, false);
-    assert.equal(report.buildSchema.installationIdentityDrift, true);
+    assert.equal(report.buildSchema.installationIdentityDrift, false);
     assert.equal(report.buildSchema.runtimeMismatch, false);
     assert.equal(report.blockers.some(({ code }) => code === "build_or_schema_mismatch"), false);
     assert.equal(report.maintenance.some(({ code }) => code === "source_install_control_plane_drift"), false);

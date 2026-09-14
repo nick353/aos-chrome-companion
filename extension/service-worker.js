@@ -1562,6 +1562,22 @@ function sameVisualTargetState(before, after) {
     && sameRect;
 }
 
+function visualTargetStateDifferences(before, after) {
+  const differences = [];
+  if (String(before?.url || "") !== String(after?.url || "")) differences.push("url");
+  if (before?.pageInstanceId !== after?.pageInstanceId) differences.push("pageInstanceId");
+  if (Number(before?.point?.x) !== Number(after?.point?.x) || Number(before?.point?.y) !== Number(after?.point?.y)) differences.push("point");
+  if (Number(before?.viewport?.width) !== Number(after?.viewport?.width)
+    || Number(before?.viewport?.height) !== Number(after?.viewport?.height)
+    || Number(before?.viewport?.devicePixelRatio) !== Number(after?.viewport?.devicePixelRatio)
+    || Number(before?.viewport?.scale ?? 1) !== Number(after?.viewport?.scale ?? 1)) differences.push("viewport");
+  if (Number(before?.scroll?.x) !== Number(after?.scroll?.x) || Number(before?.scroll?.y) !== Number(after?.scroll?.y)) differences.push("scroll");
+  const beforeRect = before?.clippedRect;
+  const afterRect = after?.clippedRect;
+  if (!["x", "y", "width", "height"].every((field) => Number(beforeRect?.[field]) === Number(afterRect?.[field]))) differences.push("clippedRect");
+  return differences;
+}
+
 async function runTypeWithVerifiedPhysicalFallback(tabId, payload, params) {
   if (!payload.locator || typeof payload.locator !== "object" || Array.isArray(payload.locator)) {
     throw companionError("physical_fallback_semantic_locator_required", "Automatic physical input fallback requires one exact semantic locator");
@@ -1634,6 +1650,19 @@ async function runTypeWithVerifiedPhysicalFallback(tabId, payload, params) {
       { operationEffectState: "none", mutationDispatchAttempted: true, semanticNoEffectVerified: true },
     );
   }
+  // Chrome may recompute a background tab's visual viewport/layout after the
+  // semantic no-effect readback.  The next step is an explicitly authorized
+  // trusted physical-input action, so promote this exact tab before taking
+  // the final geometry proof. The strict identity/geometry comparison below
+  // remains unchanged; this only prevents background-layout churn from being
+  // mistaken for a user/page target replacement.
+  const physicalTab = await chrome.tabs.get(tabId);
+  if (Number.isSafeInteger(physicalTab.windowId)) {
+    await Promise.all([
+      chrome.tabs.update(tabId, { active: true }),
+      chrome.windows.update(physicalTab.windowId, { focused: true }),
+    ]);
+  }
   const afterSemanticTarget = await runPageOperation(
     tabId,
     "inspectVisualTarget",
@@ -1644,7 +1673,11 @@ async function runTypeWithVerifiedPhysicalFallback(tabId, payload, params) {
     throw companionError(
       "physical_fallback_target_changed",
       "The exact semantic and visual input target changed before physical fallback",
-      { operationEffectState: "unknown", mutationDispatchAttempted: true },
+      {
+        operationEffectState: "unknown",
+        mutationDispatchAttempted: true,
+        nextAction: `fresh_visual_target_readback_required:${visualTargetStateDifferences(beforeTarget, afterSemanticTarget).join(",") || "unclassified"}`,
+      },
     );
   }
   const physical = await runTrustedVisualInput(tabId, "visual.typeText", {

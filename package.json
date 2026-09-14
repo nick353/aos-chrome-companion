@@ -16,6 +16,7 @@
     "canary:faults": "node scripts/fault-injection-canary.mjs",
     "canary:real:readonly": "node scripts/real-site-readonly-canary.mjs",
     "doctor": "node scripts/doctor-diagnostics.mjs",
+    "doctor:strict": "node scripts/doctor-diagnostics.mjs --strict",
     "soak:readonly": "node scripts/soak-readonly.mjs",
     "migrate:task-tabs": "node scripts/group-current-task-tabs.mjs",
     "cleanup:task-tabs": "node scripts/cleanup-task-tabs.mjs",
@@ -31,7 +32,7 @@
     "start:mcp": "node src/mcp/server.mjs",
     "start:native-host": "node src/native-host/main.mjs",
     "install:dev:macos": "node scripts/install-dev-macos.mjs",
-    "test": "node --test"
+    "test": "node --test --test-concurrency=1"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",

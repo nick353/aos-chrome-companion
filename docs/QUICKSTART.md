@@ -36,6 +36,7 @@ run the local doctor for one bounded snapshot of the common transport causes:
 ```bash
 npm run doctor
 npm run doctor -- --json
+npm run doctor -- --strict --json
 ```
 
 The doctor is read-only. It counts broker processes, inspects the socket/data
@@ -43,6 +44,18 @@ directory, compares build and operation-schema values, lists connected
 profiles/sessions/leases, reads ledger and reconciliation counts, and compares
 the auto-setup receipt with the current Profile 2 detection. It does not start
 or stop a broker, reload Chrome, adopt foreign resources, or edit state.
+
+If doctor reports `source_install_control_plane_drift`, the checkout and the
+installed MCP runtime differ. Run the control-plane sync only after doctor
+reports no active leases, queues, pending operations, or active reconciliation:
+
+```bash
+node scripts/sync-control-plane-macos.mjs --apply --restart-broker
+```
+
+The command defers itself when the boundary is not idle. Do not copy files into
+the installed app or kill the broker manually; that can leave the Extension
+generation and MCP runtime on different builds.
 
 If status reports a different build, profile, task, generation, or lease,
 stop and use the exact recovery instruction in the error. Do not retry a
@@ -65,6 +78,14 @@ timed-out mutation until its effect has been reconciled.
   boundary; do not repeatedly reload Chrome.
 - For a stale task-tab record, use `purge:missing-task-tabs` only after a fresh
   `tabs.list` confirms the exact tab is gone.
+
+### `Transport closed`
+
+The Codex App owns the stdio MCP lifetime. When it closes, the old Companion
+task/session cannot be revived by reloading the Chrome extension. Create one
+new Codex task, let the plugin start a new MCP process, then run fresh status
+and session setup. Never replay an operation whose response was interrupted;
+read the provider or exact page back first because its effect may be unknown.
 
 For a complete protocol and security description, see [PROTOCOL.md](PROTOCOL.md)
 and [SECURITY.md](SECURITY.md).

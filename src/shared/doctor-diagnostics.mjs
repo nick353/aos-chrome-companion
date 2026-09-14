@@ -254,8 +254,14 @@ async function runtimeBuildSchema({ sourceRoot, installedRoot, status }) {
     || generated.value.version !== OPERATION_SCHEMA_VERSION
     || generated.value.schemaDigest !== OPERATION_SCHEMA_DIGEST
   );
+  // The source tree deliberately keeps the Node build identity at `dev-local`.
+  // The local installer stamps the installed Node and Extension trees with a
+  // stable install id, while the unpacked Extension source is stamped with
+  // that same id. Treat the intentional source-side dev-local value as a
+  // development boundary, not as source/install drift.
+  const sourceNodeIdentityIsDevelopment = sourceBuild === "dev-local";
   const installationIdentityDrift = Boolean(
-    (installedBuild && sourceBuild && installedBuild !== sourceBuild)
+    (!sourceNodeIdentityIsDevelopment && installedBuild && sourceBuild && installedBuild !== sourceBuild)
     || (installedExtensionBuild && sourceExtensionBuild && installedExtensionBuild !== sourceExtensionBuild),
   );
   const sourceDrift = controlPlaneDrift.length > 0;
@@ -350,7 +356,18 @@ export async function collectDoctorDiagnostics(options = {}) {
   if (connectedProfiles.length > 1) addBlocker(blockers, "multiple_connected_profiles", { count: connectedProfiles.length });
   if (buildSchema.runtimeMismatch) addBlocker(blockers, "build_or_schema_mismatch");
   if (buildSchema.sourceDrift) maintenance.push({ code: "source_install_control_plane_drift", severity: "high", files: buildSchema.controlPlaneDrift.slice(0, 20), nextAction: "refresh_installed_runtime_at_an_idle_boundary" });
-  if (ledger.ledger.reconciliationBacklogCount > 0) maintenance.push({ code: "reconciliation_backlog", severity: "high", durable: ledger.ledger.reconciliationBacklogCount, nextAction: "inspect_exact_targets_and_reconcile_without_replay" });
+  const activeReconciliationCount = status?.reconciliationPendingActiveCount;
+  if (ledger.ledger.reconciliationBacklogCount > 0) {
+    const activeReconciliationKnown = Number.isFinite(Number(activeReconciliationCount));
+    const activeReconciliation = activeReconciliationKnown && Number(activeReconciliationCount) > 0;
+    maintenance.push({
+      code: "reconciliation_backlog",
+      severity: activeReconciliation || !activeReconciliationKnown ? "high" : "medium",
+      durable: ledger.ledger.reconciliationBacklogCount,
+      active: activeReconciliationKnown ? Number(activeReconciliationCount) : null,
+      nextAction: "inspect_exact_targets_and_reconcile_without_replay",
+    });
+  }
   if ((status?.reconciliationPendingActiveCount ?? 0) > 0) addBlocker(blockers, "active_reconciliation_backlog", { active: status.reconciliationPendingActiveCount });
   if (sessions.length > 0) maintenance.push({ code: "active_logical_sessions", count: sessions.length });
   if (leases.length > 0) maintenance.push({ code: "active_tab_leases", count: leases.length });

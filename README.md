@@ -42,12 +42,19 @@ or writes Companion state:
 ```bash
 npm run doctor
 npm run doctor -- --json
+npm run doctor -- --strict --json
+# equivalent package command
+npm run doctor:strict -- --json
 ```
 
 Use `--data-dir`, `--socket`, `--state-file`, `--installed-root`, or
 `--chrome-user-data-dir` when diagnosing a non-default installation. A
 non-zero exit means the report contains a blocker; use the exact blocker and
 the paths in the JSON report as the restart point.
+The `--strict` form is the install/readiness gate: active reconciliation and
+source/install control-plane drift also return a non-zero exit. Historical
+unknown-effect records remain visible as maintenance warnings and are never
+deleted or replayed.
 
 When a session appears to disconnect, run the read-only doctor before
 restarting anything:

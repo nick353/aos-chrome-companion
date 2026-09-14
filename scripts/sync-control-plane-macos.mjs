@@ -39,6 +39,7 @@ const ACTIVE_TASK_TAB_STATES = new Set([
   "admitted",
   "awaiting_user",
 ]);
+const STALE_IDLE_SESSION_MS = 5 * 60_000;
 
 function isLedgerOnlyTaskTab(tab) {
   return tab?.retentionPolicy === "ledger_only" && tab.userHelpRequired !== true;
@@ -234,8 +235,17 @@ export function maintenanceBoundary(status) {
   const maintenanceProfile = deriveMaintenanceProfile(status);
   const profiles = maintenanceProfile ? [maintenanceProfile] : runtimeProfiles;
   const taskTabs = Array.isArray(status?.taskTabs) ? status.taskTabs : [];
-  const liveSessions = (Array.isArray(status?.logicalSessions) ? status.logicalSessions : [])
+  const allSessions = (Array.isArray(status?.logicalSessions) ? status.logicalSessions : [])
     .filter((session) => session?.profileInstanceId === profiles[0]?.profileInstanceId);
+  const leasedSessionIds = new Set((Array.isArray(status?.exactTabLeases) ? status.exactTabLeases : [])
+    .map((lease) => lease?.sessionId).filter(Boolean));
+  const pendingSessionIds = new Set((Array.isArray(status?.pendingOperations) ? status.pendingOperations : [])
+    .map((operation) => operation?.sessionId).filter(Boolean));
+  const liveSessions = allSessions.filter((session) => {
+    if (leasedSessionIds.has(session.sessionId) || pendingSessionIds.has(session.sessionId)) return true;
+    const lastSeen = Date.parse(session.lastSeenAt ?? "");
+    return !Number.isFinite(lastSeen) || Date.now() - lastSeen < STALE_IDLE_SESSION_MS;
+  });
   const liveSessionIds = new Set(liveSessions.map((session) => session.sessionId).filter(Boolean));
   const leasedTabKeys = new Set((Array.isArray(status?.exactTabLeases) ? status.exactTabLeases : [])
     .filter((lease) => lease?.profileInstanceId === profiles[0]?.profileInstanceId)
@@ -254,7 +264,7 @@ export function maintenanceBoundary(status) {
       ? status.timedOutOperationUnresolvedCount
       : 0;
   const blockers = [];
-  if (Number(status?.logicalSessionCount) > 0) blockers.push("logical_sessions_active");
+  const staleIdleSessionCount = Math.max(0, allSessions.length - liveSessions.length);
   if (Number(status?.exactTabLeaseCount) > 0) blockers.push("exact_tab_leases_active");
   if (Number(status?.pendingOperationCount) > 0) blockers.push("pending_operations_active");
   if (activeTimedOutOperations > 0) blockers.push("timed_out_operations_active");
@@ -275,6 +285,8 @@ export function maintenanceBoundary(status) {
     && canSyncControlPlaneArtifacts({
       ...status,
       profiles,
+      logicalSessionCount: liveSessions.length,
+      staleIdleSessionCount,
       activeTaskTabCount: activeTaskTabs.length,
       timedOutOperationActiveCount: activeTimedOutOperations,
     });
@@ -293,6 +305,7 @@ export function maintenanceBoundary(status) {
       && ["reconciliation_required", "operation_effect_unknown"].includes(tab?.lifecycleState)
       && taskTabIsLive(tab)).length,
     retainedTaskTabCount: taskTabs.length,
+    staleIdleSessionCount,
     activeTaskTabs: activeTaskTabs.map((tab) => ({ tabId: tab.tabId, taskId: tab.taskId, lifecycleState: tab.lifecycleState })),
   };
 }

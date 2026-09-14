@@ -29,10 +29,30 @@ extension ID, and run:
 ```bash
 npm run install:dev:macos -- --extension-id <extension-id>
 npm run doctor
+npm run doctor:strict -- --json
 ```
+
+The ordinary doctor confirms that the local broker is reachable. The strict
+doctor is the readiness gate: it exits non-zero while the installed runtime
+has source/install drift or active reconciliation, even if the broker is
+connected. Historical unknown-effect records remain warnings; they are never
+deleted or replayed. Do not begin a new mutation task until the strict check is ready.
 
 Start a new Codex task after installation. The first task should be read-only;
 confirm one connected Companion profile before using any page mutation.
+
+## If Codex reports `Transport closed`
+
+This means the stdio MCP process owned by Codex App was closed. The Companion
+extension cannot reopen that process or reuse its old task/session safely. Do
+not replay the last operation. Start one new Codex task so the plugin creates
+a new MCP process, then perform a fresh status check and obtain a new
+run-bound session/handoff. An operation that was sent before the close is
+effect-unknown until the provider or page is read back.
+
+The MCP launcher records `starting root=`, `transport_error`, `setup_error`,
+and `shutdown reason=` lines on stderr. Include those bounded diagnostics when
+reporting a failure; never include cookies, tokens, or page contents.
 
 ## Release path
 

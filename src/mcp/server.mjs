@@ -124,11 +124,11 @@ server.registerTool("companion_status", {
   annotations: { readOnlyHint: true },
 }, guarded(async (args, extra) => {
   const client = await broker();
+  const clientTaskId = resolveCodexTaskId(process.env, extra);
   // Keep the first stale-socket timeout below the outer MCP tool deadline so
   // BrokerClient can reconnect once and return a fresh read-only status in the
   // same tool call. Mutations retain their existing no-replay deadlines.
-  const result = await client.request("status.get", {}, { timeoutMs: 5_000 });
-  const clientTaskId = resolveCodexTaskId(process.env, extra);
+  const result = await client.request("status.get", { taskId: clientTaskId }, { timeoutMs: 5_000 });
   const ownedSessions = (result.logicalSessions || []).filter((session) => session.taskId === clientTaskId);
   const ownedSessionIds = new Set(ownedSessions.map((session) => session.sessionId));
   const ownedLeases = (result.exactTabLeases || []).filter((lease) => ownedSessionIds.has(lease.sessionId));
@@ -867,6 +867,21 @@ server.registerTool("companion_archive_reconciliation", {
   return (await broker()).requestArchiveReconciliation({ ...args, taskId });
 }));
 
+server.registerTool("companion_purge_owned_operations", {
+  description: "Explicitly delete only terminal operation records owned by this exact Codex task and run. Active, unresolved, unknown-effect, and foreign records are rejected.",
+  inputSchema: {
+    sessionId,
+    runId: z.string().min(1),
+    idempotencyKey: z.string().min(1).max(512),
+    operationIds: z.array(z.string().min(1).max(512)).min(1).max(500),
+    confirmPurge: z.literal(true).describe("Explicitly confirm deletion of terminal records owned by this task and run"),
+  },
+  annotations: { readOnlyHint: false, destructiveHint: true },
+}, guarded(async (args, extra) => {
+  const taskId = assertSession(args, extra);
+  return (await broker()).requestPurgeOwnedOperations({ ...args, taskId });
+}));
+
 server.registerTool("companion_wait_for", {
   description: "Wait up to 15 seconds for one uniquely matched semantic locator condition in an exact leased tab.",
   inputSchema: {
@@ -893,12 +908,27 @@ const transport = new StdioServerTransport();
 await server.connect(transport);
 process.stderr.write(`AOS Chrome Companion MCP ${PROTOCOL_VERSION} ready\n`);
 
-async function shutdown() {
+let shuttingDown = false;
+async function shutdown(reason = "signal") {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  process.stderr.write(`AOS Chrome Companion MCP shutdown reason=${reason}\n`);
   const client = await brokerClientPromise?.catch(() => null);
   client?.close();
   await server.close();
   process.exit(0);
 }
 
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
+transport.onerror = (error) => {
+  const message = error instanceof Error ? error.message : String(error);
+  process.stderr.write(`AOS Chrome Companion MCP transport_error ${message}\n`);
+};
+transport.onclose = () => {
+  // Stdio is owned by Codex App. Once it closes, this process cannot revive
+  // the same session; the App must create a new MCP process/session/handoff.
+  // Keep this boundary explicit so callers never treat it as safe to replay.
+  void shutdown("transport_closed");
+};
+
+process.on("SIGINT", () => void shutdown("SIGINT"));
+process.on("SIGTERM", () => void shutdown("SIGTERM"));
