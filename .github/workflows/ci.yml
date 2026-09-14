@@ -1,0 +1,34 @@
+name: Companion CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Static and schema checks
+        run: |
+          npm run check
+          npm run schema:check
+      - name: Full regression suite
+        run: npm test
+      - name: Fault matrix
+        run: npm run canary:faults
+      - name: Read-only concurrency canary
+        run: npm run canary:parallel:readonly
