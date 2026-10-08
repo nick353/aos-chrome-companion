@@ -929,6 +929,15 @@ transport.onclose = () => {
   // Keep this boundary explicit so callers never treat it as safe to replay.
   void shutdown("transport_closed");
 };
+// The SDK stdio transport only listens for data/error, so onclose never fires when
+// the host closes stdin without a signal. The broker socket then keeps this process
+// alive with no owner. Treat stdin EOF and a lost parent the same as transport close.
+process.stdin.once("end", () => void shutdown("stdin_end"));
+process.stdin.once("close", () => void shutdown("stdin_closed"));
+const hostPid = process.ppid;
+setInterval(() => {
+  if (process.ppid !== hostPid) void shutdown("host_exited");
+}, 5_000).unref();
 
 process.on("SIGINT", () => void shutdown("SIGINT"));
 process.on("SIGTERM", () => void shutdown("SIGTERM"));
