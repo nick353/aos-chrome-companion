@@ -1,4 +1,4 @@
-import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { chmod, mkdir, readFile, rename, writeFile, lstat, open } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { dirname, join, resolve } from "node:path";
@@ -23,6 +23,48 @@ export const OPERATION_EFFECT_STATES = Object.freeze([
   "unknown_effect",
 ]);
 
+// Recovery guidance describes the affected resource, never changes authority
+// or settles the original operation. Historical reconciliation stays local.
+export function blockerRecoveryContext({ code, taskId, runId, profileInstanceId, tabId, targetKey, nextAction }) {
+  const blockScope = ["broker_connection_closed", "broker_request_timeout", "broker_reconnect_required", "broker_client_closed"].includes(code)
+    ? "broker_connection"
+    : ["profile_not_connected", "session_generation_stale", "companion_build_refresh_required"].includes(code)
+      ? "profile"
+      : ["source_handoff_implementation_forbidden", "handoff_gate_read_failed"].includes(code)
+        ? "task" : "target";
+  return {
+    block_scope: blockScope,
+    affected_target: {
+      task_id: blockScope === "profile" || blockScope === "broker_connection" ? null : taskId ?? null,
+      run_id: blockScope === "target" ? runId ?? null : null,
+      profile_instance_id: profileInstanceId ?? null,
+      tab_id: blockScope === "target" && Number.isSafeInteger(tabId) ? tabId : null,
+      // Public correlation metadata only. Keep raw keys inside the ledger
+      // and authority contracts; URLs and locators must not enter blockers.
+      target_key: blockScope === "target" && typeof targetKey === "string"
+        ? `target_sha256:${createHash("sha256").update(targetKey, "utf8").digest("hex")}` : null,
+    },
+    independent_work_allowed: blockScope !== "broker_connection",
+    next_action: nextAction,
+  };
+}
+
+// Physical target scope survives a caller's run/task/session change. Only
+// the existing broker reconciliation contract can settle the original key.
+export function unresolvedLocalNavigationForTarget(operations, { profileInstanceId, tabId }) {
+  if (!profileInstanceId || !Number.isSafeInteger(tabId)) return [];
+  return operations.filter(entry => ["tabs.reload", "tabs.navigate"].includes(entry.binding?.method)
+    && entry.binding?.profileInstanceId === profileInstanceId && entry.binding?.tabId === tabId
+    && (["dispatched", "unknown_effect"].includes(entry.state)
+      || entry.state === "reconciled" && (entry.brokerEvidence !== true || !entry.resultDigest
+        || operationEffectStateForEntry(entry) === "unknown_effect")));
+}
+
+export const DEBUGGER_CLEANUP_REASONS = Object.freeze([
+  "browser_detached", "detached", "shared_operation_active", "release_threw", "release_rejected",
+  "release_timeout", "release_not_verified", "no_lease_acquired", "detach_failed",
+]);
+
 // Terminal evidence is useful for a short recovery window, but retaining it
 // forever turns the ledger into an ever-growing second database. Unknown
 // external effects are intentionally excluded from automatic collection.
@@ -42,6 +84,7 @@ export const LOCAL_UI_OPERATION_METHODS = Object.freeze([
   "tabs.back",
   "tabs.forward",
   "tabs.reload",
+  "tabs.stopLoading",
   "tabs.groupTask",
   "tabs.configure",
   "page.configureViewport",
@@ -78,6 +121,37 @@ export function operationRequiresReconciliation(entry = {}) {
     ?? null;
   if (typeof method !== "string" || !method.trim()) return true;
   return !LOCAL_UI_OPERATION_METHOD_SET.has(method.trim());
+}
+
+/**
+ * A dispatched local navigation can outlive its acknowledgement. Keep this
+ * one operation in the reconciliation ledger without classifying it as a
+ * provider effect. Other local UI uncertainty remains owner maintenance only.
+ */
+export function isUncertainLocalNavigationEffect(entry = {}) {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) return false;
+  const method = entry.method ?? entry.binding?.method ?? entry.operation?.method;
+  const effectClass = entry.effectClass ?? entry.effect_class;
+  const idempotencyKey = entry.idempotencyKey ?? entry.idempotency_key;
+  const keyParts = typeof idempotencyKey === "string" ? idempotencyKey.split(":") : [];
+  const operationIndex = keyParts.at(-1);
+  const binding = entry.binding && typeof entry.binding === "object" ? entry.binding : {};
+  const dispatchState = String(entry.dispatchState ?? entry.dispatch_state ?? "").trim().toLowerCase();
+  return method === "tabs.navigate"
+    && keyParts.length >= 2
+    && /^\d+$/u.test(operationIndex ?? "")
+    && Number.isSafeInteger(Number(operationIndex))
+    && typeof binding.taskId === "string"
+    && Boolean(binding.taskId.trim())
+    && typeof binding.runId === "string"
+    && Boolean(binding.runId.trim())
+    && effectClass === "local_ui"
+    && entry.state === "unknown_effect"
+    && operationEffectStateForEntry(entry) === "unknown_effect"
+    && dispatchState === "dispatched"
+    && entry.dispatchCount === 1
+    && entry.mutationDispatchAttempted === true
+    && entry.externalActionExecuted === false;
 }
 
 // Restart recovery deliberately has fewer choices than a normal operation
@@ -125,6 +199,114 @@ export function normalizeOperationEffectState(value, fallback = "no_dispatch") {
   return aliases.get(normalized) ?? (OPERATION_EFFECT_STATES.includes(fallback) ? fallback : "no_dispatch");
 }
 
+// Accepted one-operation cleanup amendment. Request metrics are accepted root
+// input, never reconstructed from the ACK digest. This is not a generic route.
+export const VIEWPORT_CLEANUP_AMENDMENT = Object.freeze({
+  operationId: "op_2d00f724-7e5b-4aea-a582-d5c4c6215880",
+  operationKey: "light-model-1280-set-once:1",
+  capsuleId: "capsule_14591a86-b50f-4082-80f0-efcafbf11760",
+  taskId: "01a106b1-2e41-7093-b639-dfce60fdf22b",
+  runId: "heavy-light-model-desktop-20261005",
+  sessionId: "session_c87f8d47-e5bb-49cb-9980-2c8b56573a87",
+  profileInstanceId: "profile_37fd31b6-ed53-4a35-8604-ab92ffbab05a",
+  generation: "gen_62542f46-232b-4ad4-94f2-38f1456e1bf9",
+  tabId: 1980935548,
+  pageInstanceId: "chrome-document:3DAEDC1279264DA273ED71DA124B5F99",
+  windowId: 1980934932, frameId: 0, origin: "https://jp.linkaigc.com",
+  url: "https://jp.linkaigc.com/model-library/model-custom-form",
+  resultDigest: "80Lw-hUVoDBK4z5EH83aNdtbTTPXjrTCGYb0PXehHFc",
+  width: 1280, height: 900, devicePixelRatio: 1,
+  maximumScheduledRestorationMs: 1_800_000,
+});
+
+export function viewportCleanupCandidate(capsule, operations, capsules = [], now = Date.now()) {
+  const expected = VIEWPORT_CLEANUP_AMENDMENT;
+  const entry = operations.find(item => item.operationId === expected.operationId);
+  const reject = () => { throw authorityError("viewport_cleanup_not_applicable", "Exact original ACK, sole local obligation and elapsed scheduled deadline required"); };
+  const binding = entry?.binding, identity = binding?.targetIdentity;
+  if (!entry || !capsule || capsule.capsuleId !== expected.capsuleId || capsule.state !== "failed"
+    || capsule.taskId !== expected.taskId || capsule.runId !== expected.runId
+    || capsule.effect?.failedOperationId !== expected.operationId || capsule.effect?.failedOperationKey !== expected.operationKey
+    || capsule.effect?.idempotencyKey !== "light-model-1280-set-once"
+    || capsule.effect?.effectClass !== "local_ui" || capsule.effect?.effectState !== "unknown_effect"
+    || (capsule.effect?.externalActionExecuted !== false && capsule.effect?.externalActionExecuted !== null)
+    || capsule.effect?.awaitedEvent || capsule.effect?.uploadDelivery
+    || capsule.retention?.reason !== "local_ui_effect_unknown" || capsule.retention?.policy !== "retain_until_resume"
+    || entry.idempotencyKey !== expected.operationKey || binding?.method !== "page.configureViewport"
+    || entry.state !== "reconciled" || entry.brokerEvidence !== true || entry.resultDigest !== expected.resultDigest
+    || operationEffectStateForEntry(entry) !== "known_effect" || entry.externalActionExecuted !== false
+    || entry.dispatchCount !== 1 || entry.awaitedEvent
+    || !["taskId", "runId", "sessionId", "profileInstanceId", "generation", "tabId"].every(key => binding[key] === expected[key])
+    || binding.ownerKey !== expected.sessionId
+    || !["profileInstanceId", "generation", "tabId", "pageInstanceId", "windowId", "frameId", "origin"].every(key =>
+      identity?.[key] === expected[key] && capsule.target?.[key] === expected[key])
+    || capsule.target?.sessionId !== expected.sessionId || capsule.target?.intendedUrl !== expected.url
+    || capsule.resources?.tabId !== expected.tabId) reject();
+  const reconciledAt = Date.parse(entry.reconciledAt), preparedAt = Date.parse(entry.preparedAt);
+  const deadline = reconciledAt + expected.maximumScheduledRestorationMs;
+  if (!Number.isFinite(reconciledAt) || !Number.isFinite(preparedAt) || reconciledAt < preparedAt || now <= deadline) reject();
+  if (operations.some(other => other.operationId !== entry.operationId && (
+    other.binding?.taskId === expected.taskId && other.binding?.runId === expected.runId
+      && (["dispatched", "unknown_effect"].includes(other.state) || operationEffectStateForEntry(other) === "unknown_effect")
+    || other.binding?.method === "page.configureViewport" && other.binding?.profileInstanceId === expected.profileInstanceId
+      && other.binding?.tabId === expected.tabId && (!Number.isFinite(Date.parse(other.preparedAt)) || Date.parse(other.preparedAt) >= preparedAt)))) reject();
+  if (capsules.some(other => other.capsuleId !== expected.capsuleId && other.taskId === expected.taskId
+    && other.runId === expected.runId && (other.effect?.effectState === "unknown_effect" || other.state === "reconciliation_required"))) reject();
+  return { entry, deadline };
+}
+
+export function verifyViewportCleanupReadback(secret, proof, currentBinding, entry, now = Date.now()) {
+  const expected = VIEWPORT_CLEANUP_AMENDMENT;
+  const { signature, ...payload } = proof ?? {};
+  const capturedAt = Date.parse(payload.capturedAt), expiresAt = Date.parse(payload.expiresAt);
+  const deadline = Date.parse(entry?.reconciledAt) + expected.maximumScheduledRestorationMs;
+  const viewport = payload.viewport;
+  if (typeof signature !== "string" || signature !== payloadDigest(secret, payload)
+    || payload.schema !== "aos.chrome_companion.visual_point_proof.v1"
+    || !["taskId", "profileInstanceId", "generation", "tabId", "pageInstanceId"].every(key => payload[key] === expected[key])
+    || !currentBinding?.sessionId || !currentBinding?.leaseId
+    || payload.sessionId !== currentBinding.sessionId || payload.leaseId !== currentBinding.leaseId
+    || payload.pageUrl !== expected.url || !payload.screenshotDigest
+    || !Number.isFinite(capturedAt) || !Number.isFinite(expiresAt) || !Number.isFinite(deadline)
+    || capturedAt <= deadline || capturedAt > now || now - capturedAt > 60_000
+    || expiresAt <= now || expiresAt > capturedAt + 60_000
+    || !["width", "height", "devicePixelRatio", "scale"].every(key => Number.isFinite(viewport?.[key]) && viewport[key] > 0)
+    || (Math.abs(viewport.width - expected.width) <= 1 && Math.abs(viewport.height - expected.height) <= 1
+      && Math.abs(viewport.devicePixelRatio - expected.devicePixelRatio) <= 0.01 + Number.EPSILON)) {
+    throw authorityError("viewport_cleanup_readback_invalid", "Fresh signed original-document readback must show the requested metrics no longer effective after the scheduled deadline");
+  }
+  return payload;
+}
+
+export function verifyViewportAbsenceReadback(secret, proof, currentBinding, now = Date.now()) {
+  const expected = VIEWPORT_CLEANUP_AMENDMENT;
+  const { signature, ...payload } = proof ?? {};
+  const ids = payload.inventoryIds, inventory = payload.inventoryEvidence, lookup = payload.lookupEvidence;
+  const capturedAt = Date.parse(payload.capturedAt);
+  if (typeof signature !== "string" || signature !== payloadDigest(secret, payload)
+    || payload.schema !== "aos.chrome_companion.viewport_absence_proof.v1"
+    || !["taskId", "profileInstanceId", "generation", "tabId"].every(key => payload[key] === expected[key])
+    || !currentBinding?.sessionId || payload.sessionId !== currentBinding.sessionId
+    || canonical(payload.inventoryParams) !== "{}" || payload.inventoryCap !== 200
+    || !Array.isArray(ids) || ids.length >= payload.inventoryCap || ids.includes(expected.tabId)
+    || ids.some(id => !Number.isSafeInteger(id) || id < 0) || new Set(ids).size !== ids.length
+    || canonical(payload.lookupParams) !== canonical({ tabId: expected.tabId })
+    || inventory?.method !== "tabs.list" || inventory.returned !== true || lookup?.method !== "tabs.get"
+    || lookup.errorCode !== "extension_operation_failed"
+    || !new RegExp(`^No tab with id: ${expected.tabId}\\.?$`, "u").test(lookup.errorMessage ?? "")
+    || ![inventory, lookup].every(read => read?.brokerEvidence === true && read.operationId && read.resultDigest
+      && read.sessionId === payload.sessionId && read.profileInstanceId === expected.profileInstanceId
+      && read.generation === expected.generation && Number.isFinite(Date.parse(read.startedAt))
+      && Number.isFinite(Date.parse(read.completedAt)) && Date.parse(read.completedAt) >= Date.parse(read.startedAt)
+      && now - Date.parse(read.startedAt) <= 60_000 && Date.parse(read.completedAt) <= now)
+    || inventory.operationId === lookup.operationId
+    || Date.parse(lookup.startedAt) < Date.parse(inventory.completedAt)
+    || !Number.isFinite(capturedAt) || capturedAt > now || now - capturedAt > 60_000) {
+    throw authorityError("viewport_cleanup_absence_invalid", "Complete authenticated original-target absence requires both fresh bound inventory and exact missing lookup");
+  }
+  return payload;
+}
+
 /** Derive a semantic effect state from a legacy operation ledger entry. */
 export function operationEffectStateForEntry(entry = {}) {
   if (!entry || typeof entry !== "object") return "no_dispatch";
@@ -141,7 +323,7 @@ export function operationEffectStateForEntry(entry = {}) {
 
 export function isUnresolvedOperationEffect(entry = {}) {
   return operationEffectStateForEntry(entry) === "unknown_effect"
-    && operationRequiresReconciliation(entry);
+    && (operationRequiresReconciliation(entry) || isUncertainLocalNavigationEffect(entry));
 }
 
 export function isKnownNoEffect(entry = {}) {
@@ -150,6 +332,44 @@ export function isKnownNoEffect(entry = {}) {
 
 export function isKnownEffect(entry = {}) {
   return operationEffectStateForEntry(entry) === "known_effect";
+}
+
+// A current ledger settlement can refine an old failure receipt without
+// rewriting that receipt. Only an exact, uniquely identified broker proof
+// may replace its unknown failed-step classification.
+export function capsuleNoEffectSettlement(capsule, operations = []) {
+  if (!capsule || !["failed", "reconciliation_required"].includes(capsule.state)
+    || capsule.effect?.effectState !== "unknown_effect" || capsule.effect?.awaitedEvent
+    || capsule.effect?.externalActionExecuted === true) return null;
+  const prefix = `${capsule.effect?.idempotencyKey}:`;
+  const target = capsule.target ?? {};
+  const owned = operations.filter(entry => entry.binding?.taskId === capsule.taskId
+    && entry.binding?.runId === capsule.runId);
+  // Other uncertain operations, including local edits, cannot be hidden by
+  // a no-effect result for this one operation.
+  if (owned.some(entry => operationEffectStateForEntry(entry) === "unknown_effect")) return null;
+  const matches = owned.filter(entry => entry.idempotencyKey?.startsWith(prefix)
+    && /^\d+$/u.test(entry.idempotencyKey.slice(prefix.length))
+    && entry.state === "reconciled" && entry.brokerEvidence === true
+    && operationEffectStateForEntry(entry) === "known_no_effect"
+    && entry.mutationDispatchProvenance === "authenticated_no_effect"
+    && entry.mutationDispatchAttempted === false && entry.externalActionExecuted === false
+    && verifiedNoEffectProof(entry) && !entry.awaitedEvent && !Number.isSafeInteger(entry.createdTabId)
+    && entry.noEffectProof?.operationId === entry.operationId
+    && canonical(entry.noEffectProof?.binding) === canonical(entry.binding)
+    && ["profileInstanceId", "generation", "sessionId", "tabId"].every(key =>
+      target[key] !== undefined && target[key] !== null && entry.binding?.[key] === target[key])
+    && (!capsule.effect.failedOperationId || capsule.effect.failedOperationId === entry.operationId)
+    && (!capsule.effect.failedOperationKey || capsule.effect.failedOperationKey === entry.idempotencyKey));
+  if (matches.length !== 1) return null;
+  const entry = matches[0];
+  return {
+    capsuleId: capsule.capsuleId, operationId: entry.operationId, idempotencyKey: entry.idempotencyKey,
+    operationState: entry.state, failedStepEffectState: "known_no_effect",
+    effectState: capsule.effect?.actionProgress?.applied_action_indices?.length ? "known_effect" : "known_no_effect",
+    mutationDispatchAttempted: false, brokerEvidence: true, reconciledAt: entry.reconciledAt,
+    historicalState: capsule.state, historicalEffectState: capsule.effect.effectState,
+  };
 }
 
 function normalizedDispatchCount(entry = {}) {
@@ -434,6 +654,7 @@ export function normalizeTaskExecutionCapsule(input = {}, defaults = {}) {
     restartPoint: boundedString(source.restartPoint, null, 512),
     target: {
       targetKey,
+      intendedUrl: boundedString(source.target?.intendedUrl ?? source.startUrl ?? defaults.startUrl, null, 4096),
       canonicalLocator,
       allowedOrigins: Array.isArray(source.allowedOrigins ?? source.target?.allowedOrigins ?? defaults.allowedOrigins)
         ? [...(source.allowedOrigins ?? source.target?.allowedOrigins ?? defaults.allowedOrigins)].map((value) => String(value)).slice(0, 32)
@@ -599,6 +820,109 @@ export function payloadDigest(secret, payload) {
   if (typeof secret !== "string" || !secret) throw new Error("payload_digest_secret_required");
   if (arguments.length < 2) throw new Error("payload_digest_payload_required");
   return hmac(secret, "aos.chrome_companion.payload.v1", payload);
+}
+
+export function uploadReconciliationPayload(input = {}) {
+  return Object.fromEntries(["runId", "taskId", "idempotencyKey", "capsuleId", "tabId", "leaseId", "successQuery",
+    "originalOperationKey", "originalOperationId", "originalFingerprint", "originalUploadPayload", "confirmationFiles"]
+    .map(key => [key, input[key] ?? null]));
+}
+
+export function localEditorReconciliationPayload(input = {}) {
+  const fields = ["runId", "taskId", "idempotencyKey", "capsuleId", "tabId", "leaseId", "originalOperationKey", "originalOperationId", "originalPayload", "expectedBody", "expectedFullBody", "insertText", "offset", "repairOperationKey", "url", "pageInstanceId"];
+  return Object.fromEntries(fields.map(field => [field, input[field]]));
+}
+
+export function localSelectionReconciliationPayload(input = {}) {
+  return Object.fromEntries(["runId", "taskId", "idempotencyKey", "capsuleId", "tabId", "leaseId",
+    "originalOperationKey", "originalOperationId", "originalPayload", "url", "pageInstanceId"]
+    .map(field => [field, input[field]]));
+}
+
+// The current query contract proves a single native select's normalized label
+// only. Values, indices, custom controls and sets need a richer reader first.
+export function verifyOriginalSelectionPayload(secret, entry, capsule, originalPayload) {
+  const binding = entry?.binding, target = binding?.targetIdentity;
+  const option = originalPayload?.option;
+  const label = option?.label;
+  const normalizedLabel = typeof label === "string" ? label.replace(/\s+/gu, " ").trim() : "";
+  const prefix = `${capsule?.effect?.idempotencyKey}:`;
+  if (!entry || entry.state !== "unknown_effect" || operationEffectStateForEntry(entry) !== "unknown_effect"
+    || binding?.method !== "page.selectOption" || entry.effectClass !== "local_ui"
+    || entry.dispatchCount !== 1 || entry.dispatchState !== "dispatched" || entry.mutationDispatchAttempted !== true
+    || entry.externalActionExecuted !== false || entry.external_action_executed === true
+    || entry.reconciliationRequired === true || entry.reconciliation_required === true || entry.awaitedEvent
+    || !["failed", "reconciliation_required"].includes(capsule?.state) || capsule.effect?.effectClass !== "local_ui"
+    || capsule.effect?.effectState !== "unknown_effect" || capsule.effect?.externalActionExecuted === true || capsule.effect?.awaitedEvent
+    || capsule.effect?.failedOperationId !== entry.operationId || capsule.effect?.failedOperationKey !== entry.idempotencyKey
+    || !capsule.effect?.idempotencyKey || !entry.idempotencyKey.startsWith(prefix)
+    || !/^\d+$/u.test(entry.idempotencyKey.slice(prefix.length))
+    || binding.taskId !== capsule.taskId || binding.runId !== capsule.runId || binding.ownerKey !== binding.sessionId
+    || !target?.leaseId || !target.pageInstanceId || !Number.isSafeInteger(target.frameId) || !Number.isSafeInteger(target.windowId)
+    || target.taskId !== capsule.taskId
+    || !["sessionId", "profileInstanceId", "generation", "tabId", "pageInstanceId", "windowId", "frameId"].every(key =>
+      target[key] != null && target[key] === capsule.target?.[key] && (binding[key] === undefined || binding[key] === target[key]))
+    || binding.tabId !== capsule.resources?.tabId
+    || originalPayload?.tabId !== binding.tabId || originalPayload.pageInstanceId !== target.pageInstanceId
+    || originalPayload.windowId !== target.windowId || originalPayload.frameId !== target.frameId
+    || !originalPayload.locator || typeof originalPayload.locator !== "object" || Array.isArray(originalPayload.locator)
+    || !Object.keys(originalPayload.locator).length
+    || originalPayload.locator.frameId !== undefined && originalPayload.locator.frameId !== target.frameId
+    || originalPayload.locator.pageInstanceId !== undefined && originalPayload.locator.pageInstanceId !== target.pageInstanceId
+    || Array.isArray(option) || !option || Object.keys(option).length !== 1 || !Object.hasOwn(option, "label")
+    || !normalizedLabel || normalizedLabel.length >= 300 || label !== normalizedLabel
+    || originalPayload.exact === false || originalPayload.expectedEvent !== undefined
+    || payloadDigest(secret, { binding, payload: originalPayload }) !== entry.fingerprint) {
+    throw authorityError("local_selection_original_payload_invalid", "Require the exact signed single-label local page.selectOption payload and its original document binding");
+  }
+  return normalizedLabel;
+}
+
+// The original owner/session/lease are persisted evidence. Never replace them
+// with the current recovery session when checking the original command HMAC.
+export function verifyOriginalEditorPayload(secret, entry, capsule, originalPayload) {
+  const binding = entry?.binding;
+  if (!entry || entry.state !== "unknown_effect" || binding?.method !== "page.type"
+    || entry.dispatchCount !== 1 || entry.externalActionExecuted === true
+    || capsule?.state !== "failed" || capsule.effect?.effectClass !== "local_ui"
+    || (capsule.effect?.failedOperationId != null && capsule.effect.failedOperationId !== entry.operationId)
+    || (capsule.effect?.failedOperationKey != null && capsule.effect.failedOperationKey !== entry.idempotencyKey)
+    || !entry.idempotencyKey.startsWith(`${capsule.effect?.idempotencyKey}:`)
+    || !/^\d+$/u.test(entry.idempotencyKey.slice(`${capsule.effect?.idempotencyKey}:`.length))
+    || binding.taskId !== capsule.taskId || binding.runId !== capsule.runId
+    || binding.tabId !== capsule.resources?.tabId || !binding.targetIdentity?.leaseId
+    || binding.sessionId !== capsule.target?.sessionId || binding.generation !== capsule.target?.generation
+    || binding.profileInstanceId !== capsule.target?.profileInstanceId
+    || binding.targetIdentity.pageInstanceId !== capsule.target?.pageInstanceId
+    || originalPayload?.locator?.css !== "div.ProseMirror" || originalPayload.clear !== true
+    || typeof originalPayload.text !== "string" || originalPayload.text.length > 100_000
+    || originalPayload.tabId !== binding.tabId || originalPayload.pageInstanceId !== binding.targetIdentity.pageInstanceId
+    || originalPayload.windowId !== binding.targetIdentity.windowId || originalPayload.frameId !== binding.targetIdentity.frameId
+    || originalPayload.semanticGuardId !== undefined
+    || payloadDigest(secret, { binding, payload: originalPayload }) !== entry.fingerprint) {
+    throw authorityError("local_editor_original_payload_invalid", "Original failed editor payload does not match its persisted command binding and HMAC");
+  }
+  return entry.fingerprint;
+}
+
+/** Secret-bound digest of an HTTP(S) destination used only for local nav arrival proof. */
+export function localNavigationTargetDigest(secret, value) {
+  if (typeof secret !== "string" || !secret || typeof value !== "string" || !value.trim()) return null;
+  let url;
+  try { url = new URL(value); } catch { return null; }
+  if (!["http:", "https:"].includes(url.protocol)) return null;
+  return payloadDigest(secret, { schema: "aos.chrome_companion.local_navigation_target.v1", url: url.href });
+}
+
+/** Reconstruct an untruncated legacy URL target key, when one was persisted. */
+export function localNavigationTargetDigestFromKey(secret, targetKey) {
+  if (typeof targetKey !== "string" || !targetKey.startsWith("url:") || targetKey.length >= 512) return null;
+  const value = targetKey.slice(4);
+  let url;
+  try { url = new URL(value); } catch { return null; }
+  if (!["http:", "https:"].includes(url.protocol)
+    || `url:${url.origin}${url.pathname}${url.search}` !== targetKey) return null;
+  return localNavigationTargetDigest(secret, url.href);
 }
 
 function boundedProofString(value, fallback = null, max = 512) {
@@ -788,6 +1112,101 @@ export function prepareResumePayload(params = {}) {
       ? null
       : String(params.capsuleId),
   };
+}
+
+/** Exact signed authority to replace one missing owned target; never replay actions. */
+export function targetRecoveryPayload(params = {}) {
+  return Object.fromEntries(["sessionId", "taskId", "runId", "idempotencyKey", "sourceCapsuleId",
+    "originalOperationKey", "originalOperationId", "targetKey", "intendedUrl"].map(key => [key, String(params[key] ?? "")])
+    .concat([["oldTabId", Number.isSafeInteger(params.oldTabId) ? params.oldTabId : null]]));
+}
+
+export function validateTargetRecoverySource(capsule, operations, request, session) {
+  const reject = (code) => { throw authorityError(code, "Exact target recovery requires complete matching no-effect history"); };
+  const target = capsule?.target;
+  if (request.sessionId !== session.sessionId || !Number.isSafeInteger(request.oldTabId) || request.oldTabId < 0
+    || !request.idempotencyKey || request.idempotencyKey === capsule?.effect?.idempotencyKey
+    || request.idempotencyKey === request.originalOperationKey) reject("target_recovery_binding_mismatch");
+  if (!capsule || capsule.capsuleId !== request.sourceCapsuleId || capsule.taskId !== request.taskId
+    || capsule.runId !== request.runId || capsule.taskId !== session.taskId
+    || target?.profileInstanceId !== session.profileInstanceId || target?.tabId !== request.oldTabId
+    || capsule.resources?.tabId !== request.oldTabId || !["failed", "reconciliation_required"].includes(capsule.state)
+    || capsule.effect?.failedOperationKey !== request.originalOperationKey
+    || capsule.effect?.failedOperationId !== request.originalOperationId
+    || !target.targetKey || target.targetKey !== request.targetKey) reject("target_recovery_binding_mismatch");
+  if (capsule.retention?.userHelpRequired || capsule.retention?.requiredUserAction || capsule.effect?.awaitedEvent
+    || capsule.execution?.targetRecovery || capsule.handoff || capsule.execution?.handoff
+    || ["user_authentication", "owner_sso_required", "company_connection_ref_missing", "visible_captcha_widget_user_required", "action_event_pending"].includes(capsule.blocker?.code)) reject("target_recovery_source_protected");
+  let intendedUrl;
+  try {
+    const recorded = target.intendedUrl ?? (target.targetKey?.startsWith("url:") && target.targetKey.length < 512 ? target.targetKey.slice(4) : null);
+    if (!recorded) reject("target_recovery_stable_url_missing");
+    const url = new URL(recorded);
+    if (!["https:", "http:"].includes(url.protocol) || url.username || url.password
+      || url.href !== new URL(request.intendedUrl).href || !target.allowedOrigins?.includes(url.origin)) reject("target_recovery_url_mismatch");
+    intendedUrl = url.href;
+  } catch (error) { if (error?.code) throw error; reject("target_recovery_url_mismatch"); }
+  const prefix = `${capsule.effect.idempotencyKey}:`;
+  const owned = operations.filter(entry => entry.binding?.taskId === request.taskId && entry.binding?.runId === request.runId);
+  const source = owned.filter(entry => entry.idempotencyKey?.startsWith(prefix));
+  const operation = source.find(entry => entry.idempotencyKey === request.originalOperationKey && entry.operationId === request.originalOperationId);
+  const index = Number(request.originalOperationKey.slice(prefix.length));
+  if (!operation || !/^\d+$/u.test(request.originalOperationKey.slice(prefix.length))
+    || !capsule.effect.idempotencyKey || !Number.isSafeInteger(index) || index < 0 || index > 32 || source.length !== index + 1
+    || Array.from({ length: index + 1 }, (_, i) => `${prefix}${i}`).some(key => !source.some(entry => entry.idempotencyKey === key))) reject("target_recovery_history_incomplete");
+  if (source.some(entry => !["profileInstanceId", "generation", "sessionId", "ownerKey"].every(key =>
+    entry.binding?.[key] && entry.binding[key] === operation.binding[key])
+    || entry.binding?.tabId !== (entry.binding?.method === "tabs.create" ? null : request.oldTabId))) {
+    reject("target_recovery_binding_mismatch");
+  }
+  // Recovery requires explicit complete broker history, not the generic
+  // restart classifier's compatibility inference for legacy records.
+  const safeNoEffect = entry => ["blocked", "reconciled"].includes(entry.state)
+    && entry.externalActionExecuted === false && entry.mutationDispatchAttempted === false
+    && [entry.effectState, entry.effect_state, entry.operationEffectState, entry.operation_effect_state]
+      .filter(value => value !== undefined).every(value => normalizeOperationEffectState(value) === entry.effectState)
+    && !entry.awaitedEvent && !Number.isSafeInteger(entry.createdTabId)
+    && (entry.state === "blocked" && entry.effectState === "no_dispatch"
+      && entry.dispatchState === "not_dispatched" && entry.dispatchCount === 0
+      || entry.effectState === "known_no_effect" && entry.brokerEvidence === true
+        && entry.mutationDispatchProvenance === "authenticated_no_effect"
+        && Number.isSafeInteger(entry.dispatchCount) && entry.dispatchCount >= 0
+        && ["dispatched", "not_dispatched"].includes(entry.dispatchState)
+        && (entry.state === "blocked" || verifiedNoEffectProof(entry)
+          && entry.noEffectProof?.operationId === entry.operationId
+          && canonical(entry.noEffectProof?.binding) === canonical(entry.binding)));
+  if (!["profileInstanceId", "generation", "sessionId"].every(key => target[key] && operation.binding?.[key] === target[key])
+    || operation.binding?.ownerKey !== target.sessionId || operation.binding?.tabId !== request.oldTabId
+    || !/^(?:page|visual)\./u.test(operation.binding?.method ?? "")
+    || operation.awaitedEvent || Number.isSafeInteger(operation.createdTabId)
+    || !safeNoEffect(operation)) reject("target_recovery_effect_not_proven");
+  const progress = capsule.effect?.actionProgress;
+  const settlement = capsuleNoEffectSettlement(capsule, operations);
+  const effectState = settlement?.effectState ?? capsule.effect?.effectState;
+  if (capsule.state === "reconciliation_required" && !settlement
+    || !["known_no_effect", "no_dispatch"].includes(effectState)
+    || (!settlement && capsule.effect?.externalActionExecuted !== false) || capsule.effect?.externalActionExecuted === true
+    || !progress || !Number.isSafeInteger(progress.total_actions) || progress.total_actions < 1 || progress.total_actions > 32
+    || progress.failed_action_index !== 0 || !Array.isArray(progress.applied_action_indices) || progress.applied_action_indices.length
+    || !Array.isArray(progress.verified_action_indices) || progress.verified_action_indices.length
+    || canonical(progress.uncertain_action_indices) !== canonical(settlement ? [0] : [])
+    || canonical(progress.remaining_action_indices) !== canonical(settlement
+      ? Array.from({ length: progress.total_actions - 1 }, (_, i) => i + 1)
+      : Array.from({ length: progress.total_actions }, (_, i) => i))
+    || canonical(progress.unattempted_action_indices) !== canonical(Array.from({ length: progress.total_actions - 1 }, (_, i) => i + 1))
+    || !["known_no_effect", "no_dispatch", ...(settlement ? ["unknown_effect"] : [])].includes(progress.failed_action_effect_state)) reject("target_recovery_business_progress_unproven");
+  for (const entry of owned) {
+    if (entry === operation) continue;
+    // The only earlier effect exception is a terminal authenticated creation
+    // of this exact old tab. Navigation and other setup mutations stay gated.
+    if (source.includes(entry) && entry.binding?.method === "tabs.create" && entry.state === "applied"
+      && entry.brokerEvidence === true && entry.createdTabId === request.oldTabId && entry.resultDigest
+      && entry.dispatchCount === 1 && entry.dispatchState === "dispatched" && entry.mutationDispatchAttempted === true
+      && operationEffectStateForEntry(entry) === "known_effect" && !entry.awaitedEvent
+      && ["profileInstanceId", "generation", "sessionId", "ownerKey"].every(key => entry.binding[key] === operation.binding[key])) continue;
+    if (!safeNoEffect(entry)) reject("target_recovery_prior_effects");
+  }
+  return { intendedUrl, operation };
 }
 
 export function authoritySigningInput(envelope) {
@@ -1051,6 +1470,47 @@ export class TaskOperationLedger {
 
   get(idempotencyKey) { return this.operations.get(idempotencyKey); }
   listOperations() { return [...this.operations.values()].filter((entry) => entry.state !== "task_tab"); }
+  getOperationById(operationId) {
+    const matches = this.listOperations().filter(entry => entry.operationId === operationId);
+    return matches.length === 1 ? matches[0] : undefined;
+  }
+
+  // Cleanup is metadata on the original stop, never a settlement of its
+  // effect. Every write verifies the entire immutable operation binding.
+  async annotateDebuggerCleanup({ operationId, binding, status, reason }) {
+    return this.#queue(async () => {
+      await this.ready();
+      const entry = this.getOperationById(operationId);
+      if (!entry || entry.binding?.method !== "tabs.stopLoading" || canonical(entry.binding) !== canonical(binding)) {
+        throw authorityError("debugger_cleanup_binding_mismatch", "Cleanup must match the original stop operation and complete owner binding");
+      }
+      const ownerFields = ["taskId", "sessionId", "profileInstanceId", "generation"];
+      if (!ownerFields.every(field => typeof binding[field] === "string" && binding[field]) || !Number.isSafeInteger(binding.tabId)) {
+        throw authorityError("debugger_cleanup_binding_mismatch", "Cleanup requires a complete original owner binding");
+      }
+      const normalizedReason = DEBUGGER_CLEANUP_REASONS.includes(reason) ? reason : "release_not_verified";
+      if (!["pending", "detached", "reconciliation_required", "not_required"].includes(status)
+        || status === "detached" && !["detached", "browser_detached"].includes(normalizedReason)
+        || status === "not_required" && normalizedReason !== "no_lease_acquired"
+        || status === "reconciliation_required" && ["detached", "browser_detached", "no_lease_acquired"].includes(normalizedReason)) {
+        throw authorityError("debugger_cleanup_status_invalid", "Cleanup status and bounded reason must agree");
+      }
+      const previous = entry.cleanupReceipt;
+      if (previous && previous.status !== "pending") {
+        if (status === previous.status && normalizedReason === previous.reason) return { ...previous };
+        throw authorityError("debugger_cleanup_terminal_conflict", "A terminal cleanup receipt cannot be overridden");
+      }
+      if (!previous && status !== "pending") throw authorityError("debugger_cleanup_pending_missing", "A durable pending cleanup receipt is required");
+      if (previous && status === "pending") return { ...previous };
+      const observedAt = new Date(this.now()).toISOString();
+      const receipt = { operationId, ...Object.fromEntries([...ownerFields, "tabId"].map(field => [field, binding[field]])),
+        status, startedAt: previous?.startedAt ?? observedAt,
+        ...(status !== "pending" ? { reason: normalizedReason, observedAt } : {}) };
+      this.operations.set(entry.idempotencyKey, { ...entry, cleanupReceipt: receipt, updatedAt: observedAt });
+      await this.#persist();
+      return { ...receipt };
+    });
+  }
 
   /** Remove only old, terminal, non-uncertain records. */
   async gcTerminal({ now = this.now(), retentionMs = TERMINAL_LEDGER_RETENTION_MS } = {}) {
@@ -1072,6 +1532,7 @@ export class TaskOperationLedger {
         || entry?.effect?.effectState === "unknown_effect"
         || entry?.effect?.effect_state === "unknown_effect";
       const cleanupIncomplete = (entry) => {
+        if (["pending", "reconciliation_required"].includes(entry?.cleanupReceipt?.status)) return true;
         const cleanup = entry?.completion?.cleanup ?? entry?.cleanup;
         if (!cleanup || typeof cleanup !== "object") return false;
         if (["pending", "incomplete", "required", "started", "partial"].includes(cleanup.state)
@@ -1194,9 +1655,14 @@ export class TaskOperationLedger {
     });
   }
 
-  async prepare({ idempotencyKey, fingerprint, binding }) {
+  async prepare({ idempotencyKey, fingerprint, binding, navigationTargetDigest = null }) {
     return this.#queue(async () => {
       await this.ready();
+      const recordedNavigationTargetDigest = binding?.method === "tabs.navigate"
+        && typeof navigationTargetDigest === "string"
+        && /^[a-z0-9_-]{32,128}$/iu.test(navigationTargetDigest)
+        ? navigationTargetDigest
+        : null;
       const existing = this.operations.get(idempotencyKey);
       if (existing) {
         if (existing.state === "prepared" && existing.restartRecoveryDisposition === "fresh_retry_allowed" && existing.dispatchCount === 0) {
@@ -1212,6 +1678,7 @@ export class TaskOperationLedger {
             preparedAt: new Date(this.now()).toISOString(),
             restartRecoveryDisposition: null,
             reboundAfterRestartAt: new Date(this.now()).toISOString(),
+            ...(recordedNavigationTargetDigest ? { navigationTargetDigest: recordedNavigationTargetDigest } : {}),
           };
           this.operations.set(idempotencyKey, rebound);
           await this.#persist();
@@ -1231,6 +1698,7 @@ export class TaskOperationLedger {
         dispatchCount: 0,
         externalActionExecuted: false,
         preparedAt: new Date(this.now()).toISOString(),
+        ...(recordedNavigationTargetDigest ? { navigationTargetDigest: recordedNavigationTargetDigest } : {}),
       };
       this.operations.set(idempotencyKey, entry);
       await this.#persist();
@@ -1262,6 +1730,9 @@ export class TaskOperationLedger {
             ? "known_no_effect"
             : operationEffectStateForEntry(entry);
       Object.assign(entry, details, {
+        ...(details.mutationDispatchAttempted === true ? {
+          mutationDispatchProvenance: details.mutationDispatchProvenance ?? "observed_mutation",
+        } : {}),
         effectState: state === "unknown_effect"
           ? "unknown_effect"
           : normalizeOperationEffectState(explicitEffectState, inferredEffectState),
@@ -1280,7 +1751,7 @@ export class TaskOperationLedger {
     });
   }
 
-  async reconcile(idempotencyKey, binding, result, { brokerEvidence = false } = {}) {
+  async reconcile(idempotencyKey, binding, result, { brokerEvidence = false, noEffectOperationId = null } = {}) {
     if (!brokerEvidence) throw authorityError("reconciliation_evidence_required", "Caller-supplied results cannot reconcile an unknown effect");
     return this.#queue(async () => {
       await this.ready();
@@ -1294,12 +1765,202 @@ export class TaskOperationLedger {
       if (resultEffectState === "unknown_effect") {
         throw authorityError("reconciliation_effect_still_unknown", "Broker evidence must classify the reconciled result as an observed effect or a known no-effect");
       }
+      // A terminal broker settlement is immutable. An exact readback of the
+      // same settlement may return it, but cannot clear its proof or replace
+      // the recorded effect/digest through the general reconciliation path.
+      if (entry.state === "reconciled") {
+        const expectedNoEffectOperationId = entry.mutationDispatchProvenance === "authenticated_no_effect"
+          ? entry.noEffectProof?.operationId : null;
+        if (resultEffectState === operationEffectStateForEntry(entry)
+          && payloadDigest(this.secret, result) === entry.resultDigest
+          && noEffectOperationId === expectedNoEffectOperationId) return entry;
+        throw authorityError("reconciliation_terminal_immutable", "A terminal reconciliation cannot be replaced or have its no-effect settlement flag changed");
+      }
+      let noEffectSettlement = {};
+      if (noEffectOperationId !== null) {
+        if (noEffectOperationId !== entry.operationId || entry.mutationDispatchProvenance !== "transport_inference"
+          || entry.state !== "unknown_effect" || resultEffectState !== "known_no_effect"
+          || result?.mutationDispatchAttempted !== false || result?.externalActionExecuted !== false
+          || entry.externalActionExecuted === true || entry.awaitedEvent || entry.reason === "action_event_pending"
+          || Number.isSafeInteger(entry.createdTabId)
+          || operationEffectStateForEntry(entry) !== "unknown_effect") {
+          throw authorityError("reconciliation_no_effect_proof_mismatch", "No-effect settlement must match this operation's transport-only inference without observed mutation evidence");
+        }
+        noEffectSettlement = { mutationDispatchAttempted: false, externalActionExecuted: false,
+          mutationDispatchProvenance: "authenticated_no_effect", noEffectProofValid: true,
+          noEffectProof: { valid: true, brokerEvidence: true, effectState: "known_no_effect",
+            externalActionExecuted: false, mutationDispatchAttempted: false, operationId: entry.operationId,
+            binding: entry.binding },
+        };
+      }
       return this.#transitionUnlocked(entry, "reconciled", {
         resultDigest: payloadDigest(this.secret, result),
         reconciledAt: new Date(this.now()).toISOString(),
         brokerEvidence: true,
         effectState: resultEffectState,
+        ...noEffectSettlement,
       });
+    });
+  }
+
+  async appendViewportCleanup({ capsuleId, proof, currentBinding }, { brokerEvidence = false } = {}) {
+    if (!brokerEvidence) throw authorityError("reconciliation_evidence_required", "Cleanup requires broker-owned signed readback");
+    return this.#queue(async () => {
+      await this.ready();
+      const capsule = this.capsules.get(capsuleId);
+      const entry = this.operations.get(VIEWPORT_CLEANUP_AMENDMENT.operationKey);
+      const existing = entry?.viewportCleanupReceipts?.[0];
+      if (existing) {
+        const { signature, ...payload } = existing;
+        if (existing.capsuleId !== capsuleId || signature !== payloadDigest(this.secret, payload)
+          || existing.originalResultDigest !== entry.resultDigest || existing.originalOperationId !== entry.operationId) {
+          throw authorityError("viewport_cleanup_receipt_invalid", "Existing cleanup receipt must remain immutable");
+        }
+        return existing;
+      }
+      const { deadline } = viewportCleanupCandidate(capsule, this.listOperations(), this.listTaskCapsules(), this.now());
+      const absent = proof?.schema === "aos.chrome_companion.viewport_absence_proof.v1";
+      if (absent) verifyViewportAbsenceReadback(this.secret, proof, currentBinding, this.now());
+      else verifyViewportCleanupReadback(this.secret, proof, currentBinding, entry, this.now());
+      const receipt = {
+        schema: "aos.chrome_companion.viewport_cleanup_maintenance.v1",
+        capsuleId, originalOperationId: entry.operationId, originalResultDigest: entry.resultDigest,
+        originalBinding: entry.binding, originalOutcome: capsule.state,
+        historicalCapsuleExternalActionExecuted: capsule.effect.externalActionExecuted,
+        authenticatedOperationExternalActionExecuted: entry.externalActionExecuted,
+        originalReconciledAt: entry.reconciledAt, scheduledRestorationDeadline: new Date(deadline).toISOString(),
+        readbackProof: proof, currentBinding, recordedAt: new Date(this.now()).toISOString(),
+        conclusion: absent ? "original_target_absent_in_complete_authenticated_inventory_exact_target_lookup_also_unavailable"
+          : "original_effect_acknowledged_scheduled_deadline_elapsed_requested_configuration_not_currently_effective",
+        providerCompletion: false, desktopAcceptance: false, exactBaselineRestoration: false,
+        timerExecutionProven: false, replayAllowed: false, viewportMutationDispatchCount: 0,
+      };
+      const signed = { ...receipt, signature: payloadDigest(this.secret, receipt) };
+      entry.viewportCleanupReceipts = [signed];
+      this.operations.set(entry.idempotencyKey, entry);
+      this.capsules.set(capsuleId, { ...capsule, effect: { ...capsule.effect,
+        effectState: "known_effect", viewportCleanupReceiptDigest: signed.signature },
+        retention: { ...capsule.retention, policy: "cleanup", resumeTokenRequired: false,
+          reason: "viewport_cleanup_settled" }, updatedAt: receipt.recordedAt });
+      const tabKey = `task-tab:${entry.binding.profileInstanceId}:${entry.binding.tabId}`;
+      const tab = this.operations.get(tabKey);
+      if (tab?.capsuleId === capsuleId && tab.taskId === capsule.taskId && tab.runId === capsule.runId
+        && tab.retentionReason === "local_ui_effect_unknown") this.operations.set(tabKey, { ...tab,
+          retentionPolicy: "cleanup", retentionReason: "viewport_cleanup_settled", updatedAt: receipt.recordedAt });
+      if (absent && tab?.capsuleId === capsuleId && tab.taskId === capsule.taskId && tab.runId === capsule.runId) this.operations.delete(tabKey);
+      await this.#persist();
+      return signed;
+    });
+  }
+
+  async appendLocalEditorResolution({ originalOperationKey, originalPayload, capsuleId, resolution }, { brokerEvidence = false } = {}) {
+    if (!brokerEvidence) throw authorityError("reconciliation_evidence_required", "Local editor resolution requires fresh broker-owned readback");
+    return this.#queue(async () => {
+      await this.ready();
+      const entry = this.operations.get(originalOperationKey), capsule = this.capsules.get(capsuleId);
+      verifyOriginalEditorPayload(this.secret, entry, capsule, originalPayload);
+      const unresolved = this.listOperations().filter(item => item.state === "unknown_effect"
+        && item.binding?.taskId === capsule.taskId && item.binding?.runId === capsule.runId
+        && item.idempotencyKey.startsWith(`${capsule.effect.idempotencyKey}:`));
+      if (unresolved.length !== 1 || unresolved[0] !== entry) throw authorityError("local_editor_resolution_ambiguous", "Require one exact unresolved operation in the original failed capsule");
+      if (!resolution || resolution.originalOperationId !== entry.operationId || resolution.originalFingerprint !== entry.fingerprint
+        || resolution.currentBinding?.taskId !== entry.binding.taskId || resolution.currentBinding?.tabId !== entry.binding.tabId
+        || resolution.currentBinding?.profileInstanceId !== entry.binding.profileInstanceId
+        || resolution.currentBinding?.generation !== entry.binding.generation
+        || resolution.currentBinding?.pageInstanceId !== entry.binding.targetIdentity.pageInstanceId
+        || resolution.repairOperationKey === originalOperationKey || !resolution.repairOperationKey
+        || resolution.expectedFullBody !== resolution.expectedBody?.slice(0, resolution.offset) + resolution.insertText + resolution.expectedBody?.slice(resolution.offset)
+        || !Number.isSafeInteger(resolution.offset) || resolution.offset < 0 || resolution.offset > resolution.expectedBody.length
+        || !resolution.insertText || resolution.insertText.length > 1_000 || resolution.expectedFullBody.length > 100_000
+        || Date.parse(resolution.expiresAt) <= this.now()) {
+        throw authorityError("local_editor_resolution_invalid", "Resolution must bind one different-key surgical insertion to the fresh exact editor");
+      }
+      if ((entry.localEditorResolutions ?? []).some(item => !item.consumedAt)) throw authorityError("local_editor_resolution_exists", "An unconsumed local editor resolution already exists");
+      const signed = { ...resolution, signature: payloadDigest(this.secret, resolution) };
+      // Append only. Original receipt, binding, fingerprint, unknown state and
+      // failed capsule remain intact, including their replay rejection.
+      entry.localEditorResolutions = [...(entry.localEditorResolutions ?? []), signed];
+      this.operations.set(originalOperationKey, entry);
+      await this.#persist(); return signed;
+    });
+  }
+
+  localSelectionResolution(entry, capsule = this.capsules.get(entry?.localSelectionResolutions?.[0]?.capsuleId)) {
+    if (!entry || !capsule) return null;
+    for (const resolution of entry.localSelectionResolutions ?? []) {
+      const { signature, ...payload } = resolution;
+      try {
+        const label = verifyOriginalSelectionPayload(this.secret, entry, capsule, resolution.originalPayload);
+        const target = entry.binding.targetIdentity, current = resolution.currentBinding;
+        if (signature === payloadDigest(this.secret, payload)
+          && resolution.schema === "aos.chrome_companion.local_selection_resolution.v1"
+          && resolution.capsuleId === capsule.capsuleId && resolution.originalOperationId === entry.operationId
+          && resolution.originalFingerprint === entry.fingerprint && resolution.expectedLabel === label
+          && resolution.selectedLabel === label && resolution.providerCompletion === false
+          && resolution.optionLabelUnique === true && typeof resolution.optionInventoryDigest === "string"
+          && resolution.replayAllowed === false && resolution.controlTag === "select" && resolution.multiple === false
+          && ["taskId", "profileInstanceId", "generation", "tabId", "pageInstanceId", "windowId", "frameId"].every(key =>
+            current?.[key] != null && current[key] === target[key])
+          && current?.sessionId && current?.leaseId && resolution.url === capsule.target?.intendedUrl) return resolution;
+      } catch { /* Invalid or legacy evidence never opens a resume gate. */ }
+    }
+    return null;
+  }
+
+  localSelectionSettlement(capsule) {
+    const entry = this.operations.get(capsule?.effect?.failedOperationKey);
+    const resolution = this.localSelectionResolution(entry, capsule);
+    if (!resolution || this.listOperations().some(other => other !== entry
+      && other.binding?.taskId === capsule.taskId && other.binding?.runId === capsule.runId
+      && operationEffectStateForEntry(other) === "unknown_effect" && !this.localSelectionResolution(other))) return null;
+    return { capsuleId: capsule.capsuleId, operationId: entry.operationId, idempotencyKey: entry.idempotencyKey,
+      resolutionId: resolution.resolutionId, effectState: "known_effect", observedScope: "local_selection_only",
+      originalEffectState: "unknown_effect", providerCompletion: false, replayAllowed: false };
+  }
+
+  async appendLocalSelectionResolution({ originalOperationKey, originalPayload, capsuleId, resolution }, { brokerEvidence = false } = {}) {
+    if (!brokerEvidence) throw authorityError("reconciliation_evidence_required", "Local selection resolution requires authenticated broker readback");
+    return this.#queue(async () => {
+      await this.ready();
+      const entry = this.operations.get(originalOperationKey), capsule = this.capsules.get(capsuleId);
+      const label = verifyOriginalSelectionPayload(this.secret, entry, capsule, originalPayload);
+      const candidate = { ...resolution, capsuleId, originalPayload, expectedLabel: label };
+      const signed = { ...candidate, signature: payloadDigest(this.secret, candidate) };
+      if (!this.localSelectionResolution({ ...entry, localSelectionResolutions: [signed] }, capsule)) {
+        throw authorityError("local_selection_resolution_invalid", "Selection evidence must match this exact original control/document and label");
+      }
+      const existing = this.localSelectionResolution(entry, capsule);
+      if (existing) {
+        if (canonical(existing.currentBinding) !== canonical(candidate.currentBinding)) {
+          throw authorityError("local_selection_resolution_exists", "The original selection already has a different bound resolution");
+        }
+        return existing;
+      }
+      // Only append proof. Never change the original unknown receipt/capsule,
+      // its dispatch count or its old-key refusal.
+      entry.localSelectionResolutions = [...(entry.localSelectionResolutions ?? []), signed];
+      this.operations.set(originalOperationKey, entry);
+      await this.#persist();
+      return signed;
+    });
+  }
+
+  async consumeLocalEditorResolution({ originalOperationKey, resolutionId, repairOperationKey, currentBinding, guard, text }) {
+    return this.#queue(async () => {
+      await this.ready();
+      const entry = this.operations.get(originalOperationKey);
+      const resolution = entry?.localEditorResolutions?.find(item => item.resolutionId === resolutionId);
+      const { signature, consumedAt, ...signed } = resolution ?? {};
+      if (!resolution || consumedAt || Date.parse(resolution.expiresAt) <= this.now()
+        || signature !== payloadDigest(this.secret, signed) || resolution.repairOperationKey !== repairOperationKey
+        || repairOperationKey === originalOperationKey || canonical(resolution.currentBinding) !== canonical(currentBinding)
+        || guard.expectedBody !== resolution.expectedBody || guard.expectedFullBody !== resolution.expectedFullBody
+        || guard.offset !== resolution.offset || guard.url !== resolution.url || text !== resolution.insertText) {
+        throw authorityError("local_editor_repair_binding_invalid", "Surgical repair grant is stale, consumed or does not match this exact operation");
+      }
+      resolution.consumedAt = new Date(this.now()).toISOString();
+      this.operations.set(originalOperationKey, entry);
+      await this.#persist(); return resolution;
     });
   }
 
@@ -1589,6 +2250,25 @@ export class TaskOperationLedger {
     });
   }
 
+  async reserveTargetRecovery({ sourceCapsuleId, originalOperationId, recoveryIdempotencyKey, capsuleId, binding }) {
+    return this.#queue(async () => {
+      await this.ready();
+      const key = `target-recovery:${payloadDigest(this.secret, { sourceCapsuleId, originalOperationId })}`;
+      if (this.operations.has(key) || this.operations.has(recoveryIdempotencyKey)
+        || this.listTaskCapsules().some(capsule => capsule.effect?.idempotencyKey === recoveryIdempotencyKey)
+        || this.listOperations().some(entry => entry.recoveryIdempotencyKey === recoveryIdempotencyKey
+          || entry.idempotencyKey?.startsWith(`${recoveryIdempotencyKey}:`))) {
+        throw authorityError("target_recovery_already_reserved", "This source invocation already has a recovery; read its existing receipt without creating again");
+      }
+      const entry = { idempotencyKey: key, operationId: createId("recovery"), binding, state: "prepared",
+        effectState: "no_dispatch", dispatchState: "not_dispatched", dispatchCount: 0,
+        recoveryIdempotencyKey, sourceCapsuleId, originalOperationId, capsuleId, preparedAt: new Date(this.now()).toISOString() };
+      this.operations.set(key, entry);
+      await this.#persist();
+      return entry;
+    });
+  }
+
   async transitionTaskCapsule(capsuleId, state, details = {}) {
     return this.#queue(async () => {
       await this.ready();
@@ -1604,14 +2284,27 @@ export class TaskOperationLedger {
   // Commit the operation effect and its capsule together. Updating only the
   // lifecycle left completed reconciliations permanently UNKNOWN to status,
   // resume, and the scheduler, even after signed same-target success proof.
-  async completeTaskReconciliation(capsuleId, details, { brokerEvidence = false, proofDigest } = {}) {
+  async completeTaskReconciliation(capsuleId, details, {
+    brokerEvidence = false,
+    proofDigest,
+    proofKind = "provider_success",
+    operationIndex = null,
+    recordedTargetDigest = null,
+  } = {}) {
     if (!brokerEvidence || typeof proofDigest !== "string" || !proofDigest) {
       throw authorityError("reconciliation_evidence_required", "Task reconciliation requires broker-verified readback evidence");
     }
     return this.#queue(async () => {
       await this.ready();
       const capsule = this.capsules.get(capsuleId);
-      if (!capsule || capsule.state !== "reconciliation_required" || !capsule.effect?.idempotencyKey) {
+      const localNavigation = proofKind === "local_navigation_arrival";
+      const legacyLocalFailure = localNavigation
+        && capsule?.state === "failed"
+        && capsule.retention?.reason === "local_ui_effect_unknown";
+      if (!capsule
+        || (!localNavigation && capsule.state !== "reconciliation_required")
+        || (localNavigation && capsule.state !== "reconciliation_required" && !legacyLocalFailure)
+        || !capsule.effect?.idempotencyKey) {
         throw authorityError("task_reconciliation_state_invalid", "Only an unresolved task capsule may be reconciled");
       }
       const keyPrefix = `${capsule.effect.idempotencyKey}:`;
@@ -1623,6 +2316,109 @@ export class TaskOperationLedger {
         && entry.binding?.tabId === capsule.resources?.tabId
         && entry.binding?.profileInstanceId === capsule.target?.profileInstanceId
         && isUnresolvedOperationEffect(entry));
+      if (localNavigation) {
+        if (capsule.effect?.effectClass !== "local_ui"
+          || operationEffectStateForEntry(capsule.effect) !== "unknown_effect"
+          || capsule.effect?.externalActionExecuted === true) {
+          throw authorityError("local_navigation_reconciliation_not_applicable", "Local arrival maintenance requires an uncertain local UI capsule");
+        }
+        const candidates = operations.filter(isUncertainLocalNavigationEffect);
+        if (operations.length !== 1 || candidates.length !== 1) {
+          throw authorityError("task_reconciliation_operation_ambiguous", "Local arrival maintenance requires one exact unresolved tabs.navigate operation");
+        }
+        const operation = candidates[0];
+        const suffix = operation.idempotencyKey.slice(keyPrefix.length);
+        const parsedOperationIndex = /^\d+$/u.test(suffix) ? Number(suffix) : null;
+        if (!Number.isSafeInteger(parsedOperationIndex)
+          || parsedOperationIndex !== operationIndex
+          || (Number.isSafeInteger(operation.operationIndex) && operation.operationIndex !== parsedOperationIndex)) {
+          throw authorityError("local_navigation_operation_index_mismatch", "Local arrival proof does not match the exact unresolved operation index");
+        }
+        const expectedTargetDigest = operation.navigationTargetDigest
+          ?? localNavigationTargetDigestFromKey(this.secret, capsule.target?.targetKey);
+        if (!expectedTargetDigest
+          || expectedTargetDigest !== recordedTargetDigest
+          || (capsule.effect.localNavigationTargetDigest
+            && capsule.effect.localNavigationTargetDigest !== expectedTargetDigest)) {
+          throw authorityError("local_navigation_target_mismatch", "Local arrival proof does not match the recorded navigation target");
+        }
+        const otherUnresolved = this.listOperations().filter(entry =>
+          entry.idempotencyKey !== operation.idempotencyKey
+          && entry.binding?.taskId === capsule.taskId
+          && entry.binding?.runId === capsule.runId
+          && isUnresolvedOperationEffect(entry));
+        const now = new Date(this.now()).toISOString();
+        const oldProgress = capsule.effect.actionProgress;
+        const oldUncertainIndices = Array.isArray(oldProgress?.uncertain_action_indices)
+          ? oldProgress.uncertain_action_indices.filter(Number.isSafeInteger)
+          : [];
+        // Clear an action index only when the capsule identifies this as its
+        // sole uncertain action. Keep all later work recorded and undispatched.
+        const reconciledIndices = oldUncertainIndices.length === 1 ? oldUncertainIndices : [];
+        const actionProgress = oldProgress ? {
+          ...oldProgress,
+          applied_action_indices: [...new Set([...(oldProgress.applied_action_indices ?? []), ...reconciledIndices])].sort((a, b) => a - b),
+          verified_action_indices: [...new Set([...(oldProgress.verified_action_indices ?? []), ...reconciledIndices])].sort((a, b) => a - b),
+          uncertain_action_indices: oldUncertainIndices.filter((index) => !reconciledIndices.includes(index)),
+          failed_action_index: reconciledIndices.includes(oldProgress.failed_action_index) ? null : oldProgress.failed_action_index,
+          ...(reconciledIndices.length ? { failed_action_effect_state: "known_effect" } : {}),
+          reconciled_action_indices: [...new Set([...(oldProgress.reconciled_action_indices ?? []), ...reconciledIndices])].sort((a, b) => a - b),
+          replay_allowed: false,
+        } : undefined;
+        const next = transitionTaskExecutionCapsule(capsule, "failed", {
+          ...details,
+          // Arrival maintenance settles only the local navigation result. It
+          // never erases the original transaction failure or marks the task
+          // as a business success.
+          blocker: capsule.blocker,
+          restartPoint: "task_failure_recovery",
+          resumeToken: null,
+          retention: {
+            ...capsule.retention,
+            policy: otherUnresolved.length ? "retain_until_resume" : "cleanup",
+            resumeTokenRequired: false,
+            userHelpRequired: false,
+            reason: otherUnresolved.length ? "ai_reconciliation_pending" : null,
+            whyTabWasKept: otherUnresolved.length
+              ? "Another unresolved operation in this exact run still requires signed reconciliation."
+              : null,
+            requiredUserAction: null,
+            resumeAction: otherUnresolved.length ? "reconcile_other_unresolved_operation_without_replay" : null,
+          },
+          effect: {
+            ...capsule.effect,
+            effectClass: "local_ui",
+            effectState: "known_effect",
+            externalActionExecuted: false,
+            reconciliationRequired: false,
+            localNavigationArrivalSettled: true,
+            localNavigationOperationIndex: parsedOperationIndex,
+            localNavigationTargetDigest: expectedTargetDigest,
+            localNavigationOtherUnresolvedEffects: otherUnresolved.length,
+            localNavigationArrivalSettledAt: now,
+            reconciliationProofDigest: proofDigest,
+            reconciledAt: now,
+            ...(actionProgress ? { actionProgress } : {}),
+          },
+        }, now);
+        this.operations.set(operation.idempotencyKey, {
+          ...operation,
+          state: "reconciled",
+          effectState: "known_effect",
+          externalActionExecuted: false,
+          effectClass: "local_ui",
+          reconciliationRequired: false,
+          brokerEvidence: true,
+          localNavigationArrivalReconciled: true,
+          localNavigationArrivalAt: now,
+          localNavigationProofDigest: proofDigest,
+          updatedAt: now,
+          resultDigest: proofDigest,
+        });
+        this.capsules.set(capsuleId, next);
+        await this.#persist();
+        return next;
+      }
       if (operations.length > 1) throw authorityError("task_reconciliation_operation_ambiguous", "Several unresolved operations require separate evidence");
       const now = new Date(this.now()).toISOString();
       const oldProgress = capsule.effect.actionProgress;
@@ -1638,21 +2434,27 @@ export class TaskOperationLedger {
         replay_allowed: false,
       } : undefined;
       const remaining = actionProgress?.remaining_action_indices ?? [];
-      const next = transitionTaskExecutionCapsule(capsule, remaining.length ? "failed" : "completed", {
+      const uploadConfirmation = proofKind === "upload_site_confirmation";
+      if (uploadConfirmation && (capsule.effect?.uploadDelivery?.applied !== true
+        || details.completion?.reconciliation?.providerSuccessConfirmed !== false))
+        throw authorityError("upload_site_state_evidence_required", "Attachment settlement requires delivered files and explicit provider completion false");
+      const retainWorkflow = remaining.length > 0 || uploadConfirmation;
+      const next = transitionTaskExecutionCapsule(capsule, retainWorkflow ? "failed" : "completed", {
         ...details,
         blocker: null,
-        restartPoint: remaining.length ? "read_back_same_target_then_continue_remaining_actions" : null,
+        restartPoint: remaining.length ? "read_back_same_target_then_continue_remaining_actions" : uploadConfirmation ? "continue_unsubmitted_workflow_or_explicitly_abandon" : null,
         resumeToken: null,
-        ...(remaining.length ? { retention: { ...capsule.retention, policy: "retain_until_resume", reason: "partial_actions_applied", userHelpRequired: false, resumeTokenRequired: false } } : {}),
+        ...(retainWorkflow ? { retention: { ...capsule.retention, policy: "retain_until_resume", reason: uploadConfirmation ? "attachment_confirmed_workflow_unsubmitted" : "partial_actions_applied", userHelpRequired: false, resumeTokenRequired: false } } : {}),
         effect: {
-          ...capsule.effect, effectState: "known_effect", externalActionExecuted: true,
+          ...capsule.effect, effectState: "known_effect", externalActionExecuted: uploadConfirmation ? capsule.effect.externalActionExecuted : true,
+          ...(uploadConfirmation ? { providerSuccessConfirmed: false } : {}),
           reconciliationRequired: false, reconciledAt: now, reconciliationProofDigest: proofDigest,
           ...(actionProgress ? { actionProgress } : {}),
         },
       }, now);
       for (const entry of operations) {
         this.operations.set(entry.idempotencyKey, {
-          ...entry, state: "reconciled", effectState: "known_effect", externalActionExecuted: true,
+          ...entry, state: "reconciled", effectState: "known_effect", externalActionExecuted: uploadConfirmation ? entry.externalActionExecuted : true,
           reconciliationRequired: false, brokerEvidence: true, reconciledAt: now, updatedAt: now,
           resultDigest: proofDigest,
         });

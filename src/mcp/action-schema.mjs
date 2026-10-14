@@ -9,11 +9,14 @@ export function transactionActionSchema(locator) {
   const point = z.object({ x: z.number().min(0).max(20_000), y: z.number().min(0).max(20_000) });
   const modifiers = z.union([z.array(z.enum(['alt', 'ctrl', 'control', 'meta', 'command', 'cmd', 'shift'])), text.min(1).describe('Shortcut modifier string such as Meta+Shift')]).optional();
   const uploadConfirmation = {
+    confirmationFiles: z.array(z.object({ filename: text.min(1).max(255), locator })).min(1).max(10).optional().describe('One attachment-ready locator for every assigned filename; required for multiple files when the input resets'),
     confirmationLocator: locator.describe('Exact visible attachment-ready state that will appear after this upload; must not already match before the operation').optional(),
     confirmationTimeoutMs: z.number().int().min(100).max(15000).describe('Wait for the site to accept the attachment without uploading it again').optional(),
+    confirmationPreviewOnly: z.boolean().describe('page.upload with one file only: the site shows a preview but not the filename, so confirmationLocator alone (absent before, visible after) proves attachment').optional(),
+    confirmationCountLocator: locator.describe('For sites that rename uploads or show no filename (e.g. Printify My uploads): a locator matching every uploaded item in the list; attachment is proven when its visible count grows by the number of files').optional(),
   };
   const fields = {
-    'page.query': { query: text.min(1).max(500).optional(), locator: locator.optional(), attributes: z.array(text.regex(/^[A-Za-z_:][A-Za-z0-9_.:-]*$/u).max(100)).max(16).optional(), includeHidden: z.boolean().optional(), offset: z.number().int().min(0).max(4_999).optional(), limit: z.number().int().min(1).max(100).optional(), frameId: z.number().int().min(0).optional() },
+    'page.query': { exactEditor: z.boolean().optional(), splitBinding: z.boolean().optional().describe('Read current exact editor body/HTML and DOM caret for a signed splitParagraph guard; requires exactEditor'), query: text.min(1).max(500).optional(), locator: locator.optional(), attributes: z.array(text.regex(/^[A-Za-z_:][A-Za-z0-9_.:-]*$/u).max(100)).max(16).optional(), includeHidden: z.boolean().optional(), offset: z.number().int().min(0).max(4_999).optional(), limit: z.number().int().min(1).max(100).optional(), frameId: z.number().int().min(0).optional() },
     'page.type': { locator, text, clear: z.boolean().describe('For contenteditable, true explicitly replaces the entire editor; false inserts at selection').optional(), physicalFallback: z.enum(['disabled', 'on_verified_no_effect']).optional() },
     'page.click': { locator }, 'page.doubleClick': { locator }, 'page.hover': { locator },
     'page.setChecked': { locator, checked: z.boolean() },
@@ -27,7 +30,8 @@ export function transactionActionSchema(locator) {
     ]), visualProof: proof, exact: z.boolean().optional(), timeoutMs: z.number().int().min(250).max(15_000).optional() },
     'page.upload': { locator, filePath: text.min(1).describe('Absolute path to a supported local regular non-symlink file, at most 25 MiB'), ...uploadConfirmation },
     'page.uploadMultiple': { locator, filePaths: z.array(text.min(1)).min(1).max(10).describe('Absolute paths; supported regular non-symlink files, at most 25 MiB combined'), ...uploadConfirmation },
-    'page.richText': { locator, operation: z.enum(['bold', 'italic', 'underline', 'heading', 'formatBlock', 'formatblock', 'unorderedList', 'unorderedlist', 'unordered-list', 'orderedList', 'orderedlist', 'ordered-list', 'indent', 'outdent', 'horizontalRule', 'horizontalrule', 'horizontal-rule']), text: text.min(1).max(10_000).optional(), blockTag: z.enum(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'blockquote', 'pre']).optional().describe('For heading or formatBlock; defaults to p. The selection must cover one whole block.'), occurrence: z.number().int().min(0).max(99).optional() },
+    'page.richText': { locator, operation: z.enum(['splitParagraph', 'bold', 'italic', 'underline', 'heading', 'formatBlock', 'formatblock', 'unorderedList', 'unorderedlist', 'unordered-list', 'orderedList', 'orderedlist', 'ordered-list', 'indent', 'outdent', 'horizontalRule', 'horizontalrule', 'horizontal-rule']), text: text.min(1).max(10_000).optional(), blockTag: z.enum(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'blockquote', 'pre']).optional().describe('For heading or formatBlock; defaults to p. The selection must cover one whole block.'), occurrence: z.number().int().min(0).max(99).optional(),
+      expectedCaret: z.object({ path: z.array(z.number().int().min(0)).max(32), offset: z.number().int().min(0) }).optional().describe('splitParagraph: exact editor-relative childNodes path and DOM offset; signed with the action'), expectedEditorHtml: text.max(100_000).optional().describe('splitParagraph with BR children: exact current editor innerHTML; binds line-break boundaries'), expectedBody: text.max(100_000).optional().describe('splitParagraph: exact full editor textContent, using UTF-16 offsets'), expectedFullBody: text.max(100_000).optional().describe('splitParagraph preserves all textContent; must equal expectedBody'), expectedSelection: z.object({ start: z.number().int().min(0), end: z.number().int().min(0) }).optional() },
     'tabs.navigate': { url: z.string().url() },
     'tabs.back': {}, 'tabs.forward': {},
     'tabs.reload': { bypassCache: z.boolean().optional() },
@@ -44,6 +48,9 @@ export function transactionActionSchema(locator) {
     'page.webMcpCall': { toolName: text.min(1).max(120), arguments: z.record(z.string(), z.unknown()).optional(), allowedToolNames: z.array(text.min(1).max(120)).min(1).max(32), approved: z.literal(true), maxResultBytes: z.number().int().min(1).max(262144).optional() },
     'page.nativeChooser': {},
     'tabs.claimExisting': {},
+    'recording.status': {},
+    'recording.startAuto': { filename: text.max(160).optional() },
+    'recording.stopAuto': { filename: text.max(160).optional() },
   };
   for (const method of AUTHORIZED_TRANSACTION_METHODS.filter(name => name.startsWith('visual.'))) {
     fields[method] = { visualProof: proof };
@@ -67,6 +74,8 @@ export function transactionActionSchema(locator) {
           : 'Arguments for ' + method
     );
     if (method === 'page.query') params = params.refine(value => value.query || value.locator, 'Provide a query or locator');
+    if (method === 'page.query') params = params.refine(value => value.splitBinding !== true || value.exactEditor === true, 'splitBinding requires exactEditor');
+    if (method === 'page.richText') params = params.refine(value => value.operation !== 'splitParagraph' || (value.expectedCaret !== undefined && value.expectedBody !== undefined && value.expectedFullBody === value.expectedBody && value.expectedSelection?.start === value.expectedSelection?.end && value.expectedSelection?.start <= value.expectedBody.length), 'splitParagraph requires full unchanged body and one collapsed UTF-16 selection');
     if (method === 'page.configureViewport') params = params.refine(value => value.action === 'restore' || (value.width !== undefined && value.height !== undefined && value.width * value.height * (value.deviceScaleFactor ?? 1) ** 2 <= 16777216), 'Set requires width/height and at most 16 megapixels');
     if (method === 'tabs.configure') params = params.refine(value => ['pinned','muted','index','destinationWindowId'].some(key => value[key] !== undefined), 'Provide a tab configuration change');
     if (method === 'page.download') params = params.refine(value => (value.url !== undefined) !== (value.locator !== undefined), 'Provide exactly one URL or locator');

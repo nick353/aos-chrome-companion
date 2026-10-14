@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { collectDoctorDiagnostics, formatDoctorText } from "../src/shared/doctor-diagnostics.mjs";
+import { collectDoctorDiagnostics, evaluateDoctorReadiness, formatDoctorText } from "../src/shared/doctor-diagnostics.mjs";
 import { writeFile } from "node:fs/promises";
 
 function parseArgs(argv) {
@@ -28,17 +28,15 @@ if (options.help) {
 }
 try {
   const report = await collectDoctorDiagnostics(options);
-  const strictMaintenance = (report.maintenance ?? []).filter((item) => item.severity === "high");
-  if (options.strict) {
-    report.strict_ready = report.result === "ok" && strictMaintenance.length === 0;
-    report.strict_blockers = strictMaintenance.map((item) => item.code);
-  }
+  const readiness = evaluateDoctorReadiness(report, options);
+  report.strict_ready = readiness.strict_ready;
+  report.strict_blockers = readiness.strict_blockers;
   // --output was the legacy JSON-file interface; retain that shape unless
   // the caller explicitly asks for text-only output behavior.
   const output = (options.json || options.output) ? `${JSON.stringify(report, null, 2)}\n` : formatDoctorText(report);
   if (options.output) await writeFile(options.output, output, { mode: 0o600 });
   process.stdout.write(output);
-  process.exitCode = report.result === "ok" && (!options.strict || strictMaintenance.length === 0) ? 0 : 1;
+  process.exitCode = readiness.exitCode;
 } catch (error) {
   process.stderr.write(`${JSON.stringify({ schema: "aos.chrome_companion.doctor_diagnostics.v1", result: "unavailable", readOnly: true, error: error instanceof Error ? error.message : String(error) })}\n`);
   process.exitCode = 1;

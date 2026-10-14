@@ -10,6 +10,8 @@ const physicalInput = document.querySelector("#physical-input");
 const physicalInputStatus = document.querySelector("#physical-input-status");
 const peripheralAccess = document.querySelector("#peripheral-access");
 const peripheralAccessStatus = document.querySelector("#peripheral-access-status");
+const recording = document.querySelector("#recording");
+const recordingStatus = document.querySelector("#recording-status");
 let physicalInputEnabled = false;
 document.querySelector("#open-controls").addEventListener("click", async () => {
   try {
@@ -66,6 +68,12 @@ async function refresh() {
   peripheralAccessStatus.textContent = state.peripheralPermissionsGranted === true
     ? "Enabled for bounded task-owned operations"
     : "Optional — content query/export and WebMCP discovery do not need this";
+  const recordingState = await chrome.runtime.sendMessage({ kind: "recording.status" }).catch(() => ({ active: false }));
+  recording.dataset.active = String(recordingState?.active === true);
+  recording.textContent = recordingState?.active === true ? "Stop recording and save WebM" : "Start tab recording with audio";
+  if (recordingState?.active !== true && !recordingStatus.textContent.startsWith("Saved ")) {
+    recordingStatus.textContent = "Records the current tab's video and audio into Downloads.";
+  }
 }
 
 retry.addEventListener("click", async () => {
@@ -105,6 +113,34 @@ peripheralAccess.addEventListener("click", async () => {
     peripheralAccessStatus.textContent = `Permission request failed: ${permissionError instanceof Error ? permissionError.message : String(permissionError)}`;
   } finally {
     await refresh();
+  }
+});
+
+recording.addEventListener("click", async () => {
+  recording.disabled = true;
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab?.id) throw new Error("No active tab was found");
+    if (recording.dataset.active === "true") {
+      const result = await chrome.runtime.sendMessage({ kind: "recording.stop", filename: `companion-${Date.now()}.webm` });
+      if (!result?.ok) throw new Error(result?.error ?? "Recording could not stop");
+      recording.dataset.active = "false";
+      recording.textContent = "Start tab recording with audio";
+      recordingStatus.textContent = `Saved ${result.filename} (${result.bytes} bytes, audio verified)`;
+    } else {
+      const granted = await chrome.permissions.request({ permissions: ["downloads"] });
+      if (!granted) throw new Error("Downloads permission was not granted");
+      const streamId = await chrome.tabCapture.getMediaStreamId({ targetTabId: tab.id });
+      const result = await chrome.runtime.sendMessage({ kind: "recording.start", tabId: tab.id, streamId, taskId: "companion-popup-recording" });
+      if (!result?.ok) throw new Error(result?.error ?? "Recording could not start");
+      recording.dataset.active = "true";
+      recording.textContent = "Stop recording and save WebM";
+      recordingStatus.textContent = `Recording tab ${tab.id} with tab audio…`;
+    }
+  } catch (recordingError) {
+    recordingStatus.textContent = `Recording: ${recordingError instanceof Error ? recordingError.message : String(recordingError)}`;
+  } finally {
+    recording.disabled = false;
   }
 });
 

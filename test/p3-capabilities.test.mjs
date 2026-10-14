@@ -74,7 +74,9 @@ test("P3 implementation strips active content, redacts logs, and never exposes a
   assert.doesNotMatch(source, /Runtime\.evaluate/);
   assert.match(offscreen, /sender\?\.id !== chrome\.runtime\.id \|\| sender\?\.tab/);
   assert.match(offscreen, /document\.execCommand\("paste"\)/);
-  assert.match(offscreen, /document\.execCommand\("copy"\)/);
+  // An uncertain clipboard write must not fall back to a second copy mutation.
+  assert.doesNotMatch(offscreen, /document\.execCommand\("copy"\)/);
+  assert.match(offscreen, /writeClipboardWithReceipt/);
   assert.match(offscreen, /clipboard_binary_opt_in_required/);
   assert.match(offscreen, /clipboard_mime_not_allowed/);
   assert.match(offscreen, /clipboard_payload_too_large/);

@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { readFile } from "node:fs/promises";
+import { runInNewContext } from "node:vm";
+import { OPERATION_SCHEMA_DIGEST } from "../src/shared/operation-schema.mjs";
 import {
   automaticRefreshPlan,
   canSyncControlPlaneArtifacts,
@@ -8,6 +11,25 @@ import {
   resolveRefreshTaskIdentity,
   shouldSuppressRedundantOfflineRestart,
 } from "../src/shared/install-refresh.mjs";
+
+test("sync fresh readback rejects missing or stale activation/provenance without live integration", async () => {
+  const source = await readFile(new URL("../scripts/sync-control-plane-macos.mjs", import.meta.url), "utf8");
+  const functionSource = source.slice(source.indexOf("async function readInstalledLiveStatusUntilReady("), source.indexOf("export function maintenanceBoundary("));
+  const profile = { connected: true, buildId: "installed", generation: 2, operationSchemaDigest: OPERATION_SCHEMA_DIGEST,
+    buildProvenanceMismatches: [] };
+  for (const [overrides, expected] of [[{}, true], [{ buildId: "old" }, false], [{ operationSchemaDigest: "old" }, false],
+    [{ buildProvenanceMismatches: undefined }, false], [{ buildProvenanceMismatches: ["extensionTreeSha256"] }, false], [{ generation: null }, false]]) {
+    let clock = 0;
+    const status = { profiles: [{ ...profile, ...overrides }], runtimeAttestation: { operationSchemaDigest: OPERATION_SCHEMA_DIGEST } };
+    const check = runInNewContext(`${functionSource}\nreadInstalledLiveStatusUntilReady`, { OPERATION_SCHEMA_DIGEST,
+      Date: { now: () => { clock += 1_000; return clock; } }, setTimeout: (callback) => callback(),
+      readInstalledLiveStatus: async () => status, errorText: String });
+    const result = await check("mock-app", { expectedBuildId: "installed", timeoutMs: 5_000 });
+    assert.equal(result.ready, expected);
+  }
+  assert.match(source, /\.\.\.controlPlaneSyncReadiness\(receipt\)\.exactBlockers, \.\.\.receipt\.restartBoundary\.blockers/u);
+  assert.match(source, /refreshDeferred \? "applied_pending_refresh"/u);
+});
 
 test("automatic refresh uses one connected profile and defers before any restart otherwise", () => {
   assert.equal(automaticRefreshPlan({ restartBroker: true, refreshExtension: true, profile: { profileInstanceId: "p", connected: true } }).disposition, "allowed");

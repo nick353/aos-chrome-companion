@@ -19,7 +19,12 @@ import {
   SESSION_TTL_MS,
   TARGET_METHODS,
 } from "../shared/constants.mjs";
-import { INSTALL_BUILD_ID } from "../shared/build-info.mjs";
+import {
+  BUNDLE_TREE_SHA256,
+  EXTENSION_TREE_SHA256,
+  INSTALL_BUILD_ID,
+  NATIVE_RECORDER_SHA256,
+} from "../shared/build-info.mjs";
 import { ACTION_EVENT_CONTRACT, operationCapabilityDocument } from "../shared/operation-schema.mjs";
 import { verifyDownloadedArtifact } from "./download-artifact.mjs";
 import { CompanionError, normalizeError } from "../shared/errors.mjs";
@@ -31,7 +36,14 @@ import { assertCanvasVisualPatchUnchanged, readCanvasVisualPatch } from "../shar
 import { readHandoffSourceGate, resolveHandoffReceiptsDir, validateHandoffReceipt } from "../shared/handoff-receipt.mjs";
 import {
   deriveTaskTargetKey,
+  blockerRecoveryContext,
+  unresolvedLocalNavigationForTarget,
   archiveReconciliationPayload,
+  canonicalPayload,
+  capsuleNoEffectSettlement,
+  VIEWPORT_CLEANUP_AMENDMENT,
+  viewportCleanupCandidate,
+  classifyInterruptedEffect,
   authorizedTransactionPayload,
   createHandoffAck,
   extensionReloadPayload,
@@ -39,22 +51,34 @@ import {
   normalizeTargetIdentity,
   isUnresolvedOperationEffect,
   normalizeOperationEffectState,
+  isUncertainLocalNavigationEffect,
   operationRequiresReconciliation,
   operationEffectStateForEntry,
   operationEffectProofPayload,
   signOperationEffectProof,
   payloadDigest,
+  uploadReconciliationPayload,
+  localEditorReconciliationPayload,
+  verifyOriginalEditorPayload,
+  localSelectionReconciliationPayload,
+  verifyOriginalSelectionPayload,
+  localNavigationTargetDigest,
+  localNavigationTargetDigestFromKey,
   repairPreDispatchReadonlyPayload,
   rebuildTaskTabIdentity,
   TaskOperationLedger,
   taskTabIdentityConsistent,
   targetIdentityDigest,
+  targetRecoveryPayload,
+  validateTargetRecoverySource,
   TERMINAL_LEDGER_RETENTION_MS,
 } from "../shared/task-runtime.mjs";
 import { bindTransactionStep, compileTransactionSteps } from "../shared/step-packet.mjs";
 import { captureTransactionReadback, readSubmissionTransition, semanticReadback, transactionOutcome } from "../shared/transaction-readback.mjs";
 import { createRecoveryHandle, deriveRecoveryIndex } from "../shared/recovery-state.mjs";
 import { createRuntimeAttestation } from "../shared/runtime-attestation.mjs";
+import { buildProvenanceMismatches } from "../shared/build-provenance.mjs";
+import { historicalRefreshContractMatches, readRefreshContractHistory } from "../shared/refresh-contract-history.mjs";
 import { operationAuditPage, taskStatusPayload } from "../shared/operation-audit.mjs";
 import { resolveDynamicTaskTarget } from "../shared/dynamic-target-adapter.mjs";
 import {
@@ -67,6 +91,21 @@ import {
 function nowIso() {
   return new Date().toISOString();
 }
+
+// No-effect blockers scoped to one target that the same task may recover
+// from by reading the target again, with the concrete next step.
+const RECOVERABLE_NO_EFFECT_TARGET_BLOCKERS = new Map([
+  ["semantic_locator_not_found", "wait_for_page_ready_or_query_current_page_then_refine_locator"],
+  ["semantic_locator_ambiguous", "query_current_page_then_refine_locator"],
+  ["semantic_locator_scan_limit", "query_current_page_then_refine_locator"],
+  ["task_target_unavailable", "companion_reserve_tab_on_the_same_tab_then_retry_with_tabId"],
+  ["task_target_tab_missing", "companion_list_tabs_then_reopen_with_startUrl"],
+  ["task_target_not_provisioned", "retry_with_startUrl_to_open_a_task_tab"],
+]);
+
+// Broker-private provenance: a read's no-effect receipt cannot be interpreted
+// as a no-effect claim about an earlier setup or applied mutation.
+const READ_ONLY_COMMAND_FAILURE = Symbol("read_only_command_failure");
 
 function validateExpectedActionEvent(method, value) {
   if (value === undefined) return;
@@ -240,7 +279,60 @@ function timedOutEffectState(operation) {
 
 function timedOutNeedsReconciliation(operation) {
   return timedOutEffectState(operation) === "unknown_effect"
-    && operationRequiresReconciliation(operation);
+    && (operationRequiresReconciliation(operation) || isUncertainLocalNavigationEffect(operation));
+}
+
+function observedNoEffectDetails(error) {
+  const details = error?.details ?? {};
+  const states = [details.operationEffectState, details.effectState, details.operation_effect_state, details.effect_state]
+    .filter(value => value !== undefined && value !== null)
+    .map(value => normalizeOperationEffectState(value, "unknown_effect"));
+  return states.length > 0 && states.every(state => state === "known_no_effect");
+}
+
+export function transactionFailureNoEffectEvidence(error, { operation = null, operationKey = null, preDispatch = false } = {}) {
+  const details = error?.details ?? {};
+  const matched = operationKey && operation?.idempotencyKey === operationKey ? operation : null;
+  const unresolved = ["operation_effect_unknown", "action_event_pending"].includes(error?.code)
+    || Number.isSafeInteger(details.createdTabId)
+    || (matched && (matched.state === "unknown_effect" || isUncertainLocalNavigationEffect(matched)));
+  const claimed = [details.operationEffectState, details.effectState, details.operation_effect_state, details.effect_state]
+    .some(value => value !== undefined && value !== null && normalizeOperationEffectState(value, "unknown_effect") === "known_no_effect");
+  const effectFields = matched
+    ? [matched.effectState, matched.effect_state, matched.operationEffectState, matched.operation_effect_state]
+      .filter(value => value !== undefined && value !== null)
+      .map(value => normalizeOperationEffectState(value, "unknown_effect"))
+    : [];
+  const contradictory = Boolean(unresolved || (claimed && (
+    details.mutationDispatchAttempted === true || details.externalActionExecuted === true || details.external_action_executed === true
+    || matched?.mutationDispatchAttempted === true || matched?.externalActionExecuted === true || matched?.state === "applied"
+    || effectFields.some(state => ["unknown_effect", "known_effect"].includes(state))
+    || [details.operationEffectState, details.effectState, details.operation_effect_state, details.effect_state]
+      .filter(value => value !== undefined && value !== null)
+      .some(value => normalizeOperationEffectState(value, "unknown_effect") !== "known_no_effect")
+  )));
+  const zeroDispatch = matched && ["prepared", "blocked"].includes(matched.state)
+    && matched.dispatchCount === 0 && matched.dispatchState === "not_dispatched"
+    && matched.mutationDispatchAttempted !== true && matched.externalActionExecuted === false
+    && effectFields.length > 0 && effectFields.every(state => state === "no_dispatch")
+    && !matched.dispatchedAt;
+  const attestedNoMutation = matched && ["blocked", "reconciled"].includes(matched.state)
+    && matched.brokerEvidence === true && matched.mutationDispatchAttempted === false
+    && effectFields.length > 0 && effectFields.every(state => state === "known_no_effect");
+  return {
+    knownNoEffect: Boolean(claimed && !contradictory && (preDispatch || zeroDispatch || attestedNoMutation)),
+    contradictory,
+    unprovenNoEffect: Boolean(claimed && !contradictory && !(preDispatch || zeroDispatch || attestedNoMutation)),
+  };
+}
+
+function isLocalNavigationReconciliationCapsule(capsule) {
+  return Boolean(capsule
+    && ["reconciliation_required", "failed"].includes(capsule.state)
+    && (capsule.state !== "failed" || capsule.retention?.reason === "local_ui_effect_unknown")
+    && capsule.effect?.effectClass === "local_ui"
+    && operationEffectStateForEntry(capsule.effect) === "unknown_effect"
+    && capsule.effect?.externalActionExecuted !== true);
 }
 
 function reconciliationScopeKey(entry = {}) {
@@ -918,6 +1010,11 @@ export class CompanionBroker extends EventEmitter {
       generation: profile.generation,
       extensionRuntimeId: profile.extensionRuntimeId,
       buildId: profile.buildId ?? null,
+      buildCompatibility: this.#profileBuildMismatches(profile).length === 0 ? "current" : "refresh_required",
+      buildProvenanceMismatches: this.#profileBuildMismatches(profile),
+      bundleTreeSha256: profile.bundleTreeSha256 ?? null,
+      extensionTreeSha256: profile.extensionTreeSha256 ?? null,
+      nativeRecorderSha256: profile.nativeRecorderSha256 ?? null,
       // Missing handshake fields are intentionally exposed as null.  Filling
       // them with the broker's values would make an older installed
       // Extension look current and would hide the exact refresh boundary.
@@ -926,6 +1023,9 @@ export class CompanionBroker extends EventEmitter {
       operationSchemaVersion: profile.operationSchemaVersion ?? null,
       capabilitiesDigest: profile.capabilitiesDigest ?? null,
       expectedBuildId: INSTALL_BUILD_ID,
+      expectedBundleTreeSha256: BUNDLE_TREE_SHA256,
+      expectedExtensionTreeSha256: EXTENSION_TREE_SHA256,
+      expectedNativeRecorderSha256: NATIVE_RECORDER_SHA256,
       connected: profile.connected,
       connectedAt: profile.connectedAt,
       capabilities: profile.capabilities,
@@ -936,6 +1036,9 @@ export class CompanionBroker extends EventEmitter {
     const queuedByProfile = new Map(targetLaneMetrics.map((lane) => [lane.profileInstanceId, lane.queued]));
     const runtimeUpdatePendingByProfile = new Set(runtimeProfiles
       .filter((profile) => profile.buildId !== profile.expectedBuildId
+        || (BUNDLE_TREE_SHA256 && profile.bundleTreeSha256 !== BUNDLE_TREE_SHA256)
+        || (EXTENSION_TREE_SHA256 && profile.extensionTreeSha256 !== EXTENSION_TREE_SHA256)
+        || (NATIVE_RECORDER_SHA256 && profile.nativeRecorderSha256 !== NATIVE_RECORDER_SHA256)
         || profile.operationSchema !== OPERATION_SCHEMA
         || profile.operationSchemaDigest !== OPERATION_SCHEMA_DIGEST
         || profile.operationSchemaVersion !== OPERATION_SCHEMA_VERSION
@@ -987,6 +1090,11 @@ export class CompanionBroker extends EventEmitter {
       operationSchemaDigest: OPERATION_SCHEMA_DIGEST,
       operationSchemaVersion: OPERATION_SCHEMA_VERSION,
       capabilities: DEFAULT_CAPABILITIES,
+      componentHashes: {
+        companion_bundle: BUNDLE_TREE_SHA256,
+        companion_extension: EXTENSION_TREE_SHA256,
+        native_recorder: NATIVE_RECORDER_SHA256,
+      },
     });
     return {
       productVersion: PRODUCT_VERSION,
@@ -1210,6 +1318,7 @@ export class CompanionBroker extends EventEmitter {
         profileInstanceId,
         extensionRuntimeId: typeof message.extensionRuntimeId === "string" ? message.extensionRuntimeId : null,
         receivedBuildId: typeof message.buildId === "string" ? message.buildId : null,
+        receivedBundleTreeSha256: typeof message.bundleTreeSha256 === "string" ? message.bundleTreeSha256 : null,
         expectedBuildId: INSTALL_BUILD_ID,
         exactBlocker: normalizeError(error),
         failedAt: nowIso(),
@@ -1251,29 +1360,51 @@ export class CompanionBroker extends EventEmitter {
         receivedBuildId: message.buildId,
       });
     }
+    const expectedArtifacts = {
+      bundleTreeSha256: BUNDLE_TREE_SHA256,
+      extensionTreeSha256: EXTENSION_TREE_SHA256,
+      nativeRecorderSha256: NATIVE_RECORDER_SHA256,
+    };
+    // A same-protocol stale build may connect solely so the signed safe-boundary
+    // Extension reload can run. Session-bound page actions are blocked until
+    // all artifact hashes match; rejecting hello here would deadlock recovery.
+    const provenanceMismatches = buildProvenanceMismatches(message, expectedArtifacts);
+    const receivedCapabilities = Array.isArray(message.capabilities) ? message.capabilities : [];
+    const contractMismatch = message.operationSchema !== undefined && message.operationSchema !== OPERATION_SCHEMA
+      || message.operationSchemaVersion !== undefined && message.operationSchemaVersion !== OPERATION_SCHEMA_VERSION
+      || message.operationSchemaDigest !== undefined && message.operationSchemaDigest !== OPERATION_SCHEMA_DIGEST
+      || message.capabilitiesDigest !== undefined && (message.capabilitiesDigest !== capabilityDigest(receivedCapabilities)
+        || message.capabilitiesDigest !== capabilityDigest(DEFAULT_CAPABILITIES));
+    let historicalRefreshOnly = false;
+    if (contractMismatch) {
+      try {
+        const history = await readRefreshContractHistory(join(dirname(this.socketPath), "refresh-contract-history.json"));
+        historicalRefreshOnly = history.records.some(record => historicalRefreshContractMatches(record, message));
+      } catch { /* Missing or invalid installer-owned history is not authority. */ }
+    }
     // New Extension builds attest the generated operation contract during the
     // hello handshake.  Keep the fields optional for older local fixtures so
     // a reconnect can still be diagnosed, but reject an explicitly supplied
     // stale/mismatched contract before any session is opened.
-    if (message.operationSchema !== undefined && message.operationSchema !== OPERATION_SCHEMA) {
+    if (!historicalRefreshOnly && message.operationSchema !== undefined && message.operationSchema !== OPERATION_SCHEMA) {
       throw new CompanionError("companion_operation_schema_mismatch", "Companion Extension operation schema does not match the broker", {
         expectedOperationSchema: OPERATION_SCHEMA,
         receivedOperationSchema: message.operationSchema,
       });
     }
-    if (message.operationSchemaVersion !== undefined && message.operationSchemaVersion !== OPERATION_SCHEMA_VERSION) {
+    if (!historicalRefreshOnly && message.operationSchemaVersion !== undefined && message.operationSchemaVersion !== OPERATION_SCHEMA_VERSION) {
       throw new CompanionError("companion_operation_schema_version_mismatch", "Companion Extension operation schema version does not match the broker", {
         expectedOperationSchemaVersion: OPERATION_SCHEMA_VERSION,
         receivedOperationSchemaVersion: message.operationSchemaVersion,
       });
     }
-    if (message.operationSchemaDigest !== undefined && message.operationSchemaDigest !== OPERATION_SCHEMA_DIGEST) {
+    if (!historicalRefreshOnly && message.operationSchemaDigest !== undefined && message.operationSchemaDigest !== OPERATION_SCHEMA_DIGEST) {
       throw new CompanionError("companion_operation_schema_digest_mismatch", "Companion Extension operation schema digest does not match the broker", {
         expectedOperationSchemaDigest: OPERATION_SCHEMA_DIGEST,
         receivedOperationSchemaDigest: message.operationSchemaDigest,
       });
     }
-    if (message.capabilitiesDigest !== undefined) {
+    if (!historicalRefreshOnly && message.capabilitiesDigest !== undefined) {
       const receivedCapabilities = Array.isArray(message.capabilities)
         ? message.capabilities.filter((value) => typeof value === "string")
         : [];
@@ -1303,6 +1434,10 @@ export class CompanionBroker extends EventEmitter {
         operationSchemaDigest: message.operationSchemaDigest ?? null,
         operationSchemaVersion: message.operationSchemaVersion ?? null,
         capabilitiesDigest: message.capabilitiesDigest ?? null,
+        bundleTreeSha256: message.bundleTreeSha256 ?? null,
+        extensionTreeSha256: message.extensionTreeSha256 ?? null,
+        nativeRecorderSha256: message.nativeRecorderSha256 ?? null,
+        buildProvenanceMismatches: provenanceMismatches,
         buildId: message.buildId,
         peerId: peer.id,
       };
@@ -1370,6 +1505,10 @@ export class CompanionBroker extends EventEmitter {
       operationSchemaDigest: message.operationSchemaDigest ?? null,
       operationSchemaVersion: message.operationSchemaVersion ?? null,
       capabilitiesDigest: message.capabilitiesDigest ?? null,
+      bundleTreeSha256: message.bundleTreeSha256 ?? null,
+      extensionTreeSha256: message.extensionTreeSha256 ?? null,
+      nativeRecorderSha256: message.nativeRecorderSha256 ?? null,
+      buildProvenanceMismatches: provenanceMismatches,
       buildId: message.buildId,
       peerId: peer.id,
     };
@@ -1568,14 +1707,39 @@ export class CompanionBroker extends EventEmitter {
   }
 
   async #handleExtensionEvent(peer, message) {
+    if (message.event === "debugger.cleanup") {
+      const entry = this.taskLedger.getOperationById(message.operationId);
+      const binding = entry?.binding;
+      const profile = binding ? this.profiles.get(binding.profileInstanceId) : null;
+      const identityFields = ["taskId", "sessionId", "profileInstanceId", "generation", "tabId"];
+      if (!entry || binding?.method !== "tabs.stopLoading" || peer.authenticated !== true || peer.role !== "extension-relay"
+        || !profile?.connected || profile.peerId !== peer.id || !peer.profileInstanceIds.has(binding.profileInstanceId)
+        || profile.generation !== binding.generation || !identityFields.every(field => message[field] === binding[field])
+        || !["detached", "reconciliation_required", "not_required"].includes(message.status)) {
+        throw new CompanionError("debugger_cleanup_binding_mismatch", "Cleanup event does not match the current authenticated peer and original stop binding");
+      }
+      await this.taskLedger.annotateDebuggerCleanup({ operationId: message.operationId, binding,
+        status: message.status, reason: message.reason });
+      return;
+    }
     if (message.event === "task.tab.created" && Number.isSafeInteger(message.tabId)) {
       const operation = this.pendingOperations.get(message.operationId)
         ?? this.timedOutOperations.get(message.operationId);
       const profileInstanceId = message.profileInstanceId
         ?? (peer.profileInstanceIds.size === 1 ? [...peer.profileInstanceIds][0] : null);
+      const operationProfile = operation ? this.profiles.get(operation.profileInstanceId) : null;
       if (operation?.taskTabContext
         && profileInstanceId === operation.profileInstanceId
+        && operationProfile?.peerId === peer.id && peer.profileInstanceIds.has(profileInstanceId)
+        && operationProfile.generation === operation.generation
         && operation.method === "tabs.create") {
+        operation.createdTabId = message.tabId;
+        operation.mutationDispatchProvenance = "extension_observed";
+        if (operation.idempotencyKey) await this.taskLedger.transition(operation.idempotencyKey,
+          operation.timedOut ? "unknown_effect" : "dispatched", {
+            createdTabId: message.tabId, mutationDispatchAttempted: true,
+            mutationDispatchProvenance: "extension_observed",
+          });
         await this.#recordTaskTab(operation, message.tabId);
       }
     }
@@ -1630,12 +1794,14 @@ export class CompanionBroker extends EventEmitter {
     clearTimeout(operation.timer);
     operation.timedOut = true;
     operation.effectState = "unknown_effect";
+    operation.mutationDispatchAttempted = true;
+    operation.mutationDispatchProvenance = "action_event";
     operation.awaitedEvent = event;
     operation.tombstoneExpiresAt = Date.now() + LATE_RESULT_TOMBSTONE_TTL_MS;
     this.timedOutOperations.set(operation.operationId, operation);
     if (operation.idempotencyKey) await this.taskLedger.transition(operation.idempotencyKey, "unknown_effect", {
       operationId: operation.operationId, reason: "action_event_pending", awaitedEvent: event,
-      effectState: "unknown_effect", mutationDispatchAttempted: true, dispatchState: "dispatched", dispatchCount: 1,
+      effectState: "unknown_effect", mutationDispatchAttempted: true, mutationDispatchProvenance: "action_event", dispatchState: "dispatched", dispatchCount: 1,
       effectClass: operation.effectClass, reconciliationRequired: operation.reconciliationRequired,
     });
     operation.reject(new CompanionError("action_event_pending", "The pre-armed dialog opened. Respond to this exact opening in the same tab, session and run; never repeat its trigger", {
@@ -1652,7 +1818,7 @@ export class CompanionBroker extends EventEmitter {
     }
     const timedOut = this.timedOutOperations.has(message.operationId);
     const profile = this.profiles.get(operation.profileInstanceId);
-    const peerOwnsOperation = profile?.peerId === peer?.id
+    const peerOwnsOperation = peer?.authenticated === true && peer.role === "extension-relay" && profile?.peerId === peer?.id
       && peer?.profileInstanceIds.has(operation.profileInstanceId)
       && profile.generation === operation.generation;
     if (!peerOwnsOperation) {
@@ -1667,33 +1833,69 @@ export class CompanionBroker extends EventEmitter {
         generation: operation.generation,
       });
     }
+    const ledgerEntry = operation.idempotencyKey ? this.taskLedger.get(operation.idempotencyKey) : null;
+    const exactBinding = (!ledgerEntry || (ledgerEntry.operationId === operation.operationId
+      && canonicalPayload(ledgerEntry.binding) === canonicalPayload(operation.binding)))
+      && (message.generation === undefined || message.generation === operation.generation)
+      && (message.profileInstanceId === undefined || message.profileInstanceId === operation.profileInstanceId)
+      && (message.binding === undefined || canonicalPayload(message.binding) === canonicalPayload(operation.binding));
+    if (!exactBinding) {
+      if (timedOut) return;
+      throw new CompanionError("extension_operation_binding_mismatch", "Extension completion does not match this exact operation binding");
+    }
+    // This maintenance branch requires the exact worker close ACK. A
+    // successful transport without it is an unknown close, never retryable.
+    if (!isError && operation.binding?.ownedCleanupDisposal === true
+      && (message.result?.closed !== true || message.result?.closedExpected !== true
+        || message.result?.tabId !== operation.binding.tabId)) {
+      isError = true;
+      message = { ...message, error: { code: "owned_cleanup_close_ack_unknown",
+        message: "The exact maintenance close lacks a complete authenticated ACK",
+        details: { operationEffectState: "unknown", mutationDispatchAttempted: true } } };
+    }
     const completionStartedAt = performance.now();
     if (operation.timing) {
       operation.timing.record.timings_ms.transport_and_extension = completionStartedAt - operation.timing.sentAt;
       const measured = extensionTiming(message.executionTiming);
       if (measured) operation.timing.record.extension_timings_ms = measured;
     }
+    const inferenceOnly = operation.mutationDispatchProvenance === "transport_inference"
+      && (!ledgerEntry || ledgerEntry.mutationDispatchProvenance === "transport_inference")
+      && !operation.awaitedEvent && !ledgerEntry?.awaitedEvent && ledgerEntry?.reason !== "action_event_pending"
+      && operation.externalActionExecuted !== true && ledgerEntry?.externalActionExecuted !== true
+      && !Number.isSafeInteger(operation.createdTabId)
+      && !Number.isSafeInteger(ledgerEntry?.createdTabId)
+      && !["applied", "reconciled"].includes(ledgerEntry?.state)
+      && !["known_effect"].includes(operationEffectStateForEntry(ledgerEntry ?? operation));
+    const explicitNoEffect = isError && observedNoEffectDetails(message.error)
+      && (inferenceOnly || !MUTATION_METHODS.has(operation.method))
+      && message.error?.details?.mutationDispatchAttempted === false
+      && message.error?.details?.externalActionExecuted !== true
+      && message.error?.details?.external_action_executed !== true
+      && !["operation_effect_unknown", "action_event_pending"].includes(message.error?.code)
+      && !Number.isSafeInteger(message.error?.details?.createdTabId);
+    if (timedOut && MUTATION_METHODS.has(operation.method) && isError && observedNoEffectDetails(message.error) && !explicitNoEffect) return;
     if (timedOut) this.timedOutOperations.delete(message.operationId);
     else this.pendingOperations.delete(message.operationId);
     if (operation.timer) clearTimeout(operation.timer);
-    const explicitNoEffect = isError
-      && message.error?.details?.operationEffectState === "none"
-        && message.error?.details?.mutationDispatchAttempted === false;
     // The command was sent, but the current Extension can prove that the
     // page mutation never started. Preserve this distinction in the receipt.
-    if (explicitNoEffect) operation.mutationDispatchAttempted = false;
+    if (explicitNoEffect || !MUTATION_METHODS.has(operation.method)) {
+      operation.mutationDispatchAttempted = false;
+      operation.mutationDispatchProvenance = "authenticated_no_effect";
+    } else if (operation.awaitedEvent || message.error?.details?.mutationDispatchAttempted === true) {
+      operation.mutationDispatchAttempted = true;
+      operation.mutationDispatchProvenance = operation.awaitedEvent ? "action_event" : "extension_observed";
+    }
     const mutation = MUTATION_METHODS.has(operation.method);
     const readOnlyOperation = !mutation;
     const reconciliationRequired = mutation && operationRequiresReconciliation(operation);
     operation.reconciliationRequired = reconciliationRequired;
     operation.effectClass = reconciliationRequired ? "external_commit" : "local_ui";
-    const localMutationError = isError && mutation && !reconciliationRequired;
-    const explicitlyUnknown = mutation && (message.error?.code === "operation_effect_unknown"
-      || ["unknown", "unknown_effect"].includes(message.error?.details?.operationEffectState));
-    const observedEffectState = explicitNoEffect
+    const observedEffectState = explicitNoEffect || (isError && readOnlyOperation)
       ? "known_no_effect"
       : isError
-        ? (timedOut ? timedOutEffectState(operation) : (explicitlyUnknown ? "unknown_effect" : localMutationError ? "known_no_effect" : "unknown_effect"))
+        ? (timedOut ? timedOutEffectState(operation) : "unknown_effect")
         : (timedOut && readOnlyOperation ? "known_no_effect" : "known_effect");
     if (operation.idempotencyKey) {
       if (isError) {
@@ -1703,7 +1905,9 @@ export class CompanionBroker extends EventEmitter {
             errorCode: message.error?.code ?? "extension_operation_failed",
             operationEffectState: "none",
             effectState: "known_no_effect",
-          }, { brokerEvidence: true });
+            mutationDispatchAttempted: false,
+            externalActionExecuted: false,
+          }, { brokerEvidence: true, noEffectOperationId: operation.operationId });
         } else {
           const nextState = observedEffectState === "unknown_effect" ? "unknown_effect" : "blocked";
           await this.taskLedger.transition(operation.idempotencyKey, nextState, {
@@ -1712,8 +1916,10 @@ export class CompanionBroker extends EventEmitter {
             effectState: observedEffectState,
             dispatchState: "dispatched",
             mutationDispatchAttempted: operation.mutationDispatchAttempted === true,
+            mutationDispatchProvenance: operation.mutationDispatchProvenance,
             effectClass: operation.effectClass,
             reconciliationRequired,
+            ...(readOnlyOperation ? { externalActionExecuted: false, brokerEvidence: true } : {}),
             ...(explicitNoEffect ? { brokerEvidence: true, operationEffectState: "none" } : {}),
           });
         }
@@ -1729,8 +1935,11 @@ export class CompanionBroker extends EventEmitter {
           await this.taskLedger.transition(operation.idempotencyKey, "applied", {
             operationId: operation.operationId,
             resultDigest: payloadDigest(this.ledgerSecret, message.result),
+            ...(operation.method === "tabs.create" && operation.taskTabContext && Number.isSafeInteger(message.result?.id)
+              ? { createdTabId: message.result.id } : {}),
             brokerEvidence: true,
             effectState: observedEffectState,
+            mutationDispatchProvenance: "observed_mutation",
             dispatchState: "dispatched",
             effectClass: operation.effectClass,
             reconciliationRequired,
@@ -1754,13 +1963,22 @@ export class CompanionBroker extends EventEmitter {
         this.taskTabs.set(this.#tabKey(operation.profileInstanceId, message.result.tabId), this.taskLedger.getTaskTab(operation.profileInstanceId, message.result.tabId));
       }
     }
-    if (!isError && operation.method === "tabs.close" && Number.isSafeInteger(operation.binding?.tabId)) {
+    if (!isError && operation.method === "tabs.close" && operation.binding?.ownedCleanupDisposal !== true && Number.isSafeInteger(operation.binding?.tabId)) {
       this.taskTabs.delete(this.#tabKey(operation.profileInstanceId, operation.binding.tabId));
       await this.taskLedger.removeTaskTab(operation.profileInstanceId, operation.binding.tabId);
     }
     if (operation.timing) operation.timing.record.timings_ms.completion_persist_and_ownership = performance.now() - completionStartedAt;
+    // Internal maintenance provenance is filled only after this exact
+    // command's authenticated peer/generation completion checks above.
+    if (operation.readEvidence && readOnlyOperation && !operation.timedOut) Object.assign(operation.readEvidence, {
+      operationId: operation.operationId, method: operation.method,
+      profileInstanceId: operation.profileInstanceId, generation: operation.generation,
+      sessionId: operation.sessionId, startedAt: operation.startedAt, completedAt: nowIso(),
+      brokerEvidence: true, resultDigest: payloadDigest(this.ledgerSecret, isError ? message.error : message.result),
+      ...(isError ? { errorCode: message.error?.code, errorMessage: message.error?.message } : { returned: true }),
+    });
     if (isError) {
-      operation.reject(new CompanionError(
+      const failure = new CompanionError(
         message.error?.code ?? "extension_operation_failed",
         message.error?.message ?? "Extension operation failed",
         {
@@ -1771,7 +1989,9 @@ export class CompanionBroker extends EventEmitter {
           effectClass: operation.effectClass,
           reconciliationRequired,
         },
-      ));
+      );
+      if (readOnlyOperation) failure[READ_ONLY_COMMAND_FAILURE] = true;
+      operation.reject(failure);
     } else if (!operation.timedOut) {
       operation.resolve(message.result);
     }
@@ -1946,6 +2166,8 @@ export class CompanionBroker extends EventEmitter {
       }
       case "task.prepare_resume":
         return this.#prepareResume(peer, params);
+      case "task.recover_target":
+        return this.#recoverTarget(peer, params);
       case "task.reconciliation.inspect":
         return this.#inspectTaskReconciliation(peer, params);
       case "task.reconciliation.rebind":
@@ -1954,6 +2176,10 @@ export class CompanionBroker extends EventEmitter {
         return this.#repairPreDispatchReadonly(peer, params);
       case "task.reconciliation.complete":
         return this.#completeTaskReconciliation(peer, params);
+      case "task.reconciliation.resolve_local_editor":
+        return this.#resolveLocalEditor(peer, params);
+      case "task.reconciliation.resolve_local_selection":
+        return this.#resolveLocalSelection(peer, params);
       case "operation.reconcile":
         return this.#reconcileOperation(peer, params);
       default:
@@ -1963,7 +2189,7 @@ export class CompanionBroker extends EventEmitter {
 
   async #reloadExtension(peer, paramsValue) {
     const params = requireObject(paramsValue, "params");
-    const session = this.#requireOwnedSession(peer, params.sessionId);
+    const session = this.#requireOwnedSession(peer, params.sessionId, { allowBuildMismatch: true });
     const taskId = requireString(params.taskId ?? session.taskId ?? session.sessionId, "taskId");
     if (session.taskId && session.taskId !== taskId) {
       throw new CompanionError("task_id_mismatch", "Extension reload taskId does not match the logical session task");
@@ -2067,7 +2293,7 @@ export class CompanionBroker extends EventEmitter {
         targetOrigin: "*",
         authority: params.authority,
         params: payload,
-      });
+      }, { allowBuildMismatch: true });
       if (this.extensionReloadInFlight.get(profileKey) === reservation) {
         reservation.phase = "awaiting_reconnect";
         reservation.restartPoint = "wait_for_new_extension_hello_then_read_status_again";
@@ -2210,6 +2436,19 @@ export class CompanionBroker extends EventEmitter {
     return connected[0];
   }
 
+  #profileBuildMismatches(profile) {
+    const mismatches = buildProvenanceMismatches(profile, {
+      bundleTreeSha256: BUNDLE_TREE_SHA256,
+      extensionTreeSha256: EXTENSION_TREE_SHA256,
+      nativeRecorderSha256: NATIVE_RECORDER_SHA256,
+    });
+    for (const [field, expected] of [["operationSchema", OPERATION_SCHEMA], ["operationSchemaVersion", OPERATION_SCHEMA_VERSION],
+      ["operationSchemaDigest", OPERATION_SCHEMA_DIGEST], ["capabilitiesDigest", capabilityDigest(DEFAULT_CAPABILITIES)]]) {
+      if (profile?.[field] !== null && profile?.[field] !== undefined && profile[field] !== expected) mismatches.push(field);
+    }
+    return mismatches;
+  }
+
   #openSession(peer, params) {
     const profile = this.#selectProfile(params.profileInstanceId);
     const taskId = typeof params.taskId === "string" ? params.taskId.slice(0, 240) : null;
@@ -2272,12 +2511,32 @@ export class CompanionBroker extends EventEmitter {
 
   async #closeSession(peer, paramsValue) {
     const params = typeof paramsValue === "string" ? { sessionId: paramsValue } : paramsValue;
-    const session = this.#requireOwnedSession(peer, params.sessionId);
+    const session = this.#requireOwnedSession(peer, params.sessionId, { allowBuildMismatch: params.taskTerminal === false });
     const leaseCountBeforeClose = session.leaseIds.size;
     let terminalTabCleanup = { ok: true, status: "skipped", reason: "task_terminal_false" };
     if (params.taskTerminal !== false) {
       terminalTabCleanup = await this.#finalizeSessionTerminalTabs(peer, session, {
         allowPreEffectCleanup: params.taskTerminal !== false,
+        explicitTaskTerminal: params.taskTerminal === true,
+      }).then(async (result) => {
+        // Startup may already have removed both task-tab records. Only the
+        // pinned original capsule/operation can anchor this terminal fallback.
+        const expected = VIEWPORT_CLEANUP_AMENDMENT;
+        if (session.taskId !== expected.taskId || result.viewport_cleanup_receipt
+          || this.taskTabs.has(this.#tabKey(expected.profileInstanceId, expected.tabId))
+          || this.taskLedger.getTaskTab(expected.profileInstanceId, expected.tabId)) return result;
+        try {
+          result.viewport_cleanup_receipt = await this.#maintainAbsentOriginalViewport(peer, session, null);
+          result.viewport_cleanup_disposition = "task_tab_already_absent";
+          if (!result.missing.includes(expected.tabId)) result.missing.push(expected.tabId);
+        } catch (error) {
+          result.ok = false;
+          result.status = "partial";
+          result.exact_blocker = error?.code ?? "viewport_cleanup_target_missing";
+          result.retained.push({ tabId: expected.tabId, retention_reason: "local_ui_effect_unknown",
+            exact_blocker: result.exact_blocker });
+        }
+        return result;
       }).catch((error) => ({
         ok: false,
         status: "cleanup_failed",
@@ -2305,6 +2564,8 @@ export class CompanionBroker extends EventEmitter {
       leases_released: leaseCountBeforeClose,
       lease_release_confirmed: true,
       owner_scope: "session_task_only",
+      block_scope: "session_task",
+      independent_work_allowed: true,
       foreign_tabs_mutated: false,
       external_action_executed: false,
       recorded_at: nowIso(),
@@ -2318,7 +2579,105 @@ export class CompanionBroker extends EventEmitter {
     };
   }
 
-  async #finalizeSessionTerminalTabs(peer, session, { allowPreEffectCleanup = false } = {}) {
+  async #maintainAbsentOriginalViewport(peer, session, taskTab) {
+    const expected = VIEWPORT_CLEANUP_AMENDMENT;
+    const profile = this.profiles.get(session.profileInstanceId);
+    const assertCurrent = () => {
+      if (this.#requireOwnedSession(peer, session.sessionId) !== session
+        || !["taskId", "profileInstanceId", "generation"].every(key => session[key] === expected[key])
+        || this.profiles.get(session.profileInstanceId) !== profile || profile?.generation !== expected.generation
+        || (taskTab ? (taskTab.capsuleId !== expected.capsuleId || taskTab.taskId !== expected.taskId
+          || taskTab.runId !== expected.runId || taskTab.tabId !== expected.tabId
+          || taskTab.quarantine || taskTab.userHelpRequired || !taskTabIdentityConsistent(this.ledgerSecret, taskTab))
+          : (this.taskTabs.has(this.#tabKey(expected.profileInstanceId, expected.tabId))
+            || this.taskLedger.getTaskTab(expected.profileInstanceId, expected.tabId)))) {
+        throw new CompanionError("viewport_cleanup_target_mismatch", "Absence maintenance requires the original owner/profile/generation binding");
+      }
+    };
+    const read = (method, params, evidence) => this.#enqueue(`session:${session.sessionId}`, () => this.#sendOperation({
+      profile, session, method, params, timeoutMs: DEFAULT_OPERATION_TIMEOUTS_MS[method] ?? DEFAULT_OPERATION_TIMEOUT_MS,
+      authority: null, idempotencyKey: null, binding: { taskId: session.taskId, profileInstanceId: session.profileInstanceId,
+        generation: session.generation, sessionId: session.sessionId, tabId: params.tabId ?? null, method },
+      fingerprint: null, allowedOrigins: null, targetOrigin: null, taskTabContext: null,
+      dispatchGuard: assertCurrent, readEvidence: evidence,
+    }));
+    assertCurrent();
+    // The ledger validates the immutable signature and original operation
+    // anchors before returning an already-recorded cleanup receipt.
+    if (this.taskLedger.get(expected.operationKey)?.viewportCleanupReceipts?.length) {
+      return this.taskLedger.appendViewportCleanup({ capsuleId: expected.capsuleId, proof: null,
+        currentBinding: { sessionId: session.sessionId } }, { brokerEvidence: true });
+    }
+    viewportCleanupCandidate(this.taskLedger.getTaskCapsule(expected.capsuleId),
+      this.taskLedger.listOperations(), this.taskLedger.listTaskCapsules());
+    const inventoryEvidence = {}, lookupEvidence = {};
+    const inventory = await read("tabs.list", {}, inventoryEvidence);
+    // Source-qualified extension tabs.list uses chrome.tabs.query({}), then
+    // slice(0, MAX_TAB_LIST_ENTRIES=200). At the cap completeness is unknown.
+    const cap = 200;
+    if (!Array.isArray(inventory) || inventory.length >= cap
+      || inventory.some(tab => !Number.isSafeInteger(tab?.id) || tab.id < 0
+        || !Number.isSafeInteger(tab.windowId) || tab.windowId < 0)
+      || new Set(inventory.map(tab => tab.id)).size !== inventory.length
+      || inventory.some(tab => tab.id === expected.tabId)) {
+      throw new CompanionError("viewport_cleanup_inventory_incomplete", "Fresh unfiltered sanitized inventory must be below the actual extension cap and exclude the exact original tab");
+    }
+    let missing = false;
+    try { await read("tabs.get", { tabId: expected.tabId }, lookupEvidence); }
+    catch (error) {
+      missing = error.code === "extension_operation_failed" && lookupEvidence.brokerEvidence === true
+        && lookupEvidence.errorCode === "extension_operation_failed"
+        && new RegExp(`^No tab with id: ${expected.tabId}\\.?$`, "u").test(lookupEvidence.errorMessage ?? "");
+      if (!missing) throw error;
+    }
+    if (!missing) throw new CompanionError("viewport_cleanup_target_present", "Exact-target lookup did not authenticate the original tab's absence");
+    assertCurrent();
+    const payload = { schema: "aos.chrome_companion.viewport_absence_proof.v1", taskId: session.taskId,
+      profileInstanceId: session.profileInstanceId, generation: session.generation, sessionId: session.sessionId,
+      tabId: expected.tabId, inventoryParams: {}, inventoryCap: cap, inventoryIds: inventory.map(tab => tab.id),
+      inventoryEvidence, lookupParams: { tabId: expected.tabId }, lookupEvidence, capturedAt: nowIso() };
+    const proof = { ...payload, signature: payloadDigest(this.ledgerSecret, payload) };
+    const receipt = await this.taskLedger.appendViewportCleanup({ capsuleId: expected.capsuleId,
+      proof, currentBinding: { sessionId: session.sessionId } }, { brokerEvidence: true });
+    this.taskTabs.delete(this.#tabKey(expected.profileInstanceId, expected.tabId));
+    return receipt;
+  }
+
+  async #maintainOriginalViewportCleanup(peer, session, taskTab, lease) {
+    const expected = VIEWPORT_CLEANUP_AMENDMENT;
+    if (taskTab.capsuleId !== expected.capsuleId) return null;
+    const capsule = this.taskLedger.getTaskCapsule(expected.capsuleId);
+    const original = this.taskLedger.get(expected.operationKey);
+    if (original?.viewportCleanupReceipts?.length) return original.viewportCleanupReceipts[0];
+    viewportCleanupCandidate(capsule, this.taskLedger.listOperations(), this.taskLedger.listTaskCapsules());
+    const assertCurrent = () => {
+      if (this.#requireOwnedSession(peer, session.sessionId) !== session
+        || !["taskId", "profileInstanceId", "generation"].every(key => session[key] === expected[key])
+        || !lease || this.leases.get(lease.leaseId) !== lease || lease.sessionId !== session.sessionId
+        || lease.tabId !== expected.tabId || lease.generation !== expected.generation
+        || taskTab.taskId !== expected.taskId || taskTab.runId !== expected.runId
+        || taskTab.tabId !== expected.tabId || taskTab.generation !== expected.generation
+        || taskTab.quarantine || taskTab.userHelpRequired || !taskTabIdentityConsistent(this.ledgerSecret, taskTab)
+        || !["pageInstanceId", "windowId", "frameId"].every(key => taskTab.targetIdentity?.[key] === expected[key])) {
+        throw new CompanionError("viewport_cleanup_target_mismatch", "Cleanup requires the current owner's exact lease and original document");
+      }
+    };
+    assertCurrent();
+    const read = await this.#inspectVisualPoint(peer, { sessionId: session.sessionId,
+      leaseId: lease.leaseId, tabId: expected.tabId, point: { x: 1, y: 1 } });
+    assertCurrent();
+    if (read.target?.frameId !== expected.frameId || read.visual?.windowId !== expected.windowId
+      || !Number.isFinite(Date.parse(read.visual?.capturedAt)) || read.visualProof?.capturedAt !== read.visual.capturedAt) {
+      throw new CompanionError("viewport_cleanup_target_mismatch", "Fresh inspection/capture must identify the original frame/window");
+    }
+    const receipt = await this.taskLedger.appendViewportCleanup({ capsuleId: expected.capsuleId,
+      proof: read.visualProof, currentBinding: { sessionId: session.sessionId, leaseId: lease.leaseId } }, { brokerEvidence: true });
+    const updated = this.taskLedger.getTaskTab(expected.profileInstanceId, expected.tabId);
+    if (updated) this.taskTabs.set(this.#tabKey(expected.profileInstanceId, expected.tabId), updated);
+    return receipt;
+  }
+
+  async #finalizeSessionTerminalTabs(peer, session, { allowPreEffectCleanup = false, explicitTaskTerminal = false } = {}) {
     const result = {
       schema: "aos.chrome_companion.owner_cleanup_receipt.v1",
       ok: true,
@@ -2352,8 +2711,20 @@ export class CompanionBroker extends EventEmitter {
     ].filter(Boolean));
     const inventory = await this.#executeOperation(peer, { sessionId: session.sessionId, method: "tabs.list", params: {} });
     const liveById = new Map(inventory.map((tab) => [tab.id, tab]));
-    for (const entry of entries) {
+    for (let entry of entries) {
       const live = liveById.get(entry.tabId);
+      if (!live && entry.capsuleId === VIEWPORT_CLEANUP_AMENDMENT.capsuleId
+        && entry.retentionReason === "local_ui_effect_unknown") {
+        try {
+          const receipt = await this.#maintainAbsentOriginalViewport(peer, session, entry);
+          result.viewport_cleanup_receipt = receipt;
+          result.missing.push(entry.tabId);
+        } catch (error) {
+          result.retained.push({ tabId: entry.tabId, retention_reason: "local_ui_effect_unknown",
+            exact_blocker: error?.code ?? "viewport_cleanup_target_missing" });
+        }
+        continue;
+      }
       if (!live) {
         this.taskTabs.delete(this.#tabKey(entry.profileInstanceId, entry.tabId));
         await this.taskLedger.removeTaskTab(entry.profileInstanceId, entry.tabId);
@@ -2418,7 +2789,37 @@ export class CompanionBroker extends EventEmitter {
         });
         continue;
       }
+      if (entry.capsuleId === VIEWPORT_CLEANUP_AMENDMENT.capsuleId && entry.retentionReason === "local_ui_effect_unknown") {
+        let maintenanceLease = lease;
+        let acquired = false;
+        try {
+          if (!maintenanceLease) {
+            const acquiredLease = await this.#acquireLease(peer, { sessionId: session.sessionId, tabId: entry.tabId });
+            maintenanceLease = this.leases.get(acquiredLease.leaseId);
+            acquired = true;
+          }
+          const receipt = await this.#maintainOriginalViewportCleanup(peer, session, entry, maintenanceLease);
+          if (receipt) {
+            entry = this.taskTabs.get(this.#tabKey(entry.profileInstanceId, entry.tabId)) ?? entry;
+            result.viewport_cleanup_receipt = receipt;
+          }
+        } catch (error) {
+          result.retained.push({ tabId: entry.tabId, retention_reason: "local_ui_effect_unknown",
+            exact_blocker: error?.code ?? "viewport_cleanup_readback_unavailable" });
+          continue;
+        } finally {
+          if (acquired) this.#deleteLease(maintenanceLease.leaseId);
+        }
+      }
       const ledgerOnly = isLedgerOnlyTaskTab(entry);
+      if (entry.retentionReason === "attachment_confirmed_workflow_unsubmitted") {
+        if (!explicitTaskTerminal) {
+          result.retained.push({ tabId: entry.tabId, retention_reason: entry.retentionReason,
+            resume_action: "continue_unsubmitted_workflow_or_explicitly_abandon" });
+          continue;
+        }
+        entry = { ...entry, retentionPolicy: "cleanup", retentionReason: "explicit_owner_terminal_unsubmitted_workflow" };
+      }
       if (entry.retentionPolicy === "retain_until_resume" && ["partial_actions_applied", "local_ui_effect_unknown"].includes(entry.retentionReason)) {
         result.retained.push({ tabId: entry.tabId, user_help_required: false,
           retention_reason: entry.retentionReason, why_tab_was_kept: entry.whyTabWasKept,
@@ -2615,7 +3016,7 @@ export class CompanionBroker extends EventEmitter {
     if (!lease) {
       return { released: false, leaseId };
     }
-    this.#requireOwnedSession(peer, lease.sessionId);
+    this.#requireOwnedSession(peer, lease.sessionId, { allowBuildMismatch: true });
     this.#deleteLease(leaseId);
     return { released: true, leaseId };
   }
@@ -2701,10 +3102,12 @@ export class CompanionBroker extends EventEmitter {
     return { claimed: true, explicitApproval: true, lease: this.#publicLease(lease), tab: live, approvalTargetIdentity: targetIdentity, approvalTargetFingerprint: targetFingerprint, targetIdentity: claimed.targetIdentity, targetFingerprint: claimedTargetFingerprint };
   }
 
-  async #executeOperation(peer, params, { trustedTask = null } = {}) {
+  async #executeOperation(peer, params, { trustedTask = null, allowBuildMismatch = false } = {}) {
     const operationStartedAt = performance.now();
-    const session = this.#requireOwnedSession(peer, params.sessionId);
     const method = requireString(params.method, "operation method");
+    const session = this.#requireOwnedSession(peer, params.sessionId, {
+      allowBuildMismatch: allowBuildMismatch && method === "extension.reload",
+    });
     if (!EXTENSION_METHODS.has(method)) {
       throw new CompanionError("capability_not_supported", `Unsupported extension operation: ${method}`);
     }
@@ -2713,6 +3116,64 @@ export class CompanionBroker extends EventEmitter {
       throw new CompanionError("session_generation_stale", "Session belongs to an inactive profile generation");
     }
     const operationParams = requireObject(params.params ?? {}, "operation params");
+    const localNavigationRecovery = ["tabs.navigationDiagnostics", "tabs.stopLoading"].includes(method);
+    const readSourceCleanup = () => {
+      if (operationParams.sourceOperationId === undefined) return undefined;
+      const source = typeof operationParams.sourceOperationId === "string"
+        && operationParams.sourceOperationId.length > 0 && operationParams.sourceOperationId.length <= 256
+        ? this.taskLedger.getOperationById(operationParams.sourceOperationId) : null;
+      const sourceBinding = source?.binding;
+      const target = sourceBinding?.targetIdentity;
+      const deny = () => { throw new CompanionError("navigation_cleanup_source_not_found", "No readable cleanup source matches this exact task target"); };
+      if (method !== "tabs.navigationDiagnostics" || !source?.cleanupReceipt || sourceBinding?.method !== "tabs.stopLoading"
+        || sourceBinding.taskId !== session.taskId || sourceBinding.profileInstanceId !== session.profileInstanceId
+        || sourceBinding.tabId !== operationParams.tabId
+        || target?.profileInstanceId !== sourceBinding.profileInstanceId || target?.tabId !== sourceBinding.tabId
+        || target.origin !== new URL(operationParams.expectedUrl).origin
+        || Number.isSafeInteger(target.windowId) && target.windowId !== operationParams.expectedWindowId) deny();
+      // The original session/generation remain untouched. A fresh exact live
+      // tuple authorizes this metadata read, not a claim about the old path.
+      const names = ["operationId", "taskId", "sessionId", "profileInstanceId", "generation", "tabId", "status", "startedAt", "reason", "observedAt"];
+      return Object.fromEntries(names.filter(name => source.cleanupReceipt[name] !== undefined)
+        .map(name => [name, source.cleanupReceipt[name]]));
+    };
+    if (localNavigationRecovery) {
+      if (trustedTask || params.intent !== "local_navigation_recovery" || !params.authority) {
+        throw new CompanionError("local_navigation_recovery_required", "Navigation recovery requires a fresh separately signed exact-target request");
+      }
+      if (method === "tabs.stopLoading" && operationParams.optIn !== true) {
+        throw new CompanionError("navigation_stop_opt_in_required", "Stopping loading requires explicit optIn:true");
+      }
+      if (!Number.isSafeInteger(operationParams.expectedWindowId) || operationParams.expectedWindowId < 0
+        || !Object.hasOwn(operationParams, "expectedPendingUrl")) {
+        throw new CompanionError("navigation_recovery_binding_required", "Recovery requires the expected exact window and pending URL");
+      }
+      const allowedOrigins = operationParams.allowedOrigins;
+      if (!Array.isArray(allowedOrigins) || allowedOrigins.length === 0 || allowedOrigins.length > 32
+        || allowedOrigins.some(value => {
+          try { const origin = new URL(value); return !["http:", "https:"].includes(origin.protocol)
+            || origin.username !== "" || origin.password !== "" || origin.origin !== value; }
+          catch { return true; }
+        })) {
+        throw new CompanionError("navigation_recovery_origin_not_allowed", "Recovery requires a canonical HTTP origin allowlist");
+      }
+      for (const value of [operationParams.expectedUrl, operationParams.expectedPendingUrl].filter(value => value !== null)) {
+        let url;
+        try { url = new URL(value); } catch { /* reject below */ }
+        if (!url || !["http:", "https:"].includes(url.protocol) || url.username !== "" || url.password !== "" || url.href !== value
+          || !Array.isArray(allowedOrigins) || !allowedOrigins.includes(url.origin)) {
+          throw new CompanionError("navigation_recovery_origin_not_allowed", "Committed and pending canonical URLs must remain inside the signed origin allowlist");
+        }
+      }
+      if (typeof operationParams.expectedUrl !== "string") {
+        throw new CompanionError("navigation_recovery_binding_required", "Recovery requires the committed URL");
+      }
+      if (params.authority.targetOrigin !== new URL(operationParams.expectedUrl).origin
+        || params.targetOrigin !== params.authority.targetOrigin
+        || operationParams.targetOrigin !== undefined && operationParams.targetOrigin !== params.authority.targetOrigin) {
+        throw new CompanionError("navigation_recovery_origin_not_allowed", "The signed target origin must match the committed URL");
+      }
+    }
     validateExpectedActionEvent(method, operationParams.expectEvent);
     const isMutation = MUTATION_METHODS.has(method);
     const authority = trustedTask?.authority ?? params.authority;
@@ -2734,7 +3195,7 @@ export class CompanionBroker extends EventEmitter {
     if (method === "tabs.create" && this.strictAuthority && !trustedTask) {
       throw new CompanionError("task_transaction_required", "Create tabs through task.transaction so provenance is recorded");
     }
-    if (isMutation && authority && !trustedTask && this.strictAuthority) {
+    if ((isMutation && this.strictAuthority || localNavigationRecovery) && authority && !trustedTask) {
       await this.taskLedger.verifyAndConsumeAuthority(authority, {
         secrets: this.issuerSecrets,
         payload: operationParams,
@@ -2749,6 +3210,21 @@ export class CompanionBroker extends EventEmitter {
     let tabId = operationParams.tabId;
     let targetLeaseId = null;
     let ownedTaskTab = null;
+    const assertNavigationReady = () => {
+      if (!isMutation || !operationRequiresReconciliation({ method })) return;
+      const unresolvedNavigation = unresolvedLocalNavigationForTarget(this.taskLedger.listOperations(), {
+        profileInstanceId: session.profileInstanceId, tabId,
+      });
+      if (unresolvedNavigation.length > 0) {
+        throw new CompanionError("local_navigation_readback_required", "The original reload/navigation on this exact target requires broker-verified reconciliation before an external mutation", {
+          ...blockerRecoveryContext({ code: "local_navigation_readback_required", taskId: session.taskId,
+            runId: authority?.runId, profileInstanceId: session.profileInstanceId, tabId,
+            nextAction: "reconcile_original_navigation_with_fresh_exact_target_evidence" }),
+          operationIds: unresolvedNavigation.map(entry => entry.operationId ?? entry.idempotencyKey).slice(0, 50),
+          mutationDispatchAttempted: false, operationEffectState: "no_dispatch",
+        });
+      }
+    };
     let validateTarget = () => {};
     if (TARGET_METHODS.has(method)) {
       tabId = requireTabId(tabId);
@@ -2765,11 +3241,13 @@ export class CompanionBroker extends EventEmitter {
           throw new CompanionError("exact_tab_lease_required", "Operation requires this session's exact-tab lease");
         }
         targetLeaseId = lease.leaseId;
+        assertNavigationReady();
         const taskTab = this.taskTabs.get(this.#tabKey(session.profileInstanceId, tabId))
           || this.taskLedger.getTaskTab(session.profileInstanceId, tabId);
         ownedTaskTab = taskTab;
-        if (method === "page.observe" && (!taskTab || taskTab.taskId !== session.taskId)) {
-          throw new CompanionError("task_tab_ownership_required", "Continuous observation is limited to this task's own tab");
+        if ((method === "page.observe" || localNavigationRecovery) && (!taskTab || taskTab.taskId !== session.taskId
+          || localNavigationRecovery && taskTab.runId !== authority.runId)) {
+          throw new CompanionError("task_tab_ownership_required", "Observation and local recovery require the exact task-owned target and signed run");
         }
         if (taskTab && !taskTabIdentityConsistent(this.ledgerSecret, taskTab)) {
           throw new CompanionError(
@@ -2813,6 +3291,7 @@ export class CompanionBroker extends EventEmitter {
       };
       validateTarget();
     }
+    if (operationParams.sourceOperationId !== undefined) readSourceCleanup();
     session.lastSeenAt = Date.now();
     const timeoutMs = normalizeTimeout(
       params.timeoutMs,
@@ -2825,9 +3304,27 @@ export class CompanionBroker extends EventEmitter {
       : TARGET_METHODS.has(method)
         ? `tab:${session.profileInstanceId}:${tabId}`
         : `session:${session.sessionId}`;
-    const idempotencyKey = isMutation
+    const idempotencyKey = isMutation || localNavigationRecovery
       ? (trustedTask ? `${trustedTask.idempotencyKey}:${trustedTask.index}` : authority?.idempotencyKey ?? null)
       : null;
+    const pendingEditor = ["page.type", "visual.typeText"].includes(method) && this.taskLedger.listOperations().find(entry =>
+      entry.state === "unknown_effect" && entry.binding?.method === "page.type" && entry.binding?.taskId === session.taskId
+      && entry.binding?.profileInstanceId === session.profileInstanceId && entry.binding?.tabId === tabId);
+    if (pendingEditor && (method !== "visual.typeText" || operationParams.clickBeforeType !== false
+      || operationParams.editorGuard?.originalOperationKey !== pendingEditor.idempotencyKey
+      || !operationParams.editorGuard?.resolutionId)) {
+      throw new CompanionError("local_editor_resolution_required", "Uncertain whole-field editor input permits only a signed different-key surgical insertion");
+    }
+    if (method === "visual.typeText" && operationParams.clickBeforeType === false
+      && operationParams.editorGuard?.resolutionId) {
+      const guard = operationParams.editorGuard;
+      if (operationParams.clear !== false) throw new CompanionError("local_editor_repair_binding_invalid", "Surgical editor repair requires clear:false");
+      await this.taskLedger.consumeLocalEditorResolution({ originalOperationKey: guard.originalOperationKey,
+        resolutionId: guard.resolutionId, repairOperationKey: idempotencyKey, guard, text: operationParams.text,
+        currentBinding: { taskId: session.taskId, sessionId: session.sessionId, leaseId: targetLeaseId,
+          generation: session.generation, profileInstanceId: session.profileInstanceId, tabId,
+          pageInstanceId: operationParams.pageInstanceId, windowId: operationParams.windowId, frameId: operationParams.frameId ?? 0 } });
+    }
     const targetIdentity = normalizeTargetIdentity({
       taskId: authority?.taskId ?? session.taskId ?? session.sessionId,
       sessionId: session.sessionId,
@@ -2857,16 +3354,21 @@ export class CompanionBroker extends EventEmitter {
       targetFingerprint: targetIdentityDigest(this.ledgerSecret, targetIdentity),
     };
     const fingerprint = payloadDigest(this.ledgerSecret, { binding, payload: operationParams });
+    const navigationTargetDigest = method === "tabs.navigate"
+      ? localNavigationTargetDigest(this.ledgerSecret, operationParams.url)
+      : null;
     const prepareStartedAt = performance.now();
     if (idempotencyKey) {
-      const existing = await this.taskLedger.prepare({ idempotencyKey, fingerprint, binding });
+      const existing = await this.taskLedger.prepare({ idempotencyKey, fingerprint, binding, navigationTargetDigest });
       if (existing.state !== "prepared") {
         throw new CompanionError("idempotency_duplicate", "This idempotency key has already been dispatched; replay is forbidden", { state: existing.state, operationId: existing.operationId });
       }
     }
     const preparedAt = performance.now();
     const dispatchGuard = () => {
-      const currentSession = this.#requireOwnedSession(peer, session.sessionId);
+      const currentSession = this.#requireOwnedSession(peer, session.sessionId, {
+        allowBuildMismatch: method === "extension.reload",
+      });
       if (currentSession !== session || !this.peers.has(peer.id)) throw new CompanionError("session_not_owned", "Original operation session is no longer active");
       if (authority?.expiresAt && Date.parse(authority.expiresAt) <= Date.now()) throw new CompanionError("authority_expired", "Authority expired while the operation was queued");
       validateTarget();
@@ -2919,7 +3421,8 @@ export class CompanionBroker extends EventEmitter {
           } : null,
         }));
         record.outcome = "returned";
-        return result;
+        const sourceCleanup = operationParams.sourceOperationId === undefined ? undefined : readSourceCleanup();
+        return sourceCleanup ? { ...result, cleanupReceipt: sourceCleanup } : result;
       } catch (error) {
         await this.#recordNotDispatched(idempotencyKey, error);
         record.outcome = "error";
@@ -3315,26 +3818,53 @@ export class CompanionBroker extends EventEmitter {
       throw new CompanionError("exact_tab_lease_required", "Visual target inspection requires this session's exact-tab lease");
     }
     const locator = requireObject(params.locator, "locator");
-    const inspection = await this.#executeOperation(peer, {
+    let inspection = await this.#executeOperation(peer, {
       sessionId: session.sessionId,
       leaseId,
       method: "visual.inspectTarget",
       params: { tabId, locator },
     });
-    const visual = await this.#executeOperation(peer, {
-      sessionId: session.sessionId,
-      leaseId,
-      method: "page.screenshot",
-      params: { tabId, restoreActive: true },
-      timeoutMs: 30_000,
-    });
-    const visualPageUrl = String(inspection?.topLevelUrl || inspection?.url || "");
-    if (visual?.kind !== "screenshot"
-      || !visual.dataBase64
-      || visual.tabId !== tabId
-      || String(visual.url || "") !== visualPageUrl) {
-      throw new CompanionError("visual_target_readback_mismatch", "Visual target geometry and screenshot did not identify the same exact tab and page");
+    const approvedPageUrl = String(inspection?.topLevelUrl || inspection?.url || "");
+    const approvedPageInstanceId = inspection?.pageInstanceId ?? null;
+    const approvedFrameId = inspection?.frameId ?? 0;
+    const approvedFramePath = JSON.stringify(inspection?.framePath ?? []);
+    let visual, settled = false;
+    // Capture temporarily activates a hidden tab and can change its viewport
+    // or clamp an inner scroll container. Never sign pre-capture coordinates
+    // against the later image. Allow one bounded read-only recapture after
+    // such a same-document layout change; navigation is never a retry.
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      visual = await this.#executeOperation(peer, {
+        sessionId: session.sessionId, leaseId, method: "page.screenshot",
+        params: { tabId, restoreActive: true }, timeoutMs: 30_000,
+      });
+      const current = await this.#executeOperation(peer, {
+        sessionId: session.sessionId, leaseId, method: "visual.inspectTarget",
+        params: { tabId, locator, scroll: false },
+      });
+      if (visual?.kind !== "screenshot" || !visual.dataBase64 || visual.tabId !== tabId
+        || String(visual.url || "") !== approvedPageUrl
+        || String(current?.topLevelUrl || current?.url || "") !== approvedPageUrl
+        || (current?.pageInstanceId ?? null) !== approvedPageInstanceId
+        || (current?.frameId ?? 0) !== approvedFrameId
+        || JSON.stringify(current?.framePath ?? []) !== approvedFramePath) {
+        throw new CompanionError("visual_target_readback_mismatch", "The target document or frame changed during screenshot capture");
+      }
+      const samePoint = ["x", "y"].every(key => Number(current?.point?.[key]) === Number(inspection?.point?.[key]));
+      const sameRect = ["x", "y", "width", "height"].every(key => Number(current?.clippedRect?.[key]) === Number(inspection?.clippedRect?.[key]));
+      const sameViewport = ["width", "height", "devicePixelRatio"].every(key => Number(current?.viewport?.[key]) === Number(inspection?.viewport?.[key]))
+        && Number(current?.viewport?.scale ?? 1) === Number(inspection?.viewport?.scale ?? 1);
+      const sameScroll = ["x", "y"].every(key => Number(current?.scroll?.[key] ?? 0) === Number(inspection?.scroll?.[key] ?? 0));
+      const sameSpace = String(current?.coordinateSpace ?? "viewport") === String(inspection?.coordinateSpace ?? "viewport");
+      inspection = current;
+      if (samePoint && sameRect && sameViewport && sameScroll && sameSpace) { settled = true; break; }
     }
+    if (!settled) {
+      throw new CompanionError("visual_target_readback_mismatch", "The target geometry did not settle across the bounded screenshot readback", {
+        mutationDispatchAttempted: false, operationEffectState: "none",
+      });
+    }
+    const visualPageUrl = approvedPageUrl;
     const capturedAtCandidate = String(visual.capturedAt || "");
     const capturedAt = Number.isFinite(Date.parse(capturedAtCandidate)) ? capturedAtCandidate : nowIso();
     const expiresAt = new Date(Date.parse(capturedAt) + 60_000).toISOString();
@@ -3605,6 +4135,157 @@ export class CompanionBroker extends EventEmitter {
     return { ...base, state: "readback_verified", capsule_state: updated.state, action_progress: progress, readback };
   }
 
+  async #executeProfileGlobalTransaction(peer, {
+    session,
+    taskId,
+    runId,
+    rawAllowedOrigins,
+    allowedOrigins,
+    actions,
+    steps,
+    authority,
+    initialUrl,
+    params,
+  }) {
+    // Profile-global task actions such as native recording must not create a
+    // disposable target tab just to satisfy the generic page transaction
+    // path.  In particular, stop must remain callable after that tab has
+    // disappeared.  The signed authority and per-step operation ledger still
+    // provide the same ownership, idempotency, queue, and no-replay boundary.
+    const capsuleInput = params.capsule ?? params.taskExecutionCapsule ?? null;
+    const capsule = normalizeTaskExecutionCapsule(capsuleInput ?? {}, {
+      taskId,
+      runId,
+      startUrl: initialUrl,
+      targetOrigin: authority?.targetOrigin ?? params.targetOrigin,
+      allowedOrigins: rawAllowedOrigins,
+      profileInstanceId: session.profileInstanceId,
+      generation: session.generation,
+      sessionId: session.sessionId,
+      idempotencyKey: authority?.idempotencyKey,
+      workflowType: "profile_global",
+      retentionPolicy: "cleanup",
+      resourceClass: "profile_global",
+    });
+    const taskWithCapsule = {
+      authority,
+      runId,
+      taskId,
+      idempotencyKey: authority?.idempotencyKey ?? "authority-unavailable",
+      index: 0,
+      capsule,
+      allowDirectApplication: false,
+    };
+    const snapshot = {
+      schema: "aos_chrome_companion.transaction.v1",
+      result: "running",
+      execution_surface: "aos_chrome_companion_profile_instance",
+      run_id: runId,
+      task_id: taskId,
+      profile: { profileInstanceId: session.profileInstanceId, generation: session.generation },
+      tab: null,
+      actions: [],
+      step_packets: steps.map(step => ({
+        schema: step.schema,
+        index: step.index,
+        method: step.method,
+        authorized: step.authorized,
+        mutation: step.mutation,
+        target_scoped: false,
+        profile_global: step.profileGlobal,
+        effect_class: step.effectClass,
+        reconciliation_required: step.reconciliationRequired,
+      })),
+      external_action_executed: false,
+      effect_state: "no_dispatch",
+      dispatch_count: 0,
+      cleanup: { closed: true, retained: false, tabless: true },
+      exact_blocker: null,
+    };
+    const capsuleId = capsule.capsuleId;
+    try {
+      await this.taskLedger.putTaskCapsule(capsule);
+      await this.taskLedger.transitionTaskCapsule(capsuleId, "admitted", { effect: { ...capsule.effect, idempotencyKey: authority?.idempotencyKey ?? null } });
+      await this.taskLedger.verifyAndConsumeAuthority(authority, {
+        secrets: this.issuerSecrets,
+        payload: authorizedTransactionPayload({
+          ...(params.tabId === undefined ? {} : { tabId: params.tabId }),
+          startUrl: initialUrl,
+          allowedOrigins: rawAllowedOrigins,
+          actions,
+          // Verify the exact caller projection.  Profile-global operations do
+          // not create or retain a tab, but those lifecycle flags are still
+          // part of the signed transaction payload and must not be rewritten
+          // on the broker side.
+          reuseTaskTab: params.reuseTaskTab !== false,
+          keepTaskTab: params.keepTaskTab === undefined ? null : params.keepTaskTab === true,
+          readbackMaxTextChars: params.readbackMaxTextChars,
+          retainOnUnknown: params.retainOnUnknown === true,
+          precondition: params.precondition ?? null,
+          capsule: capsuleInput ?? null,
+        }),
+        expected: { runId, taskId, ownerKey: session.sessionId, method: "task.transaction", intent: params.intent ?? "authorized_transaction" },
+      });
+      await this.taskLedger.transitionTaskCapsule(capsuleId, "target_bound", {
+        target: { ...capsule.target, profileInstanceId: session.profileInstanceId, generation: session.generation },
+        resources: { ...capsule.resources, exactTabLeaseId: null, tabId: null, resourceClass: "profile_global" },
+      });
+      await this.taskLedger.transitionTaskCapsule(capsuleId, "pre_read", { target: { ...capsule.target, tabId: null, leaseId: null }, visual: { required: false, proof: null } });
+      await this.taskLedger.transitionTaskCapsule(capsuleId, "executing");
+      for (const step of steps) {
+        const index = step.index;
+        taskWithCapsule.index = index;
+        const actionStartedAt = performance.now();
+        const result = await this.#executeOperation(peer, {
+          sessionId: session.sessionId,
+          method: step.method,
+          params: { ...step.params },
+          allowedOrigins,
+          targetOrigin: authority?.targetOrigin ?? params.targetOrigin ?? null,
+        }, { trustedTask: taskWithCapsule });
+        snapshot.actions.push({
+          timings_ms: { total_before_receipt: performance.now() - actionStartedAt },
+          index,
+          method: step.method,
+          step_packet: bindTransactionStep(step, {
+            secret: this.ledgerSecret,
+            taskId,
+            sessionId: session.sessionId,
+            generation: session.generation,
+            profileInstanceId: session.profileInstanceId,
+            origin: authority?.targetOrigin ?? params.targetOrigin ?? null,
+          }),
+          result: { ok: true, ...result },
+          before: null,
+          after: null,
+        });
+      }
+      snapshot.result = "verified";
+      snapshot.effect_state = snapshot.actions.some(action => action.step_packet.reconciliation_required) ? "known_effect" : "known_no_effect";
+      snapshot.external_action_executed = snapshot.actions.some(action => action.step_packet.mutation);
+      snapshot.dispatch_count = snapshot.actions.length;
+      await this.taskLedger.transitionTaskCapsule(capsuleId, "post_read", {
+        effect: { ...capsule.effect, effectState: snapshot.effect_state, effectClass: "external_commit", reconciliationRequired: false, externalActionExecuted: snapshot.external_action_executed, dispatchCount: snapshot.dispatch_count },
+      });
+      const finalCapsule = await this.taskLedger.transitionTaskCapsule(capsuleId, "completed", {
+        target: { ...capsule.target, tabId: null, leaseId: null },
+        resources: { ...capsule.resources, exactTabLeaseId: null, tabId: null, resourceClass: "profile_global" },
+        effect: { ...capsule.effect, effectState: snapshot.effect_state, effectClass: "external_commit", reconciliationRequired: false, externalActionExecuted: snapshot.external_action_executed, dispatchCount: snapshot.dispatch_count },
+      });
+      snapshot.capsule = this.#publicTaskCapsule(finalCapsule);
+      return snapshot;
+    } catch (error) {
+      snapshot.result = error?.code === "operation_effect_unknown" ? "unknown_effect" : "blocked";
+      snapshot.effect_state = snapshot.result === "unknown_effect" ? "unknown_effect" : "no_dispatch";
+      snapshot.external_action_executed = snapshot.result === "unknown_effect" ? null : false;
+      snapshot.exact_blocker = { code: error?.code ?? "transaction_failed", message: String(error?.message ?? error).slice(0, 400) };
+      try {
+        await this.taskLedger.transitionTaskCapsule(capsuleId, snapshot.result === "unknown_effect" ? "reconciliation_required" : "failed", { blocker: snapshot.exact_blocker, effect: { ...capsule.effect, effectState: snapshot.effect_state, reconciliationRequired: snapshot.result === "unknown_effect", externalActionExecuted: snapshot.external_action_executed } });
+      } catch { /* preserve the original operation error */ }
+      throw error;
+    }
+  }
+
   async #executeTaskTransaction(peer, params) {
     const transactionStartedAt = performance.now();
     const phaseTimings = {};
@@ -3645,6 +4326,20 @@ export class CompanionBroker extends EventEmitter {
       throw new CompanionError("transaction_dialog_exact_action_required", "Handle an observed dialog in a single-action transaction with the exact owned tabId");
     }
     if (dialogOnly && params.precondition) throw new CompanionError("transaction_dialog_precondition_unavailable", "A modal prevents a DOM precondition read; bind the observed dialog message and opening identity instead");
+    if (steps.every(step => !step.targetScoped)) {
+      return this.#executeProfileGlobalTransaction(peer, {
+        session,
+        taskId,
+        runId,
+        rawAllowedOrigins,
+        allowedOrigins,
+        actions,
+        steps,
+        authority,
+        initialUrl,
+        params,
+      });
+    }
     const capsuleInput = params.capsule ?? params.taskExecutionCapsule ?? null;
     // Terminal work closes its task tab by default. Callers must opt into
     // retention for a concrete resume, reconciliation, or user-action need.
@@ -3793,6 +4488,93 @@ export class CompanionBroker extends EventEmitter {
             && entry.retentionPolicy !== "cleanup"
             && !isLedgerOnlyTaskTab(entry))
           .sort((left, right) => String(right.updatedAt ?? right.createdAt ?? "").localeCompare(String(left.updatedAt ?? left.createdAt ?? "")));
+        // An explicit exact-tab continuation may begin with a freshly leased
+        // user tab that has not yet crossed a task transaction boundary.  The
+        // lease is the ownership proof in this narrow path; do not broaden it
+        // to URL/origin reuse.  Bind only the exact current-generation tab
+        // owned by this session, with a live non-active/non-pinned target in
+        // the signed origin allowlist.  The normal pre-read below replaces
+        // the provisional identity with the live pageInstanceId before any
+        // mutating action can dispatch.
+        if (exactTabId !== undefined && !candidateEntries.some((entry) => entry.tabId === exactTabId)) {
+          const exactLease = [...this.leases.values()].find((entry) => entry.tabId === exactTabId
+            && entry.sessionId === session.sessionId
+            && entry.profileInstanceId === session.profileInstanceId
+            && entry.generation === session.generation);
+          const exactLive = inventoryById.get(exactTabId);
+          let exactOrigin = null;
+          try { exactOrigin = new URL(exactLive?.url ?? "").origin; } catch { exactOrigin = null; }
+          // A popup opened by an already-retained task tab is a narrow,
+          // explicit continuation target. It may be active because Chrome
+          // focuses auth popups by design; allow it only when the exact tab is
+          // leased by this session, is not pinned, and Chrome reports an
+          // opener that is itself one of this task's current retained tabs.
+          // Ordinary active tabs and unassociated auth tabs remain blocked.
+          const ownedOpenerContinuation = Number.isSafeInteger(exactLive?.openerTabId)
+            && exactLive.openerTabId !== exactTabId
+            && candidateEntries.some((entry) => entry.tabId === exactLive.openerTabId
+              && entry.generation === session.generation
+              && entry.retentionPolicy !== "cleanup"
+              && !isLedgerOnlyTaskTab(entry));
+          // Chrome may omit openerTabId for an already-open OAuth popup that
+          // was reused by a provider.  Keep that case narrow as well: the
+          // exact leased tab must be Google's account chooser and its signed
+          // URL must explicitly identify Printify as both origin and app
+          // domain.  This does not authorize arbitrary active auth tabs.
+          const printifyOAuthContinuation = exactOrigin === "https://accounts.google.com"
+            && /^https:\/\/accounts\.google\.com\/v3\/signin\/accountchooser(?:[/?]|$)/u.test(String(exactLive?.url ?? ""))
+            && /(?:^|[?&])origin=https%3A%2F%2Fprintify\.com(?:&|$)/iu.test(String(exactLive?.url ?? ""))
+            && /(?:^|[?&])app_domain=https%3A%2F%2Fprintify\.com(?:&|$)/iu.test(String(exactLive?.url ?? ""));
+          // A tab this same session already used as this task's tab (for
+          // example one whose uncertain upload was just reconciled) is not a
+          // user tab, even when Chrome reports it active: the task may
+          // re-reserve it and continue there.
+          const previouslyOwnedTaskTab = [...this.taskTabs.values()].some((entry) => entry.tabId === exactTabId
+            && entry.profileInstanceId === session.profileInstanceId
+            && entry.generation === session.generation
+            && entry.taskId === taskId
+            && entry.sessionId === session.sessionId
+            && entry.userHelpRequired !== true
+            && !entry.quarantine
+            && !entry.resumeToken
+            && !isLedgerOnlyTaskTab(entry));
+          if (exactLease && exactLive && exactLive.pinned !== true
+            && exactOrigin && allowedOrigins.includes(exactOrigin)
+            && (exactLive.active !== true || ownedOpenerContinuation || printifyOAuthContinuation || previouslyOwnedTaskTab)) {
+            const provisionalIdentity = normalizeTargetIdentity({
+              taskId,
+              sessionId: session.sessionId,
+              leaseId: null,
+              generation: session.generation,
+              profileInstanceId: session.profileInstanceId,
+              tabId: exactTabId,
+              pageInstanceId: null,
+              windowId: exactLive.windowId,
+              frameId: capsule.target.frameId,
+              origin: exactOrigin,
+            });
+            candidateEntries.push({
+              profileInstanceId: session.profileInstanceId,
+              generation: session.generation,
+              tabId: exactTabId,
+              taskId,
+              runId,
+              sessionId: session.sessionId,
+              targetKey: capsule.target.targetKey,
+              canonicalLocator: capsule.target.canonicalLocator,
+              targetIdentity: provisionalIdentity,
+              targetFingerprint: targetIdentityDigest(this.ledgerSecret, provisionalIdentity),
+              workflowType: capsule.workflowType,
+              lifecycleState: "completed",
+              retentionPolicy: "retain",
+              resumeToken: null,
+              userHelpRequired: false,
+              quarantine: null,
+              createdAt: nowIso(),
+              updatedAt: nowIso(),
+            });
+          }
+        }
         // Missing current-generation records are bookkeeping, not targets.
         // Remove them only after the fresh inventory proves the tab is gone;
         // stale-generation and reconciliation records remain for signed
@@ -3937,6 +4719,26 @@ export class CompanionBroker extends EventEmitter {
         }
         return result;
       };
+      // Single-page apps (Printify's editor, LinkedIn's composer) render
+      // their controls well after the document commits. Before the signed
+      // pre-read, wait (read-only, bounded) for the first semantic target to
+      // be visible, longer for a tab this transaction just opened. A timeout
+      // is not an error here: the normal locator checks below report it.
+      const firstSemanticStep = dialogOnly ? null
+        : steps.find((step) => SEMANTIC_TARGET_MUTATION_METHODS.has(step.method) && step.params?.locator && typeof step.params.locator === "object");
+      if (firstSemanticStep) {
+        try {
+          await this.#executeOperation(peer, { sessionId: session.sessionId, leaseId: lease.leaseId, method: "page.waitFor",
+            params: { tabId: taskTab.id, locator: firstSemanticStep.params.locator, condition: "visible",
+              timeoutMs: createdForTransaction ? 15_000 : 5_000, allowedOrigins, targetOrigin: authority.targetOrigin } });
+          snapshot.target_ready_wait = "observed";
+        } catch (error) {
+          // Best effort only: anything but a lost connection falls through to
+          // the ordinary pre-read, which reports the real state.
+          if (["broker_connection_closed", "profile_not_connected", "session_generation_stale"].includes(error?.code)) throw error;
+          snapshot.target_ready_wait = error?.code === "page_wait_timeout" ? "timed_out" : "unavailable";
+        }
+      }
       const pre = await readTransactionBefore();
       if (!allowedOrigins.includes(new URL(pre.url).origin)) throw new CompanionError("target_origin_not_allowed", "Created task tab did not commit to an allowed origin");
       const transactionHasMutation = steps.some((step) => step.mutation);
@@ -4186,17 +4988,78 @@ export class CompanionBroker extends EventEmitter {
         const uploadConfirmationTimeoutMs = Number.isSafeInteger(actionParams.confirmationTimeoutMs)
           ? Math.min(Math.max(actionParams.confirmationTimeoutMs, 100), 15_000)
           : 5_000;
+        const assignedUploadFiles = method === "page.upload" ? [actionParams.file]
+          : method === "page.uploadMultiple" ? actionParams.files : [];
+        if (Array.isArray(assignedUploadFiles) && new Set(assignedUploadFiles.map(file => file?.name)).size !== assignedUploadFiles.length)
+          throw new CompanionError("upload_filename_ambiguous", "Each file in one upload must have a distinct filename for exact attachment readiness proof", { operationEffectState: "none", mutationDispatchAttempted: false });
+        for (const file of assignedUploadFiles ?? []) if (file?.sha256 !== undefined
+          && file.sha256 !== createHash("sha256").update(Buffer.from(file.dataBase64 ?? "", "base64")).digest("hex"))
+          throw new CompanionError("upload_file_digest_mismatch", "The assigned file SHA-256 must match its exact materialized bytes", { operationEffectState: "none", mutationDispatchAttempted: false });
+        // Sites that only render a thumbnail (X, Instagram, Threads, Facebook)
+        // never show the filename. For one file, a caller may bind a preview
+        // locator that must be absent before and appear after this upload.
+        const uploadPreviewOnly = actionParams.confirmationPreviewOnly === true;
+        if (uploadPreviewOnly && (method !== "page.upload" || !uploadConfirmationLocator || actionParams.confirmationFiles !== undefined))
+          throw new CompanionError("upload_confirmation_preview_invalid", "confirmationPreviewOnly requires one page.upload file and a confirmationLocator, without confirmationFiles", { operationEffectState: "none", mutationDispatchAttempted: false });
+        const uploadConfirmationFiles = uploadPreviewOnly
+          ? (assignedUploadFiles ?? []).map(file => {
+            const locator = uploadConfirmationLocator;
+            if ([locator.nth, locator.ordinal, locator.last].some(value => value !== undefined))
+              throw new CompanionError("upload_confirmation_locator_invalid", "Attachment-ready proof requires one unique row; omit nth, ordinal and last", { operationEffectState: "none", mutationDispatchAttempted: false });
+            return { filename_sha256: createHash("sha256").update(String(file.name).replace(/\s+/gu, " ").trim()).digest("hex"),
+              file_sha256: createHash("sha256").update(Buffer.from(file.dataBase64 ?? "", "base64")).digest("hex"),
+              preview_only: true, filename_locator: null, locator };
+          })
+          : (method === "page.upload" || method === "page.uploadMultiple")
+          ? (assignedUploadFiles ?? []).map(file => {
+            const explicit = Array.isArray(actionParams.confirmationFiles) ? actionParams.confirmationFiles.filter(item => item?.filename === file?.name) : undefined;
+            if (actionParams.confirmationFiles !== undefined && (!Array.isArray(actionParams.confirmationFiles)
+              || explicit?.length !== 1 || actionParams.confirmationFiles.length !== assignedUploadFiles.length))
+              throw new CompanionError("upload_confirmation_files_invalid", "Provide one attachment-ready locator for every assigned filename", { operationEffectState: "none", mutationDispatchAttempted: false });
+            const locator = explicit?.[0]?.locator ?? uploadConfirmationLocator;
+            if (locator && [locator.nth, locator.ordinal, locator.last].some(value => value !== undefined))
+              throw new CompanionError("upload_confirmation_locator_invalid", "Attachment-ready proof requires one unique row; omit nth, ordinal and last", { operationEffectState: "none", mutationDispatchAttempted: false });
+            if (locator?.allOf?.length >= 8) throw new CompanionError("upload_confirmation_locator_invalid", "Attachment-ready locators allow at most 7 allOf filters before the bound filename constraint", { operationEffectState: "none", mutationDispatchAttempted: false });
+            return locator ? { filename_sha256: createHash("sha256").update(String(file.name).replace(/\s+/gu, " ").trim()).digest("hex"),
+              file_sha256: createHash("sha256").update(Buffer.from(file.dataBase64 ?? "", "base64")).digest("hex"),
+              filename_locator: { text: file.name, exact: true, anyOf: [locator, { within: locator }] },
+              locator: { ...locator, allOf: [...(locator.allOf ?? []), { hasText: file.name }] } } : null;
+          }).filter(Boolean) : [];
         delete actionParams.confirmationLocator;
+        // Sites that rename uploads (Printify) or show neither filename nor a
+        // unique preview may instead bind a locator matching every uploaded
+        // item in a list: attachment is proven when its exact visible count
+        // grows by the number of assigned files.
+        const uploadCountLocator = (method === "page.upload" || method === "page.uploadMultiple")
+          && actionParams.confirmationCountLocator && typeof actionParams.confirmationCountLocator === "object"
+          && !Array.isArray(actionParams.confirmationCountLocator) ? actionParams.confirmationCountLocator : null;
         delete actionParams.confirmationTimeoutMs;
+        delete actionParams.confirmationFiles;
+        delete actionParams.confirmationPreviewOnly;
+        delete actionParams.confirmationCountLocator;
+        let uploadCountBefore = null;
+        let uploadCountConfirmed = false;
+        if (uploadCountLocator) {
+          if ([uploadCountLocator.nth, uploadCountLocator.ordinal, uploadCountLocator.last].some(value => value !== undefined))
+            throw new CompanionError("upload_confirmation_locator_invalid", "confirmationCountLocator must match every uploaded item; omit nth, ordinal and last", { operationEffectState: "none", mutationDispatchAttempted: false });
+          const countBefore = await this.#executeOperation(peer, {
+            sessionId: session.sessionId, leaseId: lease.leaseId, method: "page.query",
+            params: { tabId: taskTab.id, locator: uploadCountLocator, limit: 1, allowedOrigins },
+          });
+          if (!Number.isSafeInteger(countBefore?.totalCount) || countBefore.totalCountExact !== true || countBefore.scanLimitReached === true)
+            throw new CompanionError("upload_confirmation_pre_read_failed", "Could not count the upload list before the upload", { operationEffectState: "none", mutationDispatchAttempted: false });
+          uploadCountBefore = countBefore.totalCount;
+        }
         if (method === "page.upload" || method === "page.uploadMultiple") {
           // A caller cannot independently relax FileList readback. A reset
           // control is admissible only when this transaction will verify a
           // newly appearing, explicit site attachment state after delivery.
-          actionParams.allowInputReset = uploadConfirmationLocator !== null;
-          if (uploadConfirmationLocator) {
+          actionParams.allowInputReset = (uploadConfirmationFiles.length === assignedUploadFiles.length && uploadConfirmationFiles.length > 0)
+            || uploadCountBefore !== null;
+          for (const confirmationFile of uploadConfirmationFiles) {
             const confirmationBefore = await this.#executeOperation(peer, {
               sessionId: session.sessionId, leaseId: lease.leaseId, method: "page.query",
-              params: { tabId: taskTab.id, locator: uploadConfirmationLocator, limit: 2, allowedOrigins },
+              params: { tabId: taskTab.id, locator: confirmationFile.locator, limit: 2, allowedOrigins },
             });
             if (!Number.isSafeInteger(confirmationBefore?.count)) {
               throw new CompanionError("upload_confirmation_pre_read_failed", "Could not establish the pre-upload confirmation state", {
@@ -4209,6 +5072,12 @@ export class CompanionBroker extends EventEmitter {
                 nextAction: "inspect_existing_attachment_before_upload",
               });
             }
+            // Validate the exact scoped filename locator on the original page
+            // before the sole upload dispatch, even when no row exists yet.
+            if (!confirmationFile.preview_only) await this.#executeOperation(peer, {
+              sessionId: session.sessionId, leaseId: lease.leaseId, method: "page.query",
+              params: { tabId: taskTab.id, locator: confirmationFile.filename_locator, limit: 2, allowedOrigins },
+            });
           }
         }
         let dropdownVisualProofVerified = false;
@@ -4246,6 +5115,19 @@ export class CompanionBroker extends EventEmitter {
           await this.#revalidateVisualTargetProof(peer, { session, lease, tabId: taskTab.id, verified, currentUrl: before.url });
           delete actionParams.visualProof;
           actionParams.point = verified.point;
+          if (method === "visual.click" || method === "visual.doubleClick") {
+            // The Extension promotes the tab and renders its cursor after this
+            // broker check. Carry only verified geometry for a final check
+            // after those layout-changing steps, before any mouse input.
+            actionParams.visualTargetGuard = {
+              kind: verified.kind, locator: verified.locator,
+              point: verified.point, rect: verified.rect,
+              viewport: verified.viewport, scroll: verified.scroll,
+              pageUrl: before.url, pageInstanceId: verified.pageInstanceId,
+              frameId: verified.frameId, framePath: verified.framePath,
+              coordinateSpace: verified.coordinateSpace,
+            };
+          }
           if (method === "visual.drag") {
             const verifiedTo = this.#verifyVisualTargetProof({
               proof: actionParams.toVisualProof,
@@ -4305,6 +5187,43 @@ export class CompanionBroker extends EventEmitter {
           mutation: action.mutation && !(method === "visual.pointerMove" && actionParams.virtualOnly === true),
           reconciliationRequired: boundStep.reconciliationRequired,
         });
+        if (method === "page.upload" || method === "page.uploadMultiple") {
+          snapshot.upload_delivery = { action_index: index, applied: true,
+            file_input_assignment_verified: result?.fileInputAssignmentVerified === true,
+            control_readback_verified: result?.uploadReadbackVerified === true,
+            confirmation_observed: false, provider_submission_confirmed: false, retry_upload: false,
+            filename_sha256: (result?.expectedFiles ?? []).filter(file => typeof file.name === "string")
+              .map(file => createHash("sha256").update(file.name.replace(/\s+/gu, " ").trim()).digest("hex")),
+            // Kept so a confirmation method can still be registered later,
+            // during reconciliation, without the original bytes.
+            assigned_files: (assignedUploadFiles ?? []).filter(file => typeof file?.name === "string").map(file => ({
+              filename_sha256: createHash("sha256").update(String(file.name).replace(/\s+/gu, " ").trim()).digest("hex"),
+              file_sha256: createHash("sha256").update(Buffer.from(file.dataBase64 ?? "", "base64")).digest("hex"),
+            })),
+            ...(uploadCountLocator ? { count_witness: { locator: uploadCountLocator, before: uploadCountBefore,
+              required_increase: (assignedUploadFiles ?? []).length, observed: null } } : {}),
+            confirmation_files: uploadConfirmationFiles };
+          if (uploadCountLocator) {
+            const deadline = Date.now() + uploadConfirmationTimeoutMs;
+            while (true) {
+              const countAfter = await this.#executeOperation(peer, {
+                sessionId: session.sessionId, leaseId: lease.leaseId, method: "page.query",
+                params: { tabId: taskTab.id, locator: uploadCountLocator, limit: 1, allowedOrigins },
+              }).catch(() => null);
+              if (Number.isSafeInteger(countAfter?.totalCount) && countAfter.totalCountExact === true) {
+                snapshot.upload_delivery.count_witness.observed = countAfter.totalCount;
+                if (countAfter.totalCount >= uploadCountBefore + snapshot.upload_delivery.count_witness.required_increase) break;
+              }
+              if (Date.now() >= deadline) break;
+              await new Promise(resolve => setTimeout(resolve, 300));
+            }
+            const witness = snapshot.upload_delivery.count_witness;
+            if (Number.isSafeInteger(witness.observed) && witness.observed >= witness.before + witness.required_increase) {
+              uploadCountConfirmed = true;
+              snapshot.upload_delivery.confirmation_observed = true;
+            }
+          }
+        }
         if (method === "tabs.configure" && Number.isSafeInteger(result?.windowId)) {
           taskTab.windowId = result.windowId;
           boundTarget.windowId = result.windowId;
@@ -4333,30 +5252,37 @@ export class CompanionBroker extends EventEmitter {
           }
         }
         let uploadConfirmation = null;
-        if ((method === "page.upload" || method === "page.uploadMultiple") && result?.requiresSiteConfirmation === true && !uploadConfirmationLocator) {
+        if ((method === "page.upload" || method === "page.uploadMultiple") && result?.requiresSiteConfirmation === true && !uploadConfirmationFiles.length && !uploadCountConfirmed) {
           throw new CompanionError("upload_confirmation_required", "The input was consumed after file delivery; inspect the site's attachment state without re-uploading", {
             operationEffectState: "unknown", mutationDispatchAttempted: true,
             nextAction: "inspect_existing_attachment_state_without_reupload",
           });
         }
-        if (uploadConfirmationLocator) {
+        if (uploadConfirmationFiles.length) {
           // Uploading a FileList proves only the control state.  A workflow
           // may additionally bind one visible post-upload/confirmation
           // locator so the same transaction can prove the site's own state.
           try {
+            const confirmationDeadline = Date.now() + uploadConfirmationTimeoutMs;
+            for (const confirmationFile of uploadConfirmationFiles) {
+            const remainingMs = confirmationDeadline - Date.now();
+            if (remainingMs < 100) throw new CompanionError("page_wait_timeout", "The bounded all-files confirmation interval expired");
             uploadConfirmation = await this.#executeOperation(peer, {
             sessionId: session.sessionId,
             leaseId: lease.leaseId,
             method: "page.waitFor",
             params: {
               tabId: taskTab.id,
-              locator: uploadConfirmationLocator,
-              timeoutMs: uploadConfirmationTimeoutMs,
+              locator: confirmationFile.locator,
+              timeoutMs: remainingMs,
               allowedOrigins,
               targetOrigin: authority.targetOrigin,
             },
             });
             if (uploadConfirmation?.found !== true) throw new CompanionError("page_wait_timeout", "The site attachment confirmation was not observed");
+            }
+            await this.#readUploadConfirmationFiles(peer, { session, lease, tabId: taskTab.id,
+              delivery: snapshot.upload_delivery, pageInstanceId: before.pageInstanceId, pageUrl: before.url });
           } catch (error) {
             throw new CompanionError("upload_confirmation_not_observed", "Files were delivered but the site's attachment confirmation was not observed; reconcile without re-uploading", {
               operationEffectState: "unknown", mutationDispatchAttempted: true,
@@ -4370,6 +5296,7 @@ export class CompanionBroker extends EventEmitter {
           result.uploadReadbackMethod = "site_confirmation";
           result.siteConfirmationVerified = true;
           result.requiresSiteConfirmation = false;
+          snapshot.upload_delivery.confirmation_observed = true;
         }
         if (dialogOnly && result?.closedVerified !== true) throw new CompanionError("javascript_dialog_close_unknown", "The dialog response has no verified close event; reconcile without replay", { operationEffectState: "unknown", mutationDispatchAttempted: true });
         const nextDialog = dialogOnly ? await this.#executeOperation(peer, { sessionId: session.sessionId, leaseId: lease.leaseId, method: "page.inspectDialog", params: { tabId: taskTab.id } }) : null;
@@ -4558,29 +5485,44 @@ export class CompanionBroker extends EventEmitter {
         && error?.details?.reconciliation_required !== false;
       const pendingActionEvent = error?.code === "action_event_pending" && error?.details?.actionEvent?.kind === "dialog"
         ? error.details.actionEvent : null;
-      const effectMayHaveDispatched = (["operation_effect_unknown", "action_event_pending"].includes(error?.code) && errorRequiresReconciliation)
+      const failedStepMayMutate = mutationInFlight || (activeActionIndex !== null && steps[activeActionIndex]?.mutation === true);
+      const failedReadOnlyCommand = error?.[READ_ONLY_COMMAND_FAILURE] === true;
+      const noEffectEvidence = failedReadOnlyCommand
+        ? { knownNoEffect: false, contradictory: false, unprovenNoEffect: false }
+        : transactionFailureNoEffectEvidence(error, {
+        operation: currentOperation,
+        operationKey: actionOperationKey ?? (mutationInFlight ? `${taskWithCapsule.idempotencyKey}:${taskWithCapsule.index}` : null),
+        // This broker-owned path has not invoked the current action. A prior
+        // setup/applied entry is deliberately excluded from its evidence.
+        preDispatch: activeActionIndex !== null && !actionOperationKey && !mutationInFlight,
+      });
+      const effectMayHaveDispatched = failedStepMayMutate && !noEffectEvidence.knownNoEffect && ((["operation_effect_unknown", "action_event_pending"].includes(error?.code) && errorRequiresReconciliation)
         || (mutationInFlight && currentOperationRequiresReconciliation
           && (["dispatched", "unknown_effect"].includes(operationState)
-            || (operationState === "applied" && POST_DISPATCH_READBACK_ERRORS.has(error?.code))));
+            || (operationState === "applied" && !failedReadOnlyCommand && POST_DISPATCH_READBACK_ERRORS.has(error?.code)))));
+      const localNavigationEffectUnknown = !effectMayHaveDispatched
+        && isUncertainLocalNavigationEffect(currentOperation);
       // Keep the raw operation result honest for a local browser mutation
       // that did dispatch but returned late. Provider reconciliation and
       // local input uncertainty are distinct: preserve the original page for
       // an uncertain edit, while disposable tab setup follows its cleanup policy.
-      const localUiEffectUnknown = !effectMayHaveDispatched
-        && currentOperationMayMutate
-        && !currentOperationRequiresReconciliation
+      const localUiEffectUnknown = failedStepMayMutate && !effectMayHaveDispatched
+        && !noEffectEvidence.knownNoEffect
+        && (noEffectEvidence.contradictory || noEffectEvidence.unprovenNoEffect
+        || (currentOperationMayMutate && !currentOperationRequiresReconciliation
         && (operationState === "unknown_effect"
+          || (mutationInFlight && currentOperation?.dispatchCount > 0 && operationState !== "applied")
           || ["operation_effect_unknown", "action_event_pending"].includes(error?.code)
           // tabs.create can emit a task.tab.created event before its
           // navigation acknowledgement.  The browser effect is local and
           // disposable, but the caller still needs the honest "unknown"
           // result so cleanup/readback can handle the created tab.
-          || Number.isSafeInteger(error?.details?.createdTabId));
+          || Number.isSafeInteger(error?.details?.createdTabId))));
       const appliedMutations = appliedActions.filter((action) => action.mutation);
       const retainUncertainLocalEdit = localUiEffectUnknown && activeActionIndex !== null;
       const failedStepEffectState = effectMayHaveDispatched || localUiEffectUnknown
         ? "unknown_effect"
-        : error?.details?.operationEffectState === "none" || error?.details?.effectState === "known_no_effect"
+        : noEffectEvidence.knownNoEffect
           ? "known_no_effect"
           : actionOperationKey && operationState === "applied" ? "known_effect" : "no_dispatch";
       const effectState = failedStepEffectState === "unknown_effect" ? "unknown_effect"
@@ -4588,7 +5530,9 @@ export class CompanionBroker extends EventEmitter {
       snapshot.failed_step = { index: activeActionIndex, effect_state: failedStepEffectState };
       snapshot.applied_actions = appliedActions.map(({ operationKey: _key, ...action }) => action);
       snapshot.completed_mutation_count = appliedMutations.length;
-      snapshot.external_action_executed = effectState === "unknown_effect" ? null : appliedMutations.length > 0;
+      snapshot.external_action_executed = effectState === "unknown_effect"
+        ? (localNavigationEffectUnknown ? false : null)
+        : appliedMutations.length > 0;
       snapshot.result = effectMayHaveDispatched || localUiEffectUnknown ? "unknown_effect" : "blocked";
       snapshot.effect_state = effectState;
       const failedDispatchCount = actionOperationKey && !appliedActions.some((action) => action.operationKey === actionOperationKey)
@@ -4626,45 +5570,93 @@ export class CompanionBroker extends EventEmitter {
           ...(typeof error.details.operationEffectState === "string" ? { operationEffectState: error.details.operationEffectState.slice(0, 40) } : {}),
         }
         : {};
+      if (error?.code === "screenshot_target_changed" && error.details && typeof error.details === "object") {
+        // Project only the bounded capture diagnostic contract, never raw URLs or extra fields.
+        const details = error.details;
+        if (details.reasons && typeof details.reasons === "object" && !Array.isArray(details.reasons)) {
+          const reasons = {};
+          for (const key of ["activationInterruption", "activeTabMismatch", "windowMismatch", "urlMismatch", "loading"]) {
+            if (typeof details.reasons[key] === "boolean") reasons[key] = details.reasons[key];
+          }
+          if (Object.keys(reasons).length > 0) blockerDetails.reasons = reasons;
+        }
+        if (["before_capture", "after_slot", "after_capture", "retry_guard"].includes(details.phase)) blockerDetails.phase = details.phase;
+        if (Number.isSafeInteger(details.attempt) && details.attempt >= 0 && details.attempt <= 4) blockerDetails.attempt = details.attempt;
+        for (const key of ["targetTabId", "targetWindowId", "currentTabId", "currentWindowId", "activeTabId", "activeWindowId"]) {
+          if (details[key] === null || (Number.isSafeInteger(details[key]) && details[key] > 0)) blockerDetails[key] = details[key];
+        }
+      }
+      if (error?.details?.documentProbeTarget && typeof error.details.documentProbeTarget === "object") {
+        const conditions = error.details.documentProbeTarget;
+        blockerDetails.documentProbeTarget = Object.fromEntries([
+          "tabIdMatches", "windowMatches", "tabUrlMatches", "pendingNavigationPresent", "pendingUrlMatchesCommitted", "documentUrlMatches", "normalizedUrlMatches",
+        ].filter(key => typeof conditions[key] === "boolean").map(key => [key, conditions[key]]));
+        if (["before_injection", "after_injection", "document_url"].includes(conditions.stage)) blockerDetails.documentProbeTarget.stage = conditions.stage;
+      }
       snapshot.exact_blocker = {
         code: error?.code ?? "transaction_failed",
         message: String(error?.message ?? error).slice(0, 400),
         ...(Object.keys(blockerDetails).length > 0 ? { details: blockerDetails } : {}),
+        ...blockerRecoveryContext({ code: error?.code, taskId, runId, profileInstanceId: session.profileInstanceId,
+          tabId: taskTab?.id, targetKey: capsule.target?.targetKey,
+          nextAction: pendingActionEvent ? pendingActionEvent.requiresUser ? "user_dialog_response" : "page.handleDialog"
+            : effectMayHaveDispatched || localNavigationEffectUnknown ? "perform_one_owner_signed_reconciliation_readback"
+              : "fresh_status_and_exact_owner_readback" }),
       };
       if (pendingActionEvent) snapshot.action_event = pendingActionEvent;
       // A terminal blocker is a checkpoint, not a prompt to keep the same
       // thread spinning.  Surface an explicit continuation gate so callers
       // can pause automatic continuation and resume only from the recorded
       // restart point after the blocker changes.
+      // A blocker that provably dispatched nothing and only concerns this
+      // target (a locator that did not match yet, a tab that must be
+      // re-reserved) is recoverable inside the same task: read the target
+      // again and continue. Calling it terminal made callers abandon
+      // half-finished workflows.
+      const recoverableNoEffect = !effectMayHaveDispatched && !localNavigationEffectUnknown && !localUiEffectUnknown
+        && appliedMutations.length === 0 && !pendingActionEvent
+        && RECOVERABLE_NO_EFFECT_TARGET_BLOCKERS.has(snapshot.exact_blocker.code);
       snapshot.continuation = {
-        allowed: false,
-        reason: effectMayHaveDispatched ? "reconciliation_required" : localUiEffectUnknown ? "local_ui_readback_required" : appliedMutations.length > 0 ? "partial_actions_applied_readback_required" : "terminal_blocker",
-        restart_point: effectMayHaveDispatched ? "signed_task_status_readback" : "task_failure_recovery",
+        ...blockerRecoveryContext({ code: error?.code, taskId, runId, profileInstanceId: session.profileInstanceId,
+          tabId: taskTab?.id, targetKey: capsule.target?.targetKey, nextAction: snapshot.exact_blocker.next_action }),
+        blocked_tab_id: taskTab?.id ?? null,
+        blocked_run_id: runId,
+        allowed: recoverableNoEffect,
+        reason: effectMayHaveDispatched || localNavigationEffectUnknown ? "reconciliation_required" : localUiEffectUnknown ? "local_ui_readback_required" : appliedMutations.length > 0 ? "partial_actions_applied_readback_required" : recoverableNoEffect ? "no_effect_target_readback_then_continue" : "terminal_blocker",
+        restart_point: effectMayHaveDispatched || localNavigationEffectUnknown ? "signed_task_status_readback" : recoverableNoEffect ? "fresh_target_readback" : "task_failure_recovery",
+        ...(recoverableNoEffect ? { next_action: RECOVERABLE_NO_EFFECT_TARGET_BLOCKERS.get(snapshot.exact_blocker.code), task_may_continue: true } : {}),
         exact_blocker: snapshot.exact_blocker.code,
         ...(pendingActionEvent ? { reason: "action_event_pending", restart_point: "inspect_dialog_then_signed_response",
           next_action: pendingActionEvent.requiresUser ? "user_dialog_response" : "page.handleDialog",
           same_tab_id: taskTab?.id, same_run_id: runId, same_session_id: session.sessionId, trigger_replay_allowed: false } : {}),
       };
-      const capsuleState = effectMayHaveDispatched ? "reconciliation_required" : "failed";
+      const capsuleState = effectMayHaveDispatched || localNavigationEffectUnknown ? "reconciliation_required" : "failed";
       let finalCapsule = null;
       try {
         finalCapsule = await this.taskLedger.transitionTaskCapsule(capsule.capsuleId, capsuleState, {
           blocker: snapshot.exact_blocker,
-          restartPoint: effectMayHaveDispatched ? "signed_task_status_readback" : "task_failure_recovery",
-          resumeToken: effectMayHaveDispatched ? (capsule.resumeToken ?? createId("resume")) : capsule.resumeToken,
+          restartPoint: effectMayHaveDispatched || localNavigationEffectUnknown ? "signed_task_status_readback" : "task_failure_recovery",
+          resumeToken: effectMayHaveDispatched || localNavigationEffectUnknown ? (capsule.resumeToken ?? createId("resume")) : capsule.resumeToken,
           resources: { ...capsule.resources, exactTabLeaseId: lease?.leaseId ?? null, tabId: taskTab?.id ?? null },
-          ...((appliedMutations.length > 0 || retainUncertainLocalEdit || dialogOnly) && !effectMayHaveDispatched ? {
-            retention: { ...capsule.retention, policy: dialogOnly ? "retain" : "retain_until_resume", reason: dialogOnly ? "dialog_response_not_completed" : retainUncertainLocalEdit ? "local_ui_effect_unknown" : "partial_actions_applied",
-              resumeAction: dialogOnly ? "inspect_dialog_then_signed_response" : "read_back_same_target_then_continue_remaining_actions", userHelpRequired: false },
+          ...((appliedMutations.length > 0 || retainUncertainLocalEdit || localNavigationEffectUnknown || dialogOnly) && !effectMayHaveDispatched ? {
+            retention: { ...capsule.retention, policy: dialogOnly ? "retain" : "retain_until_resume", reason: dialogOnly ? "dialog_response_not_completed" : localNavigationEffectUnknown ? "local_ui_navigation_arrival_pending" : retainUncertainLocalEdit ? "local_ui_effect_unknown" : "partial_actions_applied",
+              resumeAction: dialogOnly ? "inspect_dialog_then_signed_response" : localNavigationEffectUnknown ? "signed_local_navigation_arrival_readback_then_cleanup" : "read_back_same_target_then_continue_remaining_actions", userHelpRequired: false },
           } : {}),
           effect: {
             ...(capsule.effect ?? {}),
             effectState,
             effectClass: effectMayHaveDispatched || appliedMutations.some((action) => action.reconciliationRequired) ? "external_commit" : "local_ui",
-            reconciliationRequired: effectMayHaveDispatched,
-            externalActionExecuted: effectState === "known_effect" ? true : effectState === "unknown_effect" ? null : false,
+            reconciliationRequired: effectMayHaveDispatched || localNavigationEffectUnknown,
+            externalActionExecuted: effectState === "known_effect" ? true : effectState === "unknown_effect" ? (localNavigationEffectUnknown ? false : null) : false,
             dispatchCount: snapshot.dispatch_count,
             actionProgress: snapshot.action_progress,
+            ...(snapshot.upload_delivery ? { uploadDelivery: snapshot.upload_delivery } : {}),
+            ...(actionOperationKey && currentOperation?.operationId ? {
+              failedOperationKey: actionOperationKey, failedOperationId: currentOperation.operationId,
+            } : {}),
+            ...(localNavigationEffectUnknown && currentOperation?.navigationTargetDigest
+              ? { localNavigationTargetDigest: currentOperation.navigationTargetDigest }
+              : {}),
             ...(pendingActionEvent ? { awaitedEvent: pendingActionEvent } : {}),
           },
         });
@@ -4672,7 +5664,7 @@ export class CompanionBroker extends EventEmitter {
         // Preserve the original transaction blocker if durable status itself
         // is unavailable; the operation ledger still carries no-replay proof.
       }
-      if (effectMayHaveDispatched) {
+      if (effectMayHaveDispatched || localNavigationEffectUnknown) {
         snapshot.reconciliation = {
           run_id: runId,
           task_id: taskId,
@@ -4680,6 +5672,11 @@ export class CompanionBroker extends EventEmitter {
           operation_id: currentOperation?.operationId ?? null,
           state: operationState ?? "unknown_effect",
           restart_point: "signed_task_status_readback",
+          ...(localNavigationEffectUnknown ? {
+            proof_kind: "local_navigation_arrival",
+            operation_index: Number(String(currentOperation?.idempotencyKey ?? "").slice(`${taskWithCapsule.idempotencyKey}:`.length)),
+            external_action_executed: false,
+          } : {}),
         };
       }
       // Preserve the page containing successful edits when a later step fails.
@@ -4687,7 +5684,7 @@ export class CompanionBroker extends EventEmitter {
       // The default transaction also needs its exact page to reconcile an
       // uncertain submission. Omitting an optional capsule or retention flag
       // must not close the only provider evidence after dispatch.
-      const retainUnknown = Boolean(pendingActionEvent) || effectMayHaveDispatched;
+      const retainUnknown = Boolean(pendingActionEvent) || effectMayHaveDispatched || localNavigationEffectUnknown;
       const retainForLifecycle = capsuleMode && (capsuleState === "reconciliation_required" || capsuleState === "awaiting_user");
       const retainForPolicy = capsuleMode && capsuleRetention !== "cleanup";
       if (taskTab && lease && !cleanupAttempted && !keepTaskTab && !retainPartialMutation && !retainUnknown && !retainForLifecycle && !retainForPolicy) {
@@ -4720,13 +5717,15 @@ export class CompanionBroker extends EventEmitter {
             retentionPolicy: capsuleState === "reconciliation_required" || retainPartialMutation ? "retain_until_resume" : dialogOnly ? "retain" : retainedTab.retentionPolicy,
             resumeToken: finalCapsule.resumeToken,
             userHelpRequired: false,
-            retentionReason: capsuleState === "reconciliation_required" ? "ai_reconciliation_pending" : retainUncertainLocalEdit ? "local_ui_effect_unknown" : retainPartialMutation ? "partial_actions_applied" : dialogOnly ? "dialog_response_not_completed" : null,
+            retentionReason: capsuleState === "reconciliation_required" ? (localNavigationEffectUnknown ? "local_ui_navigation_arrival_pending" : "ai_reconciliation_pending") : retainUncertainLocalEdit ? "local_ui_effect_unknown" : retainPartialMutation ? "partial_actions_applied" : dialogOnly ? "dialog_response_not_completed" : null,
             whyTabWasKept: capsuleState === "reconciliation_required"
-              ? "The task-owned tab is retained temporarily while Codex reconciles an unknown external effect without replaying it."
+              ? localNavigationEffectUnknown
+                ? "A local tabs.navigate acknowledgement is unknown; verify arrival at its recorded target without replay."
+                : "The task-owned tab is retained temporarily while Codex reconciles an unknown external effect without replaying it."
               : retainUncertainLocalEdit ? "A local edit was dispatched but its result is unknown; preserve the page and read it back without replaying the edit."
                 : retainPartialMutation ? "The page contains successful actions from an interrupted transaction; read it back before continuing only the remaining actions." : dialogOnly ? "The dialog response was not completed; retain its page for exact dialog inspection." : null,
             requiredUserAction: null,
-            resumeAction: capsuleState === "reconciliation_required" ? "signed_task_status_readback_then_cleanup_when_reconciled" : retainPartialMutation ? "read_back_same_target_then_continue_remaining_actions" : dialogOnly ? "inspect_dialog_then_signed_response" : null,
+            resumeAction: capsuleState === "reconciliation_required" ? (localNavigationEffectUnknown ? "signed_local_navigation_arrival_readback_then_cleanup" : "signed_task_status_readback_then_cleanup_when_reconciled") : retainPartialMutation ? "read_back_same_target_then_continue_remaining_actions" : dialogOnly ? "inspect_dialog_then_signed_response" : null,
             updatedAt: nowIso(),
           };
           const retention = taskTabRetentionExplanation(retainedEntry);
@@ -4865,6 +5864,192 @@ export class CompanionBroker extends EventEmitter {
     return result;
   }
 
+  async #cleanupOriginalRestoreDisposal(peer, { session, taskId, runId, preserveTabIds, dryRun, authority }) {
+    const expected = {
+      operationId: "op_56cf952d-9447-4b16-875a-ca4476d26eda", operationKey: "light-parity-1280-restore-once:1",
+      capsuleId: "capsule_41a03eae-b3a8-42ee-9882-0a6e6e171104", taskId: "01a106b1-2e41-7093-b639-dfce60fdf22b",
+      runId: "heavy-model-desktop-parity-new-20261005", profileInstanceId: "profile_37fd31b6-ed53-4a35-8604-ab92ffbab05a",
+      generation: "gen_62542f46-232b-4ad4-94f2-38f1456e1bf9", sessionId: "session_3553c4d5-3ba1-4ae1-bccf-8a511e6d4ae8",
+      tabId: 1980936256, pageInstanceId: "chrome-document:276C41EB36EEF86C4FD3FC33E6419E3D",
+      windowId: 1980934932, frameId: 0, origin: "https://jp.linkaigc.com",
+      url: "https://jp.linkaigc.com/model-library/model-custom-form",
+    };
+    const repairedTabSessionId = "session_d95519d6-31cf-431c-8669-a5da43cd306f";
+    const previewKey = "heavy-owned-cleanup-disposal-preview-rev3-once";
+    const executeKey = "heavy-owned-cleanup-disposal-execute-rev3-once";
+    if (authority.idempotencyKey !== (dryRun ? previewKey : executeKey)) {
+      throw new CompanionError("owned_cleanup_disposal_key_invalid", "Use the distinct exact preview/execute key with its matching dryRun value");
+    }
+    const tabKey = this.#tabKey(expected.profileInstanceId, expected.tabId);
+    const original = this.taskLedger.get(expected.operationKey);
+    const capsule = this.taskLedger.getTaskCapsule(expected.capsuleId);
+    const entry = this.taskLedger.getTaskTab(expected.profileInstanceId, expected.tabId);
+    const originalSnapshot = canonicalPayload(original), capsuleSnapshot = canonicalPayload(capsule), entrySnapshot = canonicalPayload(entry);
+    const result = { schema: "aos.chrome_companion.task_tab_cleanup.v1", run_id: runId, task_id: taskId, dry_run: dryRun,
+      profile: { profileInstanceId: session.profileInstanceId, generation: session.generation },
+      preserved: [], candidates: [], closed: [], missing: [], busy: [], skipped: [], unknown_effect: [],
+      collapse_candidates: [], collapsed: [], collapse_skipped: [], collapse_unknown_effect: [],
+      disposal_scope: "exact_original_restore_only", original_unknown_preserved: true };
+    const tupleReasons = () => {
+      const reasons = [];
+      const binding = original?.binding, target = binding?.targetIdentity;
+      if (taskId !== expected.taskId || runId !== expected.runId
+        || session.profileInstanceId !== expected.profileInstanceId || session.generation !== expected.generation
+        || !entry || !taskTabIdentityConsistent(this.ledgerSecret, entry)
+        || entry.taskId !== expected.taskId || entry.runId !== expected.runId || entry.capsuleId !== expected.capsuleId
+        || entry.profileInstanceId !== expected.profileInstanceId || entry.generation !== expected.generation
+        || entry.sessionId !== repairedTabSessionId || entry.targetIdentity?.sessionId !== repairedTabSessionId
+        || entry.identityRepairReason !== "same_task_fresh_lease"
+        || original?.operationId !== expected.operationId || original.idempotencyKey !== expected.operationKey
+        || original.state !== "unknown_effect" || binding?.method !== "page.configureViewport"
+        || binding.ownerKey !== expected.sessionId
+        || !["taskId", "runId", "sessionId", "profileInstanceId", "generation", "tabId"].every(key => binding?.[key] === expected[key])
+        // The original operation/capsule keep their immutable original
+        // session. The signed task-tab record has one exact accepted repair
+        // lineage, with every non-session target field unchanged.
+        || !["taskId", "sessionId", "profileInstanceId", "generation", "tabId", "pageInstanceId", "windowId", "frameId", "origin"].every(key =>
+          target?.[key] === expected[key])
+        // Capsule ownership is top-level; its normalized target has no taskId.
+        || !["sessionId", "profileInstanceId", "generation", "tabId", "pageInstanceId", "windowId", "frameId", "origin"].every(key =>
+          capsule?.target?.[key] === expected[key])
+        || !["taskId", "profileInstanceId", "generation", "tabId", "pageInstanceId", "windowId", "frameId", "origin"].every(key =>
+          entry.targetIdentity?.[key] === expected[key])
+        || capsule?.capsuleId !== expected.capsuleId || capsule.taskId !== expected.taskId || capsule.runId !== expected.runId
+        || capsule.state !== "failed" || capsule.resources?.tabId !== expected.tabId || capsule.target?.intendedUrl !== expected.url
+        || capsule.effect?.failedOperationId !== expected.operationId || capsule.effect?.failedOperationKey !== expected.operationKey
+        || capsule.effect?.idempotencyKey !== "light-parity-1280-restore-once" || capsule.effect?.effectState !== "unknown_effect"
+        || capsule.effect?.effectClass !== "local_ui" || capsule.retention?.policy !== "retain_until_resume"
+        || capsule.retention?.reason !== "local_ui_effect_unknown"
+        || entry.retentionPolicy !== "retain_until_resume" || entry.retentionReason !== "local_ui_effect_unknown") reasons.push("original_restore_tuple_mismatch");
+      if (preserveTabIds.includes(expected.tabId)) reasons.push("explicit_preserve");
+      if (entry?.userHelpRequired === true || capsule?.retention?.userHelpRequired === true) reasons.push("user_help_required");
+      if (entry?.resumeToken || capsule?.resumeToken) reasons.push("resume_token");
+      if (entry?.quarantine) reasons.push("quarantine");
+      if (this.tabLeaseIndex.has(tabKey)) reasons.push("leased");
+      if (entry?.sessionId && this.sessions.get(entry.sessionId)?.generation === expected.generation) reasons.push("live_owner_session");
+      if ([...this.pendingOperations.values()].some(operation => operation.operationId === expected.operationId
+        || operation.profileInstanceId === expected.profileInstanceId && operation.binding?.tabId === expected.tabId)
+        || this.operationQueues.has(`tab:${expected.profileInstanceId}:${expected.tabId}`)
+        || this.operationQueues.has(`profile:${expected.profileInstanceId}`)) reasons.push("active_broker_operation");
+      if (this.taskLedger.listOperations().some(operation => operation.binding?.ownedCleanupDisposal === true
+        && operation.binding?.profileInstanceId === expected.profileInstanceId && operation.binding?.tabId === expected.tabId
+        && operation.dispatchCount > 0 && !operation.disposalReceipt)) reasons.push("disposal_reconciliation_required");
+      return reasons;
+    };
+    const preserve = reasons => { result.preserved = [{ tabId: expected.tabId, reasons }]; return result; };
+    const initialReasons = tupleReasons();
+    if (initialReasons.length) return preserve(initialReasons);
+    const profile = this.profiles.get(session.profileInstanceId);
+    const assertCurrent = ({ queuedClose = false } = {}) => {
+      if (this.#requireOwnedSession(peer, session.sessionId) !== session
+        || canonicalPayload(this.taskLedger.get(expected.operationKey)) !== originalSnapshot
+        || canonicalPayload(this.taskLedger.getTaskCapsule(expected.capsuleId)) !== capsuleSnapshot
+        || canonicalPayload(this.taskLedger.getTaskTab(expected.profileInstanceId, expected.tabId)) !== entrySnapshot
+        || this.tabLeaseIndex.has(tabKey) || preserveTabIds.includes(expected.tabId)
+        || this.sessions.get(expected.sessionId)?.generation === expected.generation
+        || this.sessions.get(entry.sessionId)?.generation === expected.generation
+        || this.operationQueues.has(`profile:${expected.profileInstanceId}`)
+        || !queuedClose && this.operationQueues.has(`tab:${expected.profileInstanceId}:${expected.tabId}`)
+        || [...this.pendingOperations.values()].some(operation => operation.operationId === expected.operationId
+          || operation.profileInstanceId === expected.profileInstanceId && operation.binding?.tabId === expected.tabId)) {
+        throw new CompanionError("owned_cleanup_disposal_binding_changed", "Original owner/profile/generation/tuple and protected-resource guards must remain unchanged");
+      }
+    };
+    const read = (method, params, evidence, queuedClose = false) => this.#enqueue(`session:${session.sessionId}`, () => this.#sendOperation({
+      profile, session, method, params, timeoutMs: DEFAULT_OPERATION_TIMEOUTS_MS[method] ?? DEFAULT_OPERATION_TIMEOUT_MS,
+      authority: null, idempotencyKey: null, binding: { taskId, runId, sessionId: session.sessionId,
+        profileInstanceId: session.profileInstanceId, generation: session.generation, tabId: params.tabId ?? null, method },
+      fingerprint: null, allowedOrigins: [expected.origin], targetOrigin: expected.origin, taskTabContext: null,
+      dispatchGuard: () => assertCurrent({ queuedClose }), readEvidence: evidence,
+    }));
+    const inventoryEvidence = {};
+    const inventory = await read("tabs.list", {}, inventoryEvidence);
+    const validInventory = list => Array.isArray(list) && list.length < 200
+      && list.every(tab => Number.isSafeInteger(tab?.id) && tab.id >= 0 && Number.isSafeInteger(tab.windowId) && tab.windowId >= 0)
+      && new Set(list.map(tab => tab.id)).size === list.length;
+    if (!validInventory(inventory) || inventoryEvidence.brokerEvidence !== true) return preserve(["inventory_incomplete"]);
+    const liveReasons = list => {
+      const live = list.find(tab => tab.id === expected.tabId);
+      if (!live) return ["exact_target_missing"];
+      const reasons = [];
+      if (live.pinned === true) reasons.push("pinned");
+      if (live.active === true) reasons.push("active_tab");
+      if (Number.isSafeInteger(live.groupId) && live.groupId >= 0 && list.some(tab => tab.active === true && tab.groupId === live.groupId)) reasons.push("active_group_tab");
+      if (live.windowId !== expected.windowId || live.url !== expected.url) reasons.push("live_target_tuple_mismatch");
+      return reasons;
+    };
+    const reasons = liveReasons(inventory);
+    if (reasons.length) return preserve(reasons);
+    result.candidates = [expected.tabId];
+    if (dryRun) return result;
+    const snapshotEvidence = {};
+    const before = await read("page.snapshot", { tabId: expected.tabId, maxTextChars: 100 }, snapshotEvidence);
+    // Real semantic snapshots carry document/URL identity, not windowId.
+    // Window identity remains strict in both authenticated inventories.
+    if (before.pageInstanceId !== expected.pageInstanceId || before.url !== expected.url
+      || new URL(before.url).origin !== expected.origin
+      || snapshotEvidence.brokerEvidence !== true || snapshotEvidence.returned !== true
+      || snapshotEvidence.method !== "page.snapshot" || snapshotEvidence.sessionId !== session.sessionId
+      || snapshotEvidence.profileInstanceId !== expected.profileInstanceId || snapshotEvidence.generation !== expected.generation) {
+      return preserve(["live_document_mismatch"]);
+    }
+    const preCloseBinding = { ...original.binding.targetIdentity, sessionId: session.sessionId, leaseId: null };
+    const binding = { taskId, runId, profileInstanceId: session.profileInstanceId, generation: session.generation,
+      sessionId: session.sessionId, ownerKey: session.sessionId, tabId: expected.tabId, method: "tabs.close",
+      ownedCleanupDisposal: true, targetIdentity: preCloseBinding, targetFingerprint: targetIdentityDigest(this.ledgerSecret, preCloseBinding) };
+    const operationParams = { tabId: expected.tabId, pageInstanceId: expected.pageInstanceId, windowId: expected.windowId,
+      frameId: expected.frameId, allowedOrigins: [expected.origin], targetOrigin: expected.origin };
+    const closeKey = `${executeKey}:${expected.tabId}`;
+    const fingerprint = payloadDigest(this.ledgerSecret, { binding, payload: operationParams });
+    const prepared = await this.taskLedger.prepare({ idempotencyKey: closeKey, binding, fingerprint });
+    if (prepared.state !== "prepared") return preserve([`idempotency:${prepared.state}`]);
+    try {
+      const ack = await this.#enqueue(`tab:${expected.profileInstanceId}:${expected.tabId}`, async () => {
+        // The worker checks origins, but does not check pinned/active/group
+        // state. Re-read those protections after the document snapshot and
+        // inside the exact-tab queue, immediately before this single close.
+        const evidence = {};
+        const latest = await read("tabs.list", {}, evidence, true);
+        const reasons = validInventory(latest) && evidence.brokerEvidence === true
+          ? liveReasons(latest) : ["inventory_incomplete"];
+        if (reasons.length) throw new CompanionError("owned_cleanup_disposal_protected", reasons.join(","));
+        return this.#sendOperation({
+          profile, session, method: "tabs.close", params: operationParams, timeoutMs: DEFAULT_OPERATION_TIMEOUTS_MS["tabs.close"],
+          authority, idempotencyKey: closeKey, binding, fingerprint, allowedOrigins: [expected.origin], targetOrigin: expected.origin,
+          taskTabContext: null, dispatchGuard: () => assertCurrent({ queuedClose: true }),
+        });
+      });
+      const close = this.taskLedger.get(closeKey);
+      const absenceEvidence = {};
+      const after = await read("tabs.list", {}, absenceEvidence);
+      if (ack?.closed !== true || ack.closedExpected !== true || ack.tabId !== expected.tabId
+        || close?.state !== "applied" || close.brokerEvidence !== true
+        || !validInventory(after) || absenceEvidence.brokerEvidence !== true || absenceEvidence.returned !== true
+        || after.some(tab => tab.id === expected.tabId)) {
+        throw new CompanionError("owned_cleanup_disposal_absence_unverified", "Authenticated complete unfiltered inventory must prove exact-target absence below the 200-tab cap");
+      }
+      assertCurrent();
+      const payload = { schema: "aos.chrome_companion.owned_tab_disposal_receipt.v1", taskId, runId,
+        profileInstanceId: session.profileInstanceId, generation: session.generation, sessionId: session.sessionId,
+        tabId: expected.tabId, closeOperationKey: closeKey, closeOperationId: close.operationId,
+        closeResultDigest: close.resultDigest, preCloseBinding,
+        originalSource: { operationId: expected.operationId, operationKey: expected.operationKey, capsuleId: expected.capsuleId },
+        absence: { exactTargetAbsent: true, inventoryParams: {}, inventoryCap: 200, inventoryIds: after.map(tab => tab.id), inventoryEvidence: absenceEvidence },
+        originalUnknownPreserved: true, originalAcknowledgementClaimed: false, viewportRestoreClaimed: false,
+        cancellationClaimed: false, replayAllowed: false, capturedAt: nowIso() };
+      result.disposal_receipt = { ...payload, signature: payloadDigest(this.ledgerSecret, payload) };
+      await this.taskLedger.transition(closeKey, "applied", { disposalReceipt: result.disposal_receipt });
+      this.taskTabs.delete(tabKey);
+      await this.taskLedger.removeTaskTab(expected.profileInstanceId, expected.tabId);
+      result.closed = [expected.tabId];
+    } catch (error) {
+      if (this.taskLedger.get(closeKey)?.dispatchCount > 0) result.unknown_effect.push({ tabId: expected.tabId,
+        code: error.code ?? "owned_cleanup_disposal_unknown", replay_allowed: false });
+      else result.skipped.push({ tabId: expected.tabId, reason: error.code ?? "owned_cleanup_disposal_failed" });
+    }
+    return result;
+  }
+
   async #cleanupTaskTabs(peer, params) {
     const session = this.#requireOwnedSession(peer, params.sessionId);
     const taskId = requireString(params.taskId ?? session.taskId, "taskId");
@@ -4894,6 +6079,13 @@ export class CompanionBroker extends EventEmitter {
         intent: "cleanup_task_tabs",
       },
     });
+
+    // A disposal-key request (including an invalid member) or this exact
+    // accepted historical run never falls into ordinary broad cleanup.
+    if (String(authority.idempotencyKey).startsWith("heavy-owned-cleanup-disposal-")
+      || taskId === "01a106b1-2e41-7093-b639-dfce60fdf22b" && runId === "heavy-model-desktop-parity-new-20261005") {
+      return this.#cleanupOriginalRestoreDisposal(peer, { session, taskId, runId, preserveTabIds, dryRun, authority });
+    }
 
     const inventory = await this.#executeOperation(peer, {
       sessionId: session.sessionId,
@@ -5920,6 +7112,32 @@ export class CompanionBroker extends EventEmitter {
     }
   }
 
+  #localNavigationReconciliationOperation(capsule, idempotencyKey, tabId) {
+    if (!isLocalNavigationReconciliationCapsule(capsule)) return null;
+    const prefix = `${idempotencyKey}:`;
+    const candidates = this.taskLedger.listOperations().filter((entry) =>
+      entry.idempotencyKey.startsWith(prefix)
+      && /^\d+$/u.test(entry.idempotencyKey.slice(prefix.length))
+      && entry.binding?.taskId === capsule.taskId
+      && entry.binding?.runId === capsule.runId
+      && entry.binding?.tabId === tabId
+      && entry.binding?.profileInstanceId === capsule.target?.profileInstanceId
+      && isUnresolvedOperationEffect(entry));
+    if (candidates.length !== 1 || !isUncertainLocalNavigationEffect(candidates[0])) return null;
+    const operation = candidates[0];
+    const suffix = operation.idempotencyKey.slice(prefix.length);
+    const operationIndex = Number(suffix);
+    if (!Number.isSafeInteger(operationIndex)
+      || (Number.isSafeInteger(operation.operationIndex) && operation.operationIndex !== operationIndex)) return null;
+    const recordedTargetDigest = operation.navigationTargetDigest
+      ?? capsule.effect.localNavigationTargetDigest
+      ?? localNavigationTargetDigestFromKey(this.ledgerSecret, capsule.target?.targetKey);
+    if (!recordedTargetDigest
+      || (capsule.effect.localNavigationTargetDigest
+        && capsule.effect.localNavigationTargetDigest !== recordedTargetDigest)) return null;
+    return { operation, operationIndex, recordedTargetDigest };
+  }
+
   #requireTaskReconciliationBinding(session, params) {
     const runId = requireString(params.runId, "runId");
     const taskId = requireString(params.taskId ?? session.taskId, "taskId");
@@ -5935,10 +7153,25 @@ export class CompanionBroker extends EventEmitter {
       ? this.taskLedger.getTaskCapsule(capsuleId)
       : this.taskLedger.findTaskCapsule({ taskId, runId, idempotencyKey });
     if (!capsule || capsule.taskId !== taskId || capsule.runId !== runId || capsule.effect?.idempotencyKey !== idempotencyKey) {
-      throw new CompanionError("task_reconciliation_not_found", "No matching task reconciliation capsule exists for this run and idempotency key");
+      // Name the pending reconciliations of this exact task/run so the caller
+      // can retry with the right key instead of guessing variations.
+      const pending = this.taskLedger.listTaskCapsules()
+        .filter(entry => entry.taskId === taskId && entry.runId === runId && entry.state === "reconciliation_required")
+        .map(entry => ({ idempotencyKey: entry.effect?.idempotencyKey ?? null, capsuleId: entry.capsuleId, tabId: entry.resources?.tabId ?? null }))
+        .slice(0, 10);
+      throw new CompanionError("task_reconciliation_not_found", pending.length
+        ? `No matching task reconciliation capsule exists for this run and idempotency key; pending for this run: ${pending.map(entry => `${entry.idempotencyKey} (capsuleId ${entry.capsuleId}, tab ${entry.tabId})`).join(", ")}`
+        : "No matching task reconciliation capsule exists for this run and idempotency key; this run has no pending reconciliation (it may already be completed — check companion_transaction_status)",
+      { pendingReconciliations: pending });
     }
-    if (capsule.state !== "reconciliation_required") {
+    const localNavigation = isLocalNavigationReconciliationCapsule(capsule)
+      ? this.#localNavigationReconciliationOperation(capsule, idempotencyKey, tabId)
+      : null;
+    if (capsule.state !== "reconciliation_required" && !localNavigation) {
       throw new CompanionError("task_reconciliation_state_invalid", `Task reconciliation requires reconciliation_required state, not ${capsule.state}`);
+    }
+    if (isLocalNavigationReconciliationCapsule(capsule) && !localNavigation) {
+      throw new CompanionError("local_navigation_reconciliation_not_applicable", "Local arrival maintenance requires the exact unresolved tabs.navigate operation and recorded target");
     }
     if (capsule.resources?.tabId !== tabId
       || capsule.target?.profileInstanceId !== session.profileInstanceId
@@ -5958,7 +7191,200 @@ export class CompanionBroker extends EventEmitter {
     if (!taskTab || taskTab.taskId !== taskId || taskTab.runId !== runId) {
       throw new CompanionError("task_tab_ownership_required", "Reconciliation requires the exact task-owned tab from the same run");
     }
-    return { runId, taskId, idempotencyKey, capsule, capsuleId: capsule.capsuleId, tabId, lease, taskTab };
+    return { runId, taskId, idempotencyKey, capsule, capsuleId: capsule.capsuleId, tabId, lease, taskTab, localNavigation };
+  }
+
+  async #resolveLocalEditor(peer, params) {
+    const session = this.#requireOwnedSession(peer, params.sessionId);
+    const payload = localEditorReconciliationPayload(params);
+    const capsule = this.taskLedger.getTaskCapsule(params.capsuleId);
+    const entry = this.taskLedger.get(params.originalOperationKey);
+    if (!capsule || capsule.taskId !== session.taskId || capsule.taskId !== params.taskId || capsule.runId !== params.runId
+      || capsule.effect?.idempotencyKey !== params.idempotencyKey || entry?.operationId !== params.originalOperationId
+      || capsule.resources?.tabId !== params.tabId || entry.binding?.tabId !== params.tabId) {
+      throw new CompanionError("local_editor_reconciliation_target_mismatch", "Local editor resolution requires the original failed capsule and operation from this task");
+    }
+    verifyOriginalEditorPayload(this.ledgerSecret, entry, capsule, params.originalPayload);
+    const lease = this.leases.get(params.leaseId);
+    const taskTab = this.taskTabs.get(this.#tabKey(session.profileInstanceId, params.tabId));
+    if (!lease || lease.sessionId !== session.sessionId || lease.tabId !== params.tabId || lease.generation !== session.generation
+      || !taskTab || taskTab.taskId !== session.taskId || taskTab.generation !== session.generation
+      || session.profileInstanceId !== entry.binding.profileInstanceId || session.generation !== entry.binding.generation
+      || params.pageInstanceId !== entry.binding.targetIdentity.pageInstanceId
+      || params.url !== capsule.target?.intendedUrl && new URL(params.url).origin !== entry.binding.targetIdentity.origin
+      || params.expectedFullBody !== params.originalPayload.text) {
+      throw new CompanionError("local_editor_reconciliation_target_mismatch", "Current owner/lease/page and expected original full body must match separately");
+    }
+    await this.taskLedger.verifyAndConsumeAuthority(params.authority, { secrets: this.issuerSecrets, payload,
+      expected: { runId: params.runId, taskId: session.taskId, ownerKey: session.sessionId,
+        method: "task.reconciliation.resolve_local_editor", intent: "resolve_local_editor_from_exact_readback" } });
+    const read = await this.#executeOperation(peer, { sessionId: session.sessionId, leaseId: lease.leaseId, method: "page.query",
+      params: { tabId: params.tabId, frameId: entry.binding.targetIdentity.frameId, locator: { css: "div.ProseMirror" },
+        exactEditor: true, maxEditorChars: 100_000, allowedOrigins: params.originalPayload.allowedOrigins } });
+    if (!read?.exactEditor || read.truncated !== false || read.body !== params.expectedBody || read.url !== params.url
+      || read.pageInstanceId !== params.pageInstanceId || read.frameId !== entry.binding.targetIdentity.frameId) {
+      throw new CompanionError("local_editor_readback_changed", "Fresh untruncated editor body/page did not match; no local resolution appended");
+    }
+    const resolution = await this.taskLedger.appendLocalEditorResolution({ originalOperationKey: entry.idempotencyKey,
+      originalPayload: params.originalPayload, capsuleId: capsule.capsuleId, resolution: {
+        schema: "aos.chrome_companion.local_editor_resolution.v1", resolutionId: createId("editor_resolution"),
+        originalOperationId: entry.operationId, originalFingerprint: entry.fingerprint,
+        currentBinding: { taskId: session.taskId, sessionId: session.sessionId, leaseId: lease.leaseId,
+          generation: session.generation, profileInstanceId: session.profileInstanceId, tabId: params.tabId,
+          pageInstanceId: read.pageInstanceId, windowId: entry.binding.targetIdentity.windowId, frameId: read.frameId },
+        expectedBody: read.body, expectedFullBody: params.expectedFullBody, insertText: params.insertText, offset: params.offset,
+        repairOperationKey: params.repairOperationKey, url: read.url, bodySha256: read.bodySha256,
+        issuedAt: nowIso(), expiresAt: new Date(Date.now() + 120_000).toISOString(),
+        disposition: "local_body_observed_original_effect_history_preserved", providerCompletion: false,
+      } }, { brokerEvidence: true });
+    return { resolved: true, resolutionId: resolution.resolutionId, originalOperationKey: entry.idempotencyKey,
+      originalOperationState: entry.state, originalCapsuleState: capsule.state, replayAllowed: false, cleanupReady: false,
+      repairOperationKey: resolution.repairOperationKey, expiresAt: resolution.expiresAt, bodySha256: read.bodySha256,
+      editorGuard: { originalOperationKey: entry.idempotencyKey, resolutionId: resolution.resolutionId,
+        expectedBody: read.body, expectedFullBody: params.expectedFullBody, offset: params.offset, url: read.url } };
+  }
+
+  async #resolveLocalSelection(peer, params) {
+    const session = this.#requireOwnedSession(peer, params.sessionId);
+    const payload = localSelectionReconciliationPayload(params);
+    if (Object.keys(params).some(key => !["sessionId", "authority"].includes(key) && !Object.hasOwn(payload, key))) {
+      throw new CompanionError("local_selection_payload_invalid", "Selection resolution accepts original evidence only, not caller proof assertions");
+    }
+    const capsule = this.taskLedger.getTaskCapsule(params.capsuleId), entry = this.taskLedger.get(params.originalOperationKey);
+    const expectedLabel = verifyOriginalSelectionPayload(this.ledgerSecret, entry, capsule, params.originalPayload);
+    const original = entry.binding.targetIdentity;
+    const lease = this.leases.get(params.leaseId);
+    const taskTab = this.taskTabs.get(this.#tabKey(session.profileInstanceId, params.tabId));
+    const assertBinding = () => {
+      if (this.#requireOwnedSession(peer, params.sessionId) !== session
+        || capsule.taskId !== session.taskId || params.taskId !== session.taskId || params.runId !== capsule.runId
+        || params.idempotencyKey !== capsule.effect.idempotencyKey || params.originalOperationId !== entry.operationId
+        || params.tabId !== entry.binding.tabId || params.pageInstanceId !== original.pageInstanceId
+        || session.generation !== original.generation || session.profileInstanceId !== original.profileInstanceId
+        || !lease || this.leases.get(params.leaseId) !== lease || lease.sessionId !== session.sessionId
+        || lease.tabId !== params.tabId || lease.generation !== session.generation
+        || !taskTab || this.taskTabs.get(this.#tabKey(session.profileInstanceId, params.tabId)) !== taskTab
+        || taskTab.taskId !== session.taskId || taskTab.runId !== params.runId || taskTab.generation !== session.generation
+        || taskTab.quarantine || !taskTabIdentityConsistent(this.ledgerSecret, taskTab)
+        || taskTab.targetIdentity?.pageInstanceId !== original.pageInstanceId
+        || taskTab.targetIdentity?.windowId !== original.windowId || taskTab.targetIdentity?.frameId !== original.frameId
+        || params.url !== capsule.target?.intendedUrl || new URL(params.url).origin !== original.origin) {
+        throw new CompanionError("local_selection_target_mismatch", "Selection resolution requires the current exact owner lease and original document/control");
+      }
+    };
+    assertBinding();
+    await this.taskLedger.verifyAndConsumeAuthority(params.authority, { secrets: this.issuerSecrets, payload,
+      expected: { runId: params.runId, taskId: session.taskId, ownerKey: session.sessionId,
+        method: "task.reconciliation.resolve_local_selection", intent: "resolve_local_selection_from_exact_readback",
+        targetOrigin: new URL(params.url).origin } });
+    const options = await this.#executeOperation(peer, { sessionId: session.sessionId, leaseId: lease.leaseId, method: "page.query",
+      params: { tabId: params.tabId, frameId: original.frameId,
+        locator: { css: "option", within: params.originalPayload.locator }, includeHidden: true, limit: 100,
+        attributes: ["aria-label", "aria-labelledby", "title", "label", "value", "aria-selected", "aria-checked", "aria-pressed"],
+        allowedOrigins: params.originalPayload.allowedOrigins } });
+    assertBinding();
+    const completeOptions = options?.url === params.url && options.pageInstanceId === original.pageInstanceId
+      && options.totalCountExact === true && options.scanLimitReached === false && options.truncated === false
+      && options.count === options.totalCount && options.count === options.matches?.length && options.count > 0
+      && options.matches.every(option => option.tag === "option" && typeof option.text === "string"
+        && option.text.length < 500 && !option.truncatedAttributes?.length && !option.redactedAttributes?.length
+        && option.attributes && !option.attributes["aria-labelledby"] && !option.attributes.title
+        && ["aria-selected", "aria-checked", "aria-pressed"].every(name => option.attributes[name] === null));
+    const selectedOptions = options?.matches?.filter(option => option.selected === true) ?? [];
+    const matchingOptions = options?.matches?.filter(option => option.text?.toLowerCase() === expectedLabel.toLowerCase()) ?? [];
+    if (!completeOptions || matchingOptions.length !== 1 || selectedOptions.length !== 1
+      || matchingOptions[0] !== selectedOptions[0] || selectedOptions[0].text !== expectedLabel) {
+      throw new CompanionError("local_selection_option_evidence_mismatch", "Require a complete original-control option inventory with one unique selected label");
+    }
+    const read = await this.#executeOperation(peer, { sessionId: session.sessionId, leaseId: lease.leaseId, method: "page.query",
+      params: { tabId: params.tabId, frameId: original.frameId, locator: params.originalPayload.locator,
+        limit: 2, allowedOrigins: params.originalPayload.allowedOrigins } });
+    assertBinding();
+    const control = read?.matches?.[0];
+    if (read?.url !== params.url || read.pageInstanceId !== original.pageInstanceId
+      || read.count !== 1 || read.totalCount !== 1 || read.totalCountExact !== true
+      || read.truncated !== false || read.scanLimitReached !== false || read.matches?.length !== 1
+      || control?.tag !== "select" || control.multiple !== false || control.visible !== true
+      || control.selectedText !== expectedLabel) {
+      throw new CompanionError("local_selection_readback_mismatch", "Fresh exact native single-select label did not match the original signed selection");
+    }
+    const resolution = await this.taskLedger.appendLocalSelectionResolution({ originalOperationKey: entry.idempotencyKey,
+      originalPayload: params.originalPayload, capsuleId: capsule.capsuleId, resolution: {
+        schema: "aos.chrome_companion.local_selection_resolution.v1", resolutionId: createId("selection_resolution"),
+        originalOperationId: entry.operationId, originalFingerprint: entry.fingerprint,
+        currentBinding: { taskId: session.taskId, sessionId: session.sessionId, leaseId: lease.leaseId,
+          generation: session.generation, profileInstanceId: session.profileInstanceId, tabId: params.tabId,
+          pageInstanceId: read.pageInstanceId, windowId: original.windowId, frameId: original.frameId },
+        selectedLabel: control.selectedText, controlTag: control.tag, multiple: control.multiple, url: read.url,
+        optionLabelUnique: true, optionInventoryDigest: payloadDigest(this.ledgerSecret, options),
+        selectedOptionValue: selectedOptions[0].attributes.value ?? null,
+        issuedAt: nowIso(), providerCompletion: false, replayAllowed: false,
+        disposition: "local_selection_observed_original_effect_history_preserved",
+      } }, { brokerEvidence: true });
+    return { resolved: true, resolutionId: resolution.resolutionId, originalOperationKey: entry.idempotencyKey,
+      originalOperationState: entry.state, originalCapsuleState: capsule.state, selectedLabel: resolution.selectedLabel,
+      observedScope: "local_selection_only", providerCompletion: false, replayAllowed: false, actionsReplayed: 0,
+      effectiveSettlement: this.taskLedger.localSelectionSettlement(capsule) };
+  }
+
+  async #readUploadConfirmationFiles(peer, { session, lease, tabId, delivery, pageInstanceId, pageUrl }) {
+    if (!delivery?.confirmation_files?.length && delivery?.count_witness) {
+      const witness = delivery.count_witness;
+      const count = await this.#executeOperation(peer, { sessionId: session.sessionId, leaseId: lease.leaseId,
+        method: "page.query", params: { tabId, locator: witness.locator, limit: 1 } });
+      if (!Number.isSafeInteger(count?.totalCount) || count.totalCountExact !== true || count.scanLimitReached === true
+        || !Number.isSafeInteger(witness.before) || !Number.isSafeInteger(witness.required_increase)
+        || count.totalCount < witness.before + witness.required_increase
+        || count.pageInstanceId !== pageInstanceId || count.url !== pageUrl)
+        throw new CompanionError("upload_site_state_evidence_required", `The upload list count did not grow by ${witness.required_increase} (before ${witness.before}, now ${count?.totalCount ?? "unknown"}); inspect without re-uploading`);
+      return [{ count_witness: true, before: witness.before, observed: count.totalCount, required_increase: witness.required_increase,
+        query_digest: payloadDigest(this.ledgerSecret, { locator: witness.locator, totalCount: count.totalCount }) }];
+    }
+    const files = delivery?.confirmation_files;
+    if (!Array.isArray(files) || !files.length || files.length !== delivery.filename_sha256?.length
+      || new Set(files.map(file => file.filename_sha256)).size !== files.length
+      || files.some(file => !delivery.filename_sha256.includes(file.filename_sha256) || !/^[0-9a-f]{64}$/u.test(file.file_sha256)))
+      throw new CompanionError("upload_site_state_evidence_required", "Every assigned file requires its original bound attachment-ready locator and content digest; inspect without re-uploading");
+    const evidence = [];
+    const seenWitnesses = new Set();
+    for (const file of files) {
+      // A one-file preview (LinkedIn's image editor shows the same image as a
+      // large preview and a thumbnail) may match a few nodes; any visible one
+      // proves the attachment. Filename rows must stay unique.
+      const previewSingle = file.preview_only === true && files.length === 1;
+      const query = await this.#executeOperation(peer, { sessionId: session.sessionId, leaseId: lease.leaseId,
+        method: "page.query", params: { tabId, locator: file.locator, limit: previewSingle ? 10 : 2 } });
+      const countOk = previewSingle
+        ? Number.isSafeInteger(query?.count) && query.count >= 1 && query.count <= 10 && Array.isArray(query.matches) && query.matches.length >= 1
+        : Number.isSafeInteger(query?.count) && query.count === 1 && Array.isArray(query.matches) && query.matches.length === 1
+          && query.totalCount === 1 && query.totalCountExact === true && query.truncated === false;
+      if (!countOk || query.scanLimitReached !== false
+        || query.matches[0].visible !== true || typeof query.matches[0].nodeIdentity !== "string" || !query.matches[0].nodeIdentity
+        || seenWitnesses.has(query.matches[0].nodeIdentity)
+        || query.pageInstanceId !== pageInstanceId || query.url !== pageUrl)
+        throw new CompanionError("upload_site_state_evidence_required", "An assigned file has no fresh attachment-ready evidence in the exact original page; inspect without re-uploading");
+      seenWitnesses.add(query.matches[0].nodeIdentity);
+      if (file.preview_only === true && files.length === 1) {
+        evidence.push({ filename_sha256: file.filename_sha256, file_sha256: file.file_sha256, preview_only: true,
+          query_digest: payloadDigest(this.ledgerSecret, { locator: file.locator, matches: query.matches }) });
+        continue;
+      }
+      if (!file.filename_locator || file.filename_locator.exact !== true
+        || createHash("sha256").update(String(file.filename_locator.text).replace(/\s+/gu, " ").trim()).digest("hex") !== file.filename_sha256)
+        throw new CompanionError("upload_original_payload_required", "Exact original filename proof is missing; provide owner-signed originalUploadPayload and explicit confirmationFiles, never re-upload");
+      const filenameQuery = await this.#executeOperation(peer, { sessionId: session.sessionId, leaseId: lease.leaseId,
+        method: "page.query", params: { tabId, locator: file.filename_locator, limit: 2 } });
+      if (filenameQuery?.count !== 1 || filenameQuery.matches?.length !== 1 || filenameQuery.totalCount !== 1
+        || filenameQuery.totalCountExact !== true || filenameQuery.truncated !== false || filenameQuery.scanLimitReached !== false
+        || filenameQuery.matches[0].visible !== true
+        || String(filenameQuery.matches[0].text).replace(/\s+/gu, " ").trim() !== String(file.filename_locator.text).replace(/\s+/gu, " ").trim()
+        || filenameQuery.pageInstanceId !== pageInstanceId || filenameQuery.url !== pageUrl)
+        throw new CompanionError("upload_site_state_evidence_required", "The exact original filename must have one visible full-count witness within its attachment-ready row; renamed files require explicit mapping, never re-upload");
+      evidence.push({ filename_sha256: file.filename_sha256, file_sha256: file.file_sha256,
+        query_digest: payloadDigest(this.ledgerSecret, { locator: file.locator, matches: query.matches,
+          filenameLocator: file.filename_locator, filenameMatches: filenameQuery.matches }) });
+    }
+    return evidence;
   }
 
   async #inspectTaskReconciliation(peer, params) {
@@ -5968,12 +7394,95 @@ export class CompanionBroker extends EventEmitter {
     if (successQuery.length < 8 || successQuery.length > 500) {
       throw new CompanionError("reconciliation_success_query_invalid", "Reconciliation successQuery must contain 8 to 500 characters");
     }
+    let uploadDelivery = binding.capsule.effect?.uploadDelivery;
+    const uploadConfirmation = ["upload_confirmation_required", "upload_confirmation_not_observed"].includes(binding.capsule.blocker?.code)
+      && uploadDelivery?.applied === true;
+    if (uploadConfirmation && params.originalUploadPayload !== undefined) {
+      const original = this.taskLedger.get(params.originalOperationKey);
+      const payload = params.originalUploadPayload, owner = original?.binding;
+      if (!original || !["page.upload", "page.uploadMultiple"].includes(owner?.method) || original.dispatchCount !== 1
+        || original.idempotencyKey !== binding.capsule.effect?.failedOperationKey
+        || original.operationId !== binding.capsule.effect?.failedOperationId
+        || original.operationId !== params.originalOperationId || original.fingerprint !== params.originalFingerprint
+        || original.fingerprint !== payloadDigest(this.ledgerSecret, { binding: owner, payload })
+        || owner.taskId !== binding.taskId || owner.runId !== binding.runId || owner.tabId !== binding.tabId
+        || owner.profileInstanceId !== binding.capsule.target?.profileInstanceId
+        || owner.generation !== binding.capsule.target?.generation
+        || owner.sessionId !== binding.capsule.target?.sessionId
+        || owner.targetIdentity?.pageInstanceId !== binding.capsule.target?.pageInstanceId
+        || !original.idempotencyKey.startsWith(`${binding.idempotencyKey}:`))
+        throw new CompanionError("upload_original_payload_invalid", "Exact original upload operation, owner and saved HMAC must match before confirmation readback");
+      await this.taskLedger.verifyAndConsumeAuthority(params.authority, { secrets: this.issuerSecrets,
+        payload: uploadReconciliationPayload(params), expected: { runId: binding.runId, taskId: binding.taskId,
+          ownerKey: session.sessionId, method: "task.reconciliation.inspect", intent: "inspect_original_upload_confirmation_only" } });
+      const files = owner.method === "page.upload" ? [payload.file] : payload.files;
+      if (!Array.isArray(files) || !files.length || !Array.isArray(params.confirmationFiles) || params.confirmationFiles.length !== files.length)
+        throw new CompanionError("upload_confirmation_files_invalid", "Provide one explicit attachment-ready locator for every original assigned file");
+      const confirmations = files.map(file => {
+        const matches = params.confirmationFiles.filter(item => item.filename === file.name);
+        const sha256 = createHash("sha256").update(Buffer.from(file.dataBase64 ?? "", "base64")).digest("hex");
+        const nameDigest = createHash("sha256").update(file.name.replace(/\s+/gu, " ").trim()).digest("hex");
+        if (matches.length !== 1 || !matches[0].locator || file.sha256 !== undefined && file.sha256 !== sha256
+          || !uploadDelivery.filename_sha256?.includes(nameDigest))
+          throw new CompanionError("upload_original_payload_invalid", "Original file bytes, filename digest and readiness locator must agree");
+        if ([matches[0].locator.nth, matches[0].locator.ordinal, matches[0].locator.last].some(value => value !== undefined))
+          throw new CompanionError("upload_confirmation_locator_invalid", "Attachment-ready proof requires one unique row; omit nth, ordinal and last");
+        if (matches[0].previewOnly === true) {
+          if (files.length !== 1) throw new CompanionError("upload_confirmation_preview_invalid", "previewOnly confirmation is limited to one uploaded file");
+          return { filename_sha256: nameDigest, file_sha256: sha256, preview_only: true, filename_locator: null, locator: matches[0].locator };
+        }
+        return { filename_sha256: nameDigest, file_sha256: sha256,
+          filename_locator: { text: file.name, exact: true, anyOf: [matches[0].locator, { within: matches[0].locator }] },
+          locator: { ...matches[0].locator, allOf: [...(matches[0].locator.allOf ?? []), { hasText: file.name }] } };
+      });
+      uploadDelivery = { ...uploadDelivery, confirmation_files: confirmations,
+        original_operation_key: original.idempotencyKey, original_operation_id: original.operationId, original_fingerprint: original.fingerprint };
+    }
+    if (uploadConfirmation && params.originalUploadPayload === undefined && Array.isArray(params.confirmationFiles) && params.confirmationFiles.length) {
+      // Late registration: the upload was dispatched without a usable
+      // confirmation method (or the declared one cannot match on this site).
+      // Bind the caller's confirmation-only locators to the files recorded at
+      // dispatch. This never re-uploads and never claims provider success.
+      const recorded = Array.isArray(uploadDelivery.assigned_files) && uploadDelivery.assigned_files.length
+        ? uploadDelivery.assigned_files
+        : (uploadDelivery.filename_sha256 ?? []).map(nameDigest => ({ filename_sha256: nameDigest,
+          file_sha256: createHash("sha256").update(`late_registration:${nameDigest}`).digest("hex") }));
+      if (params.confirmationFiles.length !== recorded.length)
+        throw new CompanionError("upload_confirmation_files_invalid", `Provide exactly one confirmationFiles item per uploaded file (${recorded.length}), e.g. [{ filename: "<original file name>", locator: { role: "img" }, previewOnly: true }]`);
+      const previewItems = params.confirmationFiles.filter(item => item?.previewOnly === true);
+      if (previewItems.length && recorded.length !== 1)
+        throw new CompanionError("upload_confirmation_preview_invalid", "previewOnly confirmation is limited to one uploaded file");
+      const confirmations = params.confirmationFiles.map(item => {
+        const nameDigest = createHash("sha256").update(String(item?.filename ?? "").replace(/\s+/gu, " ").trim()).digest("hex");
+        const file = recorded.find(entry => entry.filename_sha256 === nameDigest);
+        if (!file || !item.locator || typeof item.locator !== "object")
+          throw new CompanionError("upload_confirmation_files_invalid", "Each confirmationFiles item needs the original uploaded file name (as passed to page.upload) and a locator object");
+        if ([item.locator.nth, item.locator.ordinal, item.locator.last].some(value => value !== undefined))
+          throw new CompanionError("upload_confirmation_locator_invalid", "Attachment-ready proof requires one unique row; omit nth, ordinal and last");
+        if (item.previewOnly === true)
+          return { filename_sha256: nameDigest, file_sha256: file.file_sha256, preview_only: true, filename_locator: null, locator: item.locator };
+        return { filename_sha256: nameDigest, file_sha256: file.file_sha256,
+          filename_locator: { text: item.filename, exact: true, anyOf: [item.locator, { within: item.locator }] },
+          locator: { ...item.locator, allOf: [...(item.locator.allOf ?? []), { hasText: item.filename }] } };
+      });
+      uploadDelivery = { ...uploadDelivery, confirmation_files: confirmations, late_registered: true };
+    }
+    if (uploadConfirmation && !uploadDelivery.confirmation_files?.length && !uploadDelivery.count_witness)
+      throw new CompanionError("upload_original_payload_required", "This retained upload predates per-file proof: provide exact originalUploadPayload, operation key/id/fingerprint and confirmationFiles for owner-signed readback; never re-upload");
+    if (uploadConfirmation && uploadDelivery.filename_sha256?.includes(createHash("sha256").update(successQuery).digest("hex"))) {
+      throw new CompanionError("upload_site_state_evidence_required", "A filename alone does not prove site attachment readiness or provider completion");
+    }
     const semantic = await this.#executeOperation(peer, {
       sessionId: session.sessionId,
       leaseId: binding.lease.leaseId,
       method: "page.snapshot",
       params: { tabId: binding.tabId, maxTextChars: 30_000 },
     });
+    if (binding.localNavigation
+      && localNavigationTargetDigest(this.ledgerSecret, String(semantic?.url ?? ""))
+        !== binding.localNavigation.recordedTargetDigest) {
+      throw new CompanionError("local_navigation_arrival_target_mismatch", "The exact leased tab has not arrived at the recorded navigation target");
+    }
     const query = await this.#executeOperation(peer, {
       sessionId: session.sessionId,
       leaseId: binding.lease.leaseId,
@@ -5983,11 +7492,14 @@ export class CompanionBroker extends EventEmitter {
     if (!Number.isSafeInteger(query?.count) || query.count < 1 || !Array.isArray(query.matches)) {
       throw new CompanionError("reconciliation_success_evidence_not_found", "No visible semantic success evidence matched the exact reconciliation tab");
     }
+    const uploadFilesEvidence = uploadConfirmation ? await this.#readUploadConfirmationFiles(peer, {
+      session, lease: binding.lease, tabId: binding.tabId, delivery: uploadDelivery,
+      pageInstanceId: semantic.pageInstanceId, pageUrl: semantic.url }) : null;
     const visual = await this.#executeOperation(peer, {
       sessionId: session.sessionId,
       leaseId: binding.lease.leaseId,
       method: "page.screenshot",
-      params: { tabId: binding.tabId, restoreActive: true },
+      params: { tabId: binding.tabId, restoreActive: true, quality: 60, maxBytes: 700_000 },
       timeoutMs: 30_000,
     });
     if (visual?.kind !== "screenshot"
@@ -6019,9 +7531,22 @@ export class CompanionBroker extends EventEmitter {
       screenshotDigest: payloadDigest(this.ledgerSecret, visual.dataBase64),
       capturedAt,
       expiresAt,
+      ...(uploadConfirmation ? { proofKind: "upload_site_confirmation", uploadActionIndex: uploadDelivery.action_index, providerSuccessConfirmed: false, uploadFilesEvidence, uploadDeliveryEvidence: uploadDelivery } : {}),
+      ...(binding.localNavigation ? {
+        proofKind: "local_navigation_arrival",
+        operationId: binding.localNavigation.operation.operationId,
+        operationIndex: binding.localNavigation.operationIndex,
+        recordedTargetDigest: binding.localNavigation.recordedTargetDigest,
+      } : {}),
     };
     return {
       kind: "reconciliation_visual_confirmation",
+      ...(uploadConfirmation ? { proof_kind: "upload_site_confirmation", upload_confirmation_observed: true, provider_success_confirmed: false } : {}),
+      ...(binding.localNavigation ? {
+        proof_kind: "local_navigation_arrival",
+        local_navigation_arrival_verified: true,
+        provider_success_confirmed: false,
+      } : {}),
       semantic,
       successEvidence: query,
       visual,
@@ -6065,6 +7590,15 @@ export class CompanionBroker extends EventEmitter {
     const validSignature = typeof signature === "string"
       && secureEqual(signature, payloadDigest(this.ledgerSecret, proofPayload));
     const consumed = typeof signature === "string" && this.consumedReconciliationProofs.has(signature);
+    const localNavigationProof = proofPayload.proofKind === "local_navigation_arrival";
+    const uploadConfirmation = ["upload_confirmation_required", "upload_confirmation_not_observed"].includes(binding.capsule.blocker?.code)
+      && binding.capsule.effect?.uploadDelivery?.applied === true;
+    if (Boolean(binding.localNavigation) !== localNavigationProof
+      || (!localNavigationProof && (uploadConfirmation ? proofPayload.proofKind !== "upload_site_confirmation"
+        || proofPayload.uploadActionIndex !== binding.capsule.effect.uploadDelivery.action_index
+        || proofPayload.providerSuccessConfirmed !== false : proofPayload.proofKind !== undefined))) {
+      throw new CompanionError("reconciliation_visual_proof_kind_invalid", "The signed proof kind does not match the exact unresolved operation");
+    }
     if (proofPayload.schema !== "aos.chrome_companion.reconciliation_visual_proof.v1"
       || !validSignature
       || consumed
@@ -6077,9 +7611,12 @@ export class CompanionBroker extends EventEmitter {
       || proofPayload.profileInstanceId !== session.profileInstanceId
       || proofPayload.generation !== session.generation
       || proofPayload.tabId !== binding.tabId
+      || (localNavigationProof && proofPayload.operationId !== binding.localNavigation.operation.operationId)
+      || (localNavigationProof && proofPayload.operationIndex !== binding.localNavigation.operationIndex)
+      || (localNavigationProof && proofPayload.recordedTargetDigest !== binding.localNavigation.recordedTargetDigest)
       || !Number.isFinite(expiresAt)
       || expiresAt <= Date.now()) {
-      throw new CompanionError("reconciliation_visual_proof_invalid", "Reconciliation proof is stale, consumed, or does not match the exact task/session/lease/tab/generation binding");
+      throw new CompanionError("reconciliation_visual_proof_invalid", "Reconciliation proof is stale, consumed, or does not match the exact task/session/lease/tab/generation binding. Call companion_inspect_reconciliation again with the same lease and pass its reconciliationProof unchanged (proofs last 5 minutes and work once)");
     }
     const semantic = await this.#executeOperation(peer, {
       sessionId: session.sessionId,
@@ -6087,6 +7624,11 @@ export class CompanionBroker extends EventEmitter {
       method: "page.snapshot",
       params: { tabId: binding.tabId, maxTextChars: 30_000 },
     });
+    if (binding.localNavigation
+      && localNavigationTargetDigest(this.ledgerSecret, String(semantic?.url ?? ""))
+        !== binding.localNavigation.recordedTargetDigest) {
+      throw new CompanionError("local_navigation_arrival_target_mismatch", "The exact leased tab has moved away from the recorded navigation target");
+    }
     const query = await this.#executeOperation(peer, {
       sessionId: session.sessionId,
       leaseId: binding.lease.leaseId,
@@ -6097,10 +7639,26 @@ export class CompanionBroker extends EventEmitter {
       sessionId: session.sessionId,
       leaseId: binding.lease.leaseId,
       method: "page.screenshot",
-      params: { tabId: binding.tabId, restoreActive: true },
+      params: { tabId: binding.tabId, restoreActive: true, quality: 60, maxBytes: 700_000 },
       timeoutMs: 30_000,
     });
     const queryDigest = payloadDigest(this.ledgerSecret, { successQuery: proofPayload.successQuery, matches: query?.matches ?? [] });
+    if (uploadConfirmation) {
+      // Evidence rebuilt from the exact original payload (e.g. previewOnly) supersedes the
+      // locators recorded at dispatch; its original operation is re-checked just below.
+      const delivery = proofPayload.uploadDeliveryEvidence?.original_operation_key || proofPayload.uploadDeliveryEvidence?.late_registered === true
+        || !binding.capsule.effect.uploadDelivery.confirmation_files?.length
+        ? proofPayload.uploadDeliveryEvidence : binding.capsule.effect.uploadDelivery;
+      if (delivery?.original_operation_key) {
+        const original = this.taskLedger.get(delivery.original_operation_key);
+        if (!original || original.operationId !== delivery.original_operation_id || original.fingerprint !== delivery.original_fingerprint)
+          throw new CompanionError("upload_original_payload_invalid", "Original upload receipt changed after inspection; do not re-upload");
+      }
+      const fresh = await this.#readUploadConfirmationFiles(peer, { session, lease: binding.lease, tabId: binding.tabId,
+        delivery, pageInstanceId: semantic.pageInstanceId, pageUrl: semantic.url });
+      if (payloadDigest(this.ledgerSecret, fresh) !== payloadDigest(this.ledgerSecret, proofPayload.uploadFilesEvidence))
+        throw new CompanionError("reconciliation_readback_changed", "The assigned-file attachment evidence changed after inspection; do not re-upload");
+    }
     const screenshotDigest = visual?.dataBase64
       ? payloadDigest(this.ledgerSecret, visual.dataBase64)
       : null;
@@ -6127,36 +7685,103 @@ export class CompanionBroker extends EventEmitter {
       completion: {
         ...binding.capsule.completion,
         reconciliation: {
-          schema: "aos.chrome_companion.reconciliation_completion.v1",
-          status: "completed",
+          schema: binding.localNavigation
+            ? "aos.chrome_companion.local_navigation_arrival_confirmation.v1"
+            : "aos.chrome_companion.reconciliation_completion.v1",
+          status: binding.localNavigation ? "local_navigation_arrival_confirmed" : "completed",
+          ...(binding.localNavigation ? {
+            operationIndex: binding.localNavigation.operationIndex,
+            recordedTargetDigest: binding.localNavigation.recordedTargetDigest,
+            providerSuccessConfirmed: false,
+          } : {}),
+          ...(uploadConfirmation ? { uploadConfirmationObserved: true, providerSuccessConfirmed: false,
+            uploadActionIndex: binding.capsule.effect.uploadDelivery.action_index } : {}),
           successQuerySha256: createHash("sha256").update(proofPayload.successQuery, "utf8").digest("hex"),
           pageUrl: proofPayload.pageUrl,
           completedAt,
         },
-        cleanup: { status: "pending_terminal_session_close" },
+        cleanup: { status: uploadConfirmation ? "pending_unsubmitted_workflow" : "pending_terminal_session_close" },
       },
+      // Reconciling one uncertain operation settles that operation, not the
+      // task: keep the tab as an ordinary retained task tab so the same task
+      // can continue its remaining steps on it. Terminal session close still
+      // cleans completed retained tabs.
       retention: {
-        policy: "cleanup",
+        policy: uploadConfirmation ? "retain_until_resume" : "retain",
         resumeTokenRequired: false,
         userHelpRequired: false,
-        reason: null,
+        reason: uploadConfirmation ? "attachment_confirmed_workflow_unsubmitted" : null,
         whyTabWasKept: null,
         requiredUserAction: null,
         resumeAction: null,
       },
-    }, { brokerEvidence: true, proofDigest: payloadDigest(this.ledgerSecret, proofPayload) });
+      }, {
+        brokerEvidence: true,
+        proofDigest: payloadDigest(this.ledgerSecret, proofPayload),
+        ...(uploadConfirmation ? { proofKind: "upload_site_confirmation" } : {}),
+        ...(binding.localNavigation ? {
+          proofKind: "local_navigation_arrival",
+          operationIndex: binding.localNavigation.operationIndex,
+          recordedTargetDigest: binding.localNavigation.recordedTargetDigest,
+        } : {}),
+      });
+    if (binding.localNavigation) {
+      const otherUnresolved = completedCapsule.effect?.localNavigationOtherUnresolvedEffects ?? 1;
+      const terminalCleanupReady = otherUnresolved === 0;
+      await this.taskLedger.recordTaskTab({
+        ...binding.taskTab,
+        lifecycleState: "failed",
+        retentionPolicy: terminalCleanupReady ? "cleanup" : "retain_until_resume",
+        resumeToken: null,
+        userHelpRequired: false,
+        retentionReason: terminalCleanupReady ? null : "ai_reconciliation_pending",
+        whyTabWasKept: terminalCleanupReady ? null : "Another unresolved operation in this exact run still requires signed reconciliation.",
+        requiredUserAction: null,
+        resumeAction: terminalCleanupReady ? null : "reconcile_other_unresolved_operation_without_replay",
+        updatedAt: completedAt,
+      });
+      this.taskTabs.set(
+        this.#tabKey(session.profileInstanceId, binding.tabId),
+        this.taskLedger.getTaskTab(session.profileInstanceId, binding.tabId),
+      );
+      return {
+        schema: "aos.chrome_companion.local_navigation_arrival_maintenance.v1",
+        status: "local_navigation_arrival_confirmed",
+        run_id: binding.runId,
+        task_id: binding.taskId,
+        idempotency_key: binding.idempotencyKey,
+        capsule_id: binding.capsuleId,
+        tab_id: binding.tabId,
+        state: "failed",
+        effect_state: "known_effect",
+        reconciliation_required: false,
+        action_progress: completedCapsule.effect?.actionProgress ?? null,
+        operation_index: binding.localNavigation.operationIndex,
+        provider_success_confirmed: false,
+        remaining_action_dispatch_allowed: false,
+        terminal_cleanup_ready: terminalCleanupReady,
+        other_unresolved_effect_count: otherUnresolved,
+        next_action: terminalCleanupReady
+          ? "companion_close_session_task_terminal_true"
+          : "reconcile_other_unresolved_operation_without_replay",
+        external_action_executed: false,
+        original_failure: completedCapsule.blocker,
+        completed_at: completedAt,
+      };
+    }
     const remainingActions = completedCapsule.effect?.actionProgress?.remaining_action_indices ?? [];
     const resumeRemaining = remainingActions.length > 0;
+    const retainWorkflow = resumeRemaining || uploadConfirmation;
     await this.taskLedger.recordTaskTab({
       ...binding.taskTab,
       lifecycleState: completedCapsule.state,
-      retentionPolicy: resumeRemaining ? "retain_until_resume" : "cleanup",
+      retentionPolicy: retainWorkflow ? "retain_until_resume" : "retain",
       resumeToken: null,
       userHelpRequired: false,
-      retentionReason: resumeRemaining ? "partial_actions_applied" : null,
+      retentionReason: uploadConfirmation ? "attachment_confirmed_workflow_unsubmitted" : resumeRemaining ? "partial_actions_applied" : null,
       whyTabWasKept: null,
       requiredUserAction: null,
-      resumeAction: resumeRemaining ? "read_back_same_target_then_continue_remaining_actions" : null,
+      resumeAction: resumeRemaining ? "read_back_same_target_then_continue_remaining_actions" : uploadConfirmation ? "continue_unsubmitted_workflow_or_explicitly_abandon" : null,
       updatedAt: completedAt,
     });
     this.taskTabs.set(
@@ -6165,7 +7790,8 @@ export class CompanionBroker extends EventEmitter {
     );
     return {
       schema: "aos.chrome_companion.reconciliation_completion.v1",
-      status: resumeRemaining ? "ready_to_resume" : "completed",
+      status: resumeRemaining ? "ready_to_resume" : uploadConfirmation ? "upload_confirmation_observed" : "completed",
+      ...(uploadConfirmation ? { upload_confirmation_observed: true, provider_success_confirmed: false, retry_upload: false } : {}),
       run_id: binding.runId,
       task_id: binding.taskId,
       idempotency_key: binding.idempotencyKey,
@@ -6175,8 +7801,10 @@ export class CompanionBroker extends EventEmitter {
       effect_state: "known_effect",
       reconciliation_required: false,
       action_progress: completedCapsule.effect?.actionProgress ?? null,
-      terminal_cleanup_ready: !resumeRemaining,
-      next_action: resumeRemaining ? "companion_prepare_resume" : "companion_close_session_task_terminal_true",
+      terminal_cleanup_ready: !retainWorkflow,
+      task_may_continue: true,
+      continue_on_tab_id: binding.tabId,
+      next_action: resumeRemaining ? "companion_prepare_resume" : uploadConfirmation ? "continue_unsubmitted_workflow_or_explicitly_abandon" : "continue_remaining_task_steps_on_same_tab_or_close_session_task_terminal_true_when_task_done",
       external_action_executed: false,
       completed_at: completedAt,
     };
@@ -6226,20 +7854,35 @@ export class CompanionBroker extends EventEmitter {
       throw new CompanionError("task_status_not_found", "No matching task operation exists for the signed run/task binding");
     }
     const operationState = entry?.state ?? null;
-    const lateResultReconciled = operationState === "reconciled" && entry?.brokerEvidence === true;
+    const selectionSettlement = this.taskLedger.localSelectionSettlement(capsule);
+    const settlement = capsuleNoEffectSettlement(capsule, this.taskLedger.listOperations()) ?? selectionSettlement;
+    const unresolvedEffects = this.taskLedger.listOperations().filter(operation => operation.binding?.taskId === taskId
+      && operation.binding?.runId === runId && operationEffectStateForEntry(operation) === "unknown_effect"
+      && !this.taskLedger.localSelectionResolution(operation));
+    const lateResultReconciled = operationState === "reconciled"
+      && entry?.brokerEvidence === true
+      && entry?.localNavigationArrivalReconciled !== true;
     const state = capsule?.state ?? operationState;
+    const localNavigation = capsule?.effect?.idempotencyKey
+      ? this.#localNavigationReconciliationOperation(capsule, capsule.effect.idempotencyKey, capsule.resources?.tabId)
+      : null;
+    const localNavigationPending = Boolean(localNavigation);
+    const localNavigationArrivalSettled = capsule?.effect?.localNavigationArrivalSettled === true;
     const effectState = normalizeOperationEffectState(
-      capsule?.effect?.effectState
+      settlement?.effectState ?? capsule?.effect?.effectState
         ?? entry?.effectState
         ?? entry?.operationEffectState,
       operationEffectStateForEntry(entry ?? capsule ?? {}),
     );
-    const effectRequiresReconciliation = effectState === "unknown_effect"
-      && operationRequiresReconciliation(entry ?? capsule ?? {});
+    const effectRequiresReconciliation = unresolvedEffects.length > 0 || effectState === "unknown_effect"
+      && (operationRequiresReconciliation(entry ?? capsule ?? {}) || localNavigationPending);
     const currentProfile = this.profiles.get(session.profileInstanceId);
     const trackedTabId = capsule?.resources?.tabId ?? entry?.binding?.tabId ?? null;
     const trackedGeneration = capsule?.target?.generation ?? entry?.binding?.generation ?? null;
     const trackedProfileInstanceId = capsule?.target?.profileInstanceId ?? entry?.binding?.profileInstanceId ?? null;
+    const unresolvedNavigation = unresolvedLocalNavigationForTarget(this.taskLedger.listOperations(), {
+      profileInstanceId: session.profileInstanceId, tabId: trackedTabId,
+    });
     const ledgerTab = Number.isSafeInteger(trackedTabId)
       ? (this.taskTabs.get(this.#tabKey(session.profileInstanceId, trackedTabId))
         || this.taskLedger.getTaskTab(session.profileInstanceId, trackedTabId))
@@ -6251,7 +7894,9 @@ export class CompanionBroker extends EventEmitter {
     const ledgerTabPresent = Boolean(profileMatches && ledgerTab && ledgerTab.taskId === taskId && ledgerTab.runId === runId);
     const ledgerOnlyTab = ledgerTabPresent && isLedgerOnlyTaskTab(ledgerTab);
     const tabQuarantined = Boolean(ledgerTabPresent && ledgerTab?.quarantine);
-    const resumeDisposition = state === "completed"
+    const resumeDisposition = localNavigationArrivalSettled
+      ? "failure_preserved_cleanup_only"
+      : state === "completed"
       ? "completed"
       : lateResultReconciled
         ? (currentProfileConnected && generationMatches && ledgerTabPresent && !tabQuarantined
@@ -6289,12 +7934,16 @@ export class CompanionBroker extends EventEmitter {
           ? {
               retained: true,
               user_help_required: false,
-              retention_reason: lateResultReconciled ? "ai_terminal_readback_pending" : "ai_reconciliation_pending",
+              retention_reason: localNavigationPending ? "local_ui_navigation_arrival_pending" : lateResultReconciled ? "ai_terminal_readback_pending" : "ai_reconciliation_pending",
               why_tab_was_kept: lateResultReconciled
                 ? "The broker received a late successful result; Codex must perform one same-target readback before terminal cleanup."
+                : localNavigationPending
+                  ? "A local tabs.navigate acknowledgement is unknown; verify arrival at its recorded target without replay."
                 : "The task-owned tab is retained temporarily while Codex reconciles an unknown external effect without replaying it.",
               required_user_action: null,
-              resume_action: lateResultReconciled
+              resume_action: localNavigationPending
+                ? "signed_local_navigation_arrival_readback_then_cleanup"
+                : lateResultReconciled
                 ? "same_target_readback_then_terminal_cleanup"
                 : "signed_task_status_readback_then_cleanup_when_reconciled",
             }
@@ -6317,7 +7966,7 @@ export class CompanionBroker extends EventEmitter {
       .find((ack) => ack.destinationTaskId === taskId && ack.runId === runId) ?? null;
     return {
       schema: "aos.chrome_companion.task_status.v1",
-      result: effectRequiresReconciliation || state === "reconciliation_required" ? "reconciliation_required" : "readback",
+      result: effectRequiresReconciliation || (state === "reconciliation_required" && !settlement) ? "reconciliation_required" : "readback",
       run_id: runId,
       task_id: taskId,
       idempotency_key: idempotencyKey ?? capsule?.effect?.idempotencyKey ?? null,
@@ -6327,7 +7976,26 @@ export class CompanionBroker extends EventEmitter {
       operation_state: operationState,
       effect_state: effectState,
       effectState,
+      effective_settlement: settlement,
+      local_selection_settlement: selectionSettlement,
+      unresolved_operation_count: unresolvedEffects.length,
       reconciliation_required: effectRequiresReconciliation,
+      // This is a historical target record read through a currently valid
+      // owner session. A past profile failure is not a fresh shared blocker.
+      ...blockerRecoveryContext({ code: "reconciliation_required", taskId, runId,
+        profileInstanceId: session.profileInstanceId, tabId: capsule?.resources?.tabId,
+        targetKey: capsule?.target?.targetKey, nextAction: unresolvedNavigation.length > 0
+          ? "reconcile_original_navigation_with_fresh_exact_target_evidence" : effectRequiresReconciliation
+          ? "perform_one_owner_signed_reconciliation_readback"
+          : "fresh_status_and_exact_owner_readback" }),
+      local_navigation_arrival_pending: localNavigationPending,
+      local_navigation_arrival_settled: localNavigationArrivalSettled,
+      local_navigation_operation_index: localNavigation?.operationIndex ?? capsule?.effect?.localNavigationOperationIndex ?? null,
+      remaining_action_dispatch_allowed: unresolvedEffects.length === 0 && unresolvedNavigation.length === 0 && !localNavigationPending && !localNavigationArrivalSettled
+        && (!selectionSettlement || currentProfileConnected && generationMatches && ledgerTabPresent && !tabQuarantined
+          && taskTabIdentityConsistent(this.ledgerSecret, ledgerTab))
+        && (state !== "reconciliation_required" || Boolean(settlement)),
+      unresolved_local_navigation_count: unresolvedNavigation.length,
       broker_evidence: entry?.brokerEvidence === true,
       late_result_reconciled: lateResultReconciled,
       target: capsule?.target ?? null,
@@ -6359,8 +8027,13 @@ export class CompanionBroker extends EventEmitter {
       reconciliation_generation_rebind: capsule?.reconciliationGenerationRebind ?? null,
       resume_disposition: resumeDisposition,
       continuation_allowed: state !== "completed"
+        && (!selectionSettlement || currentProfileConnected && generationMatches && ledgerTabPresent && !tabQuarantined
+          && taskTabIdentityConsistent(this.ledgerSecret, ledgerTab))
+        && unresolvedNavigation.length === 0
         && state !== "awaiting_user"
-        && state !== "reconciliation_required"
+        && (state !== "reconciliation_required" || Boolean(settlement))
+        && !localNavigationPending
+        && !localNavigationArrivalSettled
         && !effectRequiresReconciliation
         && !["visible_captcha_widget_user_required", "user_authentication", "owner_sso_required", "company_connection_ref_missing"].includes(capsule?.blocker?.code),
       tab_retention: tabRetention,
@@ -6376,6 +8049,155 @@ export class CompanionBroker extends EventEmitter {
    * controller one deterministic next action and a signed effect proof when
    * an operation/capsule already exists.
    */
+  async #recoverTarget(peer, params) {
+    const session = this.#requireOwnedSession(peer, params.sessionId);
+    const payload = targetRecoveryPayload(params);
+    if (Object.keys(params).some(key => key !== "authority" && !Object.hasOwn(payload, key))) {
+      throw new CompanionError("target_recovery_payload_invalid", "Recovery accepts only its exact target replacement payload");
+    }
+    for (const [key, value] of Object.entries(payload)) {
+      if (key !== "oldTabId") requireString(value, key);
+    }
+    await this.taskLedger.verifyAndConsumeAuthority(params.authority, {
+      secrets: this.issuerSecrets, payload,
+      expected: { taskId: payload.taskId, runId: payload.runId, ownerKey: session.sessionId,
+        method: "task.recover_target", intent: "recover_missing_target", idempotencyKey: payload.idempotencyKey,
+        targetOrigin: new URL(payload.intendedUrl).origin },
+    });
+    await this.#assertTaskImplementationAllowed(payload.taskId);
+    const source = this.taskLedger.getTaskCapsule(payload.sourceCapsuleId);
+    const { intendedUrl } = validateTargetRecoverySource(source, this.taskLedger.listOperations(), payload, session);
+    const oldRecord = this.taskLedger.getTaskTab(session.profileInstanceId, payload.oldTabId);
+    if (oldRecord && (!taskTabIdentityConsistent(this.ledgerSecret, oldRecord)
+      || oldRecord.taskId !== payload.taskId || oldRecord.runId !== payload.runId
+      || oldRecord.sessionId !== source.target.sessionId || oldRecord.generation !== source.target.generation
+      || oldRecord.capsuleId !== source.capsuleId || oldRecord.targetKey !== source.target.targetKey
+      || oldRecord.userHelpRequired || oldRecord.handoffSourceTaskId || oldRecord.transferredAt)) {
+      throw new CompanionError("target_recovery_ownership_mismatch", "The old target record does not belong to the exact failed capsule");
+    }
+    if (this.taskLedger.listTaskCapsules().some(capsule => capsule.capsuleId !== source.capsuleId
+      && capsule.taskId === payload.taskId && capsule.runId === payload.runId
+      && (capsule.retention?.userHelpRequired || capsule.effect?.awaitedEvent
+        || ["awaiting_user", "reconciliation_required", "executing", "admitted", "target_bound", "pre_read", "post_read"].includes(capsule.state)
+        || ["unknown_effect", "known_effect"].includes(capsule.effect?.effectState)))) {
+      throw new CompanionError("target_recovery_prior_effects", "Other run progress prevents target replacement");
+    }
+    const reservationKey = `${session.profileInstanceId}:${session.generation}:${payload.taskId}:${source.target.targetKey}`;
+    if (this.taskTargetReservations.has(reservationKey) || this.tabLeaseIndex.has(this.#tabKey(session.profileInstanceId, payload.oldTabId))) {
+      throw new CompanionError("target_resource_busy", "The source target is reserved or leased");
+    }
+    this.taskTargetReservations.set(reservationKey, session.sessionId);
+    let lease;
+    let reservation;
+    let capsule;
+    const receipt = { schema: "aos.chrome_companion.target_recovery.v1", task_id: payload.taskId, run_id: payload.runId,
+      source_capsule_id: source.capsuleId, original_operation_id: payload.originalOperationId,
+      original_operation_key: payload.originalOperationKey, old_tab_id: payload.oldTabId,
+      idempotency_key: payload.idempotencyKey, actions_replayed: 0, original_action_dispatched: false,
+      replay_allowed: false, continuation_allowed: false, external_action_executed: false };
+    try {
+      // Only a fresh successful inventory lookup proves absence. A timeout,
+      // malformed inventory, or an existing exact tab never authorizes create.
+      const inventory = await this.#executeOperation(peer, { sessionId: session.sessionId, method: "tabs.list", params: {} });
+      if (!Array.isArray(inventory) || inventory.some(tab => !Number.isSafeInteger(tab?.id) || tab.id < 0)
+        || new Set(inventory.map(tab => tab.id)).size !== inventory.length) {
+        throw new CompanionError("target_recovery_lookup_unproven", "Fresh inventory did not authoritatively establish target absence");
+      }
+      if (inventory.some(tab => tab.id === payload.oldTabId)) {
+        throw new CompanionError("target_recovery_target_exists", "The recorded exact tab still exists; reserve and inspect it");
+      }
+      // Re-read history after the lookup; in-flight settlement cannot become
+      // an unobserved permission to recreate a target.
+      validateTargetRecoverySource(source, this.taskLedger.listOperations(), payload, session);
+      capsule = normalizeTaskExecutionCapsule({ taskId: payload.taskId, runId: payload.runId,
+        state: "executing", workflowType: source.workflowType, targetKey: source.target.targetKey,
+        canonicalLocator: source.target.canonicalLocator, startUrl: intendedUrl,
+        allowedOrigins: source.target.allowedOrigins, profileInstanceId: session.profileInstanceId,
+        generation: session.generation, sessionId: session.sessionId, retentionPolicy: "retain",
+        effect: { idempotencyKey: payload.idempotencyKey, effectState: "no_dispatch", effectClass: "local_ui",
+          externalActionExecuted: false, reconciliationRequired: false },
+        execution: { ...source.execution, targetRecovery: { sourceCapsuleId: source.capsuleId,
+          originalOperationId: payload.originalOperationId, originalOperationKey: payload.originalOperationKey,
+          oldTabId: payload.oldTabId, originalActionsDispatched: false } },
+      });
+      reservation = await this.taskLedger.reserveTargetRecovery({ sourceCapsuleId: source.capsuleId,
+        originalOperationId: payload.originalOperationId, recoveryIdempotencyKey: payload.idempotencyKey,
+        capsuleId: capsule.capsuleId, binding: { taskId: payload.taskId, runId: payload.runId,
+          ownerKey: session.sessionId, sessionId: session.sessionId, profileInstanceId: session.profileInstanceId,
+          generation: session.generation, tabId: payload.oldTabId, method: "task.recover_target" } });
+      receipt.capsule_id = capsule.capsuleId;
+      receipt.recovery_operation_id = reservation.operationId;
+      await this.taskLedger.putTaskCapsule(capsule);
+      await this.taskLedger.transition(reservation.idempotencyKey, "dispatched");
+      const created = await this.#executeOperation(peer, { sessionId: session.sessionId,
+        method: "tabs.create", taskOwnedRequired: true,
+        params: { url: intendedUrl, active: false, allowedOrigins: source.target.allowedOrigins } },
+      { trustedTask: { authority: params.authority, taskId: payload.taskId, runId: payload.runId,
+        idempotencyKey: payload.idempotencyKey, index: 0, capsule } });
+      if (!Number.isSafeInteger(created?.id) || created.id === payload.oldTabId) {
+        throw new CompanionError("target_recovery_creation_identity_invalid", "Creation returned no distinct new target identity");
+      }
+      receipt.tab_id = created.id;
+      lease = await this.#acquireLease(peer, { sessionId: session.sessionId, tabId: created.id });
+      const fresh = await this.#executeOperation(peer, { sessionId: session.sessionId, leaseId: lease.leaseId,
+        method: "page.snapshot", params: { tabId: created.id, maxTextChars: 30_000 } });
+      if (typeof fresh?.pageInstanceId !== "string" || !fresh.pageInstanceId.trim()
+        || new URL(fresh.url).href !== intendedUrl || (fresh.tabId !== undefined && fresh.tabId !== created.id)) {
+        throw new CompanionError("target_recovery_readback_mismatch", "Fresh snapshot does not prove the exact intended replacement target");
+      }
+      const target = { ...capsule.target, taskId: payload.taskId, tabId: created.id, pageInstanceId: fresh.pageInstanceId,
+        windowId: Number.isSafeInteger(fresh.windowId) ? fresh.windowId : created.windowId,
+        origin: new URL(fresh.url).origin, leaseId: null };
+      const tabRecord = this.taskLedger.getTaskTab(session.profileInstanceId, created.id);
+      if (!tabRecord || tabRecord.capsuleId !== capsule.capsuleId || tabRecord.taskId !== payload.taskId
+        || tabRecord.runId !== payload.runId || tabRecord.sessionId !== session.sessionId) {
+        throw new CompanionError("target_recovery_creation_identity_invalid", "The new target lacks matching broker creation provenance");
+      }
+      await this.taskLedger.recordTaskTab({ ...tabRecord, lifecycleState: "completed", windowId: target.windowId,
+        ...rebuildTaskTabIdentity(this.ledgerSecret, tabRecord, target), updatedAt: nowIso() });
+      this.taskTabs.set(this.#tabKey(session.profileInstanceId, created.id), this.taskLedger.getTaskTab(session.profileInstanceId, created.id));
+      const effect = { ...capsule.effect, effectState: "known_effect", dispatchCount: 1, externalActionExecuted: false };
+      await this.taskLedger.transitionTaskCapsule(capsule.capsuleId, "post_read", {
+        target, resources: { ...capsule.resources, tabId: created.id, exactTabLeaseId: null }, effect,
+        visual: { ...capsule.visual, semanticPostRead: semanticReadback(fresh) } });
+      const finalCapsule = await this.taskLedger.transitionTaskCapsule(capsule.capsuleId, "completed");
+      const creation = this.taskLedger.get(`${payload.idempotencyKey}:0`);
+      await this.taskLedger.transition(reservation.idempotencyKey, "applied", { brokerEvidence: true,
+        createdTabId: created.id, creationOperationId: creation?.operationId, targetIdentity: target,
+        resultDigest: payloadDigest(this.ledgerSecret, { capsuleId: capsule.capsuleId, target }) });
+      return { ...receipt, result: "verified", effect_state: "known_effect", target,
+        target_fingerprint: targetIdentityDigest(this.ledgerSecret, target), capsule: this.#publicTaskCapsule(finalCapsule),
+        creation_operation_id: creation?.operationId, fresh_snapshot: fresh, target_readback_verified: true,
+        next_action: "reserve_new_exact_target_then_use_separate_signed_transaction" };
+    } catch (error) {
+      if (!reservation) throw error;
+      const creation = this.taskLedger.get(`${payload.idempotencyKey}:0`);
+      const uncertain = creation && (creation.state === "unknown_effect"
+        || creation.state !== "applied" && (creation.dispatchCount > 0 || Number.isSafeInteger(creation.createdTabId))
+          && !(creation.effectState === "known_no_effect" && creation.brokerEvidence === true
+            && creation.mutationDispatchProvenance === "authenticated_no_effect" && creation.mutationDispatchAttempted === false));
+      const effectState = uncertain ? "unknown_effect" : creation?.state === "applied" ? "known_effect"
+        : creation?.effectState === "known_no_effect" ? "known_no_effect" : "no_dispatch";
+      const blocker = { code: error?.code ?? "target_recovery_failed", message: String(error?.message ?? error).slice(0, 400) };
+      await this.taskLedger.transition(reservation.idempotencyKey, uncertain ? "unknown_effect" : effectState === "known_effect" ? "applied" : "blocked", {
+        effectState, createdTabId: creation?.createdTabId ?? receipt.tab_id ?? null,
+        creationOperationId: creation?.operationId ?? null, reason: blocker.code,
+        externalActionExecuted: uncertain ? null : false,
+      });
+      const failed = await this.taskLedger.transitionTaskCapsule(capsule.capsuleId, uncertain ? "reconciliation_required" : "failed", {
+        blocker, restartPoint: "read_existing_recovery_receipt_and_exact_target_without_recreating",
+        resources: { ...capsule.resources, tabId: creation?.createdTabId ?? receipt.tab_id ?? null },
+        effect: { ...capsule.effect, effectState, reconciliationRequired: Boolean(uncertain), externalActionExecuted: uncertain ? null : false },
+      });
+      return { ...receipt, result: uncertain ? "unknown_effect" : "blocked", effect_state: effectState,
+        exact_blocker: blocker, creation_operation_id: creation?.operationId ?? null,
+        capsule: this.#publicTaskCapsule(failed), next_action: "read_existing_recovery_receipt_and_exact_target_without_recreating" };
+    } finally {
+      if (lease) this.#deleteLease(lease.leaseId);
+      if (this.taskTargetReservations.get(reservationKey) === session.sessionId) this.taskTargetReservations.delete(reservationKey);
+    }
+  }
+
   async #prepareResume(peer, params) {
     const session = this.#requireOwnedSession(peer, params.sessionId);
     const runId = requireString(params.runId, "runId");
@@ -6444,9 +8266,25 @@ export class CompanionBroker extends EventEmitter {
     const unresolved = this.taskLedger.listOperations()
       .filter((operation) => operation.binding?.taskId === taskId
         && operation.binding?.runId === runId
-        && operation.binding?.profileInstanceId === session.profileInstanceId
-        && (!Number.isSafeInteger(recordedTabId) || operation.binding?.tabId === recordedTabId)
-        && isUnresolvedOperationEffect(operation));
+        && operationEffectStateForEntry(operation) === "unknown_effect"
+        && !this.taskLedger.localSelectionResolution(operation));
+    const unresolvedNavigation = unresolvedLocalNavigationForTarget(this.taskLedger.listOperations(), {
+      profileInstanceId: session.profileInstanceId, tabId: targetTab?.tabId ?? recordedTabId,
+    });
+    const exactFootprint = targetTab && candidateTabs.length === 1 && targetIdentityConsistent === true
+      ? { profileInstanceId: targetTab.profileInstanceId, tabId: targetTab.tabId } : null;
+    const navigationGateIds = new Set(unresolvedNavigation.filter(operation => operationRequiresReconciliation(operation) === false
+      && operation.externalActionExecuted !== true).map(operation => operation.operationId));
+    // Keep the historical run/task count intact, but gate execution by the
+    // trusted physical target. A foreign task's uncertainty on this tab still
+    // blocks it; absent/ambiguous footprints remain conservative.
+    const targetUnresolved = this.taskLedger.listOperations().filter(operation => {
+      if (operationEffectStateForEntry(operation) !== "unknown_effect" || this.taskLedger.localSelectionResolution(operation)) return false;
+      if (!exactFootprint) return operation.binding?.taskId === taskId && operation.binding?.runId === runId;
+      const owner = operation.binding ?? {};
+      return (!owner.profileInstanceId || owner.profileInstanceId === exactFootprint.profileInstanceId)
+        && (!Number.isSafeInteger(owner.tabId) || owner.tabId === exactFootprint.tabId);
+    }).filter(operation => !navigationGateIds.has(operation.operationId));
     let handoff = null;
     let handoffReadError = null;
     try {
@@ -6461,14 +8299,23 @@ export class CompanionBroker extends EventEmitter {
     } catch (error) {
       handoffReadError = { code: error?.code ?? "handoff_gate_read_failed", message: String(error?.message ?? error).slice(0, 400) };
     }
+    const selectionSettlement = this.taskLedger.localSelectionSettlement(matchingCapsule);
+    const settlement = capsuleNoEffectSettlement(matchingCapsule, this.taskLedger.listOperations()) ?? selectionSettlement;
     const effectState = normalizeOperationEffectState(
-      matchingCapsule?.effect?.effectState
+      settlement?.effectState ?? matchingCapsule?.effect?.effectState
         ?? matchingEntry?.effectState
         ?? matchingEntry?.operationEffectState,
       operationEffectStateForEntry(matchingEntry ?? matchingCapsule ?? {}),
     );
+    const localNavigation = matchingCapsule?.effect?.idempotencyKey
+      ? this.#localNavigationReconciliationOperation(
+        matchingCapsule,
+        matchingCapsule.effect.idempotencyKey,
+        matchingCapsule.resources?.tabId,
+      )
+      : null;
     const effectRequiresReconciliation = effectState === "unknown_effect"
-      && operationRequiresReconciliation(matchingEntry ?? matchingCapsule ?? {});
+      && (operationRequiresReconciliation(matchingEntry ?? matchingCapsule ?? {}) || Boolean(localNavigation));
     const profileReady = currentProfile?.connected === true && currentProfile.generation === session.generation;
     const blockers = [];
     if (!profileReady) blockers.push({ code: "session_generation_stale", message: "Current owner session is not bound to a connected profile generation" });
@@ -6486,11 +8333,11 @@ export class CompanionBroker extends EventEmitter {
         receiptSha256: handoff.receiptSha256,
       });
     }
-    if (unresolved.length > 0 || effectRequiresReconciliation) {
+    if (targetUnresolved.length > 0 || effectRequiresReconciliation) {
       blockers.push({
         code: "reconciliation_required",
         message: "An unknown effect must be reconciled before a retry or cleanup",
-        operationIds: unresolved.map((operation) => operation.operationId ?? operation.idempotencyKey).slice(0, 50),
+        operationIds: targetUnresolved.map((operation) => operation.operationId ?? operation.idempotencyKey).slice(0, 50),
       });
     }
     if (matchingCapsule?.state === "awaiting_user" || matchingCapsule?.retention?.userHelpRequired === true) {
@@ -6500,12 +8347,39 @@ export class CompanionBroker extends EventEmitter {
         requiredUserAction: matchingCapsule.retention?.requiredUserAction ?? null,
       });
     }
+    if (matchingCapsule?.effect?.localNavigationArrivalSettled === true) {
+      blockers.push({
+        code: "local_navigation_arrival_maintenance_only",
+        message: "The local navigation arrival was verified, but the original task remains failed; remaining actions are not dispatched by this maintenance proof",
+      });
+    }
     if (targetTab && targetIdentityConsistent === false) {
       blockers.push({ code: "task_tab_identity_mismatch", message: "The persisted target identity does not match the current owner fields" });
     }
+    if (unresolvedNavigation.length > 0) blockers.push({ code: "local_navigation_readback_required",
+      message: "The original reload/navigation on this exact target must be reconciled before external mutations",
+      operationIds: unresolvedNavigation.map(entry => entry.operationId ?? entry.idempotencyKey).slice(0, 50) });
+    for (const blocker of blockers) {
+      Object.assign(blocker, blockerRecoveryContext({ code: blocker.code, taskId, runId,
+        profileInstanceId: session.profileInstanceId, tabId: targetTab?.tabId ?? recordedTabId,
+        targetKey: targetIdentity?.targetKey,
+        nextAction: blocker.code === "source_handoff_implementation_forbidden"
+          ? "complete_destination_no_output_proof_then_return_to_source"
+          : blocker.code === "reconciliation_required" ? "perform_one_owner_signed_reconciliation_readback"
+            : blocker.code === "local_navigation_readback_required" ? "reconcile_original_navigation_with_fresh_exact_target_evidence"
+            : blocker.code === "user_help_required" ? "complete_recorded_user_action_then_prepare_resume_again"
+              : "fresh_status_and_exact_owner_readback" }));
+    }
     const exactBlocker = blockers[0] ?? null;
+    const sharedBlocker = blockers.find(blocker => blocker.block_scope === "broker_connection")
+      ?? blockers.find(blocker => blocker.block_scope === "profile")
+      ?? blockers.find(blocker => blocker.block_scope === "task") ?? exactBlocker;
     const resumeReady = !exactBlocker;
-    const proofIdempotencyKey = idempotencyKey
+    const readbackReady = profileReady && candidateTabs.length <= 1
+      && (!Number.isSafeInteger(recordedTabId) || Boolean(targetTab))
+      && (!targetTab || targetTab.generation === currentGeneration && !targetTab.quarantine && targetIdentityConsistent !== false);
+    const proofEntry = settlement ? this.taskLedger.get(settlement.idempotencyKey) : matchingEntry;
+    const proofIdempotencyKey = settlement?.idempotencyKey ?? idempotencyKey
       ?? matchingCapsule?.effect?.idempotencyKey
       ?? matchingEntry?.idempotencyKey
       ?? `resume:${taskId}:${runId}`;
@@ -6520,19 +8394,19 @@ export class CompanionBroker extends EventEmitter {
         generation: currentGeneration,
         profileInstanceId: session.profileInstanceId,
         targetIdentity: targetIdentity ?? { taskId, sessionId: session.sessionId, generation: currentGeneration, profileInstanceId: session.profileInstanceId },
-        operationId: matchingEntry?.operationId ?? matchingCapsule?.effect?.operationId ?? null,
+        operationId: proofEntry?.operationId ?? matchingCapsule?.effect?.operationId ?? null,
         idempotencyKey: proofIdempotencyKey,
-        method: matchingEntry?.binding?.method ?? "task.prepare_resume",
-        effectClass: matchingEntry?.effectClass ?? matchingCapsule?.effect?.effectClass ?? "external_commit",
-        reconciliationRequired: matchingEntry?.reconciliationRequired !== false
+        method: proofEntry?.binding?.method ?? "task.prepare_resume",
+        effectClass: proofEntry?.effectClass ?? matchingCapsule?.effect?.effectClass ?? "external_commit",
+        reconciliationRequired: settlement ? false : matchingEntry?.reconciliationRequired !== false
           && matchingCapsule?.effect?.reconciliationRequired !== false,
-        dispatchCount: matchingEntry?.dispatchCount ?? matchingCapsule?.effect?.dispatchCount ?? 0,
+        dispatchCount: proofEntry?.dispatchCount ?? matchingCapsule?.effect?.dispatchCount ?? 0,
         effectState,
-        externalActionExecuted: matchingEntry?.externalActionExecuted ?? matchingCapsule?.effect?.externalActionExecuted ?? false,
-        mutationDispatchAttempted: matchingEntry?.mutationDispatchAttempted === true,
+        externalActionExecuted: proofEntry?.externalActionExecuted ?? matchingCapsule?.effect?.externalActionExecuted ?? false,
+        mutationDispatchAttempted: proofEntry?.mutationDispatchAttempted === true,
         cleanup: { state: targetTab ? "pending" : "not_required", tabClosed: false },
         capabilityDigest: currentProfile?.capabilitiesDigest ?? null,
-        resultDigest: matchingEntry?.resultDigest ?? null,
+        resultDigest: proofEntry?.resultDigest ?? null,
       });
     } catch {
       // A resume preparation without an existing operation is still useful;
@@ -6553,6 +8427,8 @@ export class CompanionBroker extends EventEmitter {
       session_generation: session.generation,
       profile_connected: currentProfile?.connected === true,
       effect_state: effectState,
+      effective_settlement: settlement,
+      local_selection_settlement: selectionSettlement,
       // Expose the exact durable capsule selected by (taskId, runId,
       // idempotencyKey/capsuleId).  A resume caller must be able to carry
       // this identifier into the owner-signed reconciliation tools; omitting
@@ -6573,14 +8449,25 @@ export class CompanionBroker extends EventEmitter {
       target_identity_consistent: targetIdentityConsistent,
       task_tab_count: taskTabs.length,
       unresolved_operation_count: unresolved.length,
+      unresolved_operation_count_scope: "task_run",
+      target_unresolved_external_operation_count: targetUnresolved.length,
+      target_unresolved_external_operation_count_scope: exactFootprint ? "profile_tab" : "ambiguous_task_run",
+      target_unresolved_navigation_operation_count: unresolvedNavigation.length,
       handoff,
       exact_blocker: exactBlocker,
       blockers,
+      ...blockerRecoveryContext({ code: sharedBlocker?.code, taskId, runId,
+        profileInstanceId: session.profileInstanceId, tabId: targetTab?.tabId ?? recordedTabId,
+        targetKey: targetIdentity?.targetKey, nextAction: sharedBlocker?.next_action
+          ?? "fresh_status_and_exact_owner_readback" }),
       resume_ready: resumeReady,
+      readback_ready: readbackReady,
+      mutation_resume_allowed: resumeReady,
+      unresolved_local_navigation_count: unresolvedNavigation.length,
       fresh_session_required: false,
       replay_allowed: false,
       target_readback_required: !!targetTab,
-      target_reservation: resumeReady && targetTab ? {
+      target_reservation: readbackReady && targetTab ? {
         tool: "companion_reserve_tab", arguments: { sessionId: session.sessionId, tabId: targetTab.tabId },
         next_tool: "companion_read_page",
       } : null,
@@ -6590,6 +8477,8 @@ export class CompanionBroker extends EventEmitter {
         ? "complete_destination_no_output_proof_then_return_to_source"
         : exactBlocker?.code === "reconciliation_required"
           ? "perform_one_owner_signed_reconciliation_readback"
+          : exactBlocker?.code === "local_navigation_readback_required"
+            ? "reconcile_original_navigation_with_fresh_exact_target_evidence"
           : exactBlocker?.code === "user_help_required"
             ? "complete_recorded_user_action_then_prepare_resume_again"
             : resumeReady
@@ -6736,7 +8625,7 @@ export class CompanionBroker extends EventEmitter {
     });
   }
 
-  async #sendOperation({ profile, session, method, params, timeoutMs, authority, idempotencyKey, binding, fingerprint, allowedOrigins, targetOrigin, taskTabContext, timing = null, dispatchGuard = null }) {
+  async #sendOperation({ profile, session, method, params, timeoutMs, authority, idempotencyKey, binding, fingerprint, allowedOrigins, targetOrigin, taskTabContext, timing = null, dispatchGuard = null, readEvidence = null }) {
     if (timing) timing.record.timings_ms.queue = performance.now() - timing.queuedAt;
     const assertDispatch = () => {
       this.#assertRequestActive();
@@ -6763,10 +8652,21 @@ export class CompanionBroker extends EventEmitter {
         dispatchState: "dispatched",
         dispatchCount: 1,
         mutationDispatchAttempted: mutation,
+        mutationDispatchProvenance: mutation ? "transport_inference" : "not_applicable",
         externalActionExecuted: mutation && reconciliationRequired ? null : false,
         effectClass,
         reconciliationRequired,
       });
+      if (method === "tabs.stopLoading") {
+        // A worker can disappear before returning or reporting detach. The
+        // durable pending record must exist before the sole browser send.
+        try {
+          await this.taskLedger.annotateDebuggerCleanup({ operationId, binding, status: "pending" });
+        } catch (error) {
+          await this.#recordNotDispatched(idempotencyKey, error, operationId);
+          throw error;
+        }
+      }
     }
     if (timing) timing.record.timings_ms.dispatch_persist = performance.now() - dispatchPersistStartedAt;
     // Durability may yield long enough for cancellation, lease release, or a
@@ -6782,7 +8682,10 @@ export class CompanionBroker extends EventEmitter {
           // possible without replaying the command.
           this.pendingOperations.delete(operationId);
           pending.timedOut = true;
+          pending.state = "unknown_effect";
           pending.effectState = mutation ? "unknown_effect" : "known_no_effect";
+          pending.dispatchState = "dispatched";
+          pending.dispatchCount = 1;
           pending.mutationDispatchAttempted = mutation;
           pending.externalActionExecuted = mutation && reconciliationRequired ? null : false;
           pending.effectClass = effectClass;
@@ -6800,12 +8703,13 @@ export class CompanionBroker extends EventEmitter {
             dispatchState: "dispatched",
             dispatchCount: 1,
             mutationDispatchAttempted: mutation,
+            mutationDispatchProvenance: pending?.mutationDispatchProvenance ?? (mutation ? "transport_inference" : "not_applicable"),
             externalActionExecuted: mutation && reconciliationRequired ? null : false,
             effectClass,
             reconciliationRequired,
           },
         );
-        reject(new CompanionError(
+        const failure = new CompanionError(
             mutation ? "operation_effect_unknown" : "operation_timeout",
             mutation && reconciliationRequired
               ? "External-effect mutation timed out after dispatch; effect is unknown and must not be replayed automatically"
@@ -6822,7 +8726,9 @@ export class CompanionBroker extends EventEmitter {
             effectClass,
             reconciliationRequired,
           },
-        ));
+        );
+        if (!mutation) failure[READ_ONLY_COMMAND_FAILURE] = true;
+        reject(failure);
       }, timeoutMs);
       timer.unref();
       this.pendingOperations.set(operationId, {
@@ -6832,8 +8738,12 @@ export class CompanionBroker extends EventEmitter {
         sessionId: session.sessionId,
         idempotencyKey,
         binding,
+        state: "dispatched",
         effectState: "no_dispatch",
+        dispatchState: "dispatched",
+        dispatchCount: 1,
         mutationDispatchAttempted: mutation,
+        mutationDispatchProvenance: mutation ? "transport_inference" : "not_applicable",
         externalActionExecuted: mutation && reconciliationRequired ? null : false,
         effectClass,
         reconciliationRequired,
@@ -6843,6 +8753,7 @@ export class CompanionBroker extends EventEmitter {
         allowedOrigins,
         method,
         timing,
+        readEvidence,
         startedAt: nowIso(),
         timer,
         resolve,
@@ -6867,7 +8778,7 @@ export class CompanionBroker extends EventEmitter {
     });
   }
 
-  #requireOwnedSession(peer, sessionIdValue) {
+  #requireOwnedSession(peer, sessionIdValue, { allowBuildMismatch = false } = {}) {
     const sessionId = requireString(sessionIdValue, "sessionId");
     const session = this.sessions.get(sessionId);
     if (!session || session.peerId !== peer.id) {
@@ -6877,6 +8788,14 @@ export class CompanionBroker extends EventEmitter {
     if (!profile?.connected || profile.generation !== session.generation) {
       this.#deleteSession(sessionId);
       throw new CompanionError("session_generation_stale", "Logical session is stale after profile reconnect");
+    }
+    const provenanceMismatches = this.#profileBuildMismatches(profile);
+    if (provenanceMismatches.length > 0 && !allowBuildMismatch) {
+      throw new CompanionError("companion_build_refresh_required", "The connected Extension is stale; only a signed safe-boundary refresh is permitted", {
+        profileInstanceId: profile.profileInstanceId,
+        buildProvenanceMismatches: provenanceMismatches,
+        allowedRecovery: ["extension.reload", "lease.release", "session.close(taskTerminal=false)"],
+      });
     }
     session.lastSeenAt = Date.now();
     return session;
@@ -6891,6 +8810,8 @@ export class CompanionBroker extends EventEmitter {
       taskId: session.taskId,
       createdAt: session.createdAt,
       capabilityHandshake: session.capabilityHandshake ?? null,
+      buildProvenanceMismatches: this.#profileBuildMismatches(this.profiles.get(session.profileInstanceId)),
+      requiresExtensionRefresh: this.#profileBuildMismatches(this.profiles.get(session.profileInstanceId)).length > 0,
     };
   }
 
@@ -7098,6 +9019,7 @@ export class CompanionBroker extends EventEmitter {
             dispatchState: "dispatched",
             dispatchCount: 1,
             mutationDispatchAttempted: mutation,
+            mutationDispatchProvenance: operation.mutationDispatchProvenance,
             externalActionExecuted: mutation && reconciliationRequired ? null : false,
             effectClass: operation.effectClass,
             reconciliationRequired,

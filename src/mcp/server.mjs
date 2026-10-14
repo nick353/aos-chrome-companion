@@ -3,14 +3,17 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import * as z from "zod/v4";
 import { BrokerClient, withBrokerRequestSignal } from "../client/broker-client.mjs";
-import { PRODUCT_VERSION, PROTOCOL_VERSION } from "../shared/constants.mjs";
+import { PRODUCT_VERSION, PROTOCOL_VERSION, OPERATION_SCHEMA_DIGEST } from "../shared/constants.mjs";
+import { INSTALL_BUILD_ID } from "../shared/build-info.mjs";
 import { transactionActionSchema } from "./action-schema.mjs";
+import { validateLocatorTree } from "./locator-validation.mjs";
 import { toolResult, taskStatus } from "./result.mjs";
 import { normalizeError, CompanionError } from "../shared/errors.mjs";
 import { materializeTransactionActions } from "./action-materializer.mjs";
 import { bindCodexTaskId, McpTaskBindingRegistry, resolveCodexTaskId } from "./task-context.mjs";
 import { normalizeBinaryClipboardRequest } from "../shared/peripheral-policy.mjs";
 import { readUrls } from "./read-urls.mjs";
+import { MAX_SPLIT_ACTIONS, runSplitTransaction } from "./split-transaction.mjs";
 
 let brokerClientPromise;
 function broker() {
@@ -46,6 +49,69 @@ function assertSessionAndLease(args, extra) {
   const taskId = assertSession(args, extra);
   taskBindings.assertLease(args.leaseId, args.sessionId, taskId);
   return taskId;
+}
+
+async function recoverSessionForPrepareResume(client, { previousSessionId, runId, taskId }) {
+  // This is deliberately the only route that may recover after the in-process
+  // MCP binding map has been lost. The host-derived task id is authoritative;
+  // broker status supplies the original profile, and session.open enforces
+  // owner transfer only when the previous owner has no active lease/work.
+  const status = await client.request("status.get", { taskId }, { timeoutMs: 5_000 });
+  const previousSession = (Array.isArray(status.logicalSessions) ? status.logicalSessions : [])
+    .find((entry) => entry.sessionId === previousSessionId
+      && (entry.ownerTaskId ?? entry.taskId) === taskId);
+
+  let profileInstanceId = previousSession?.profileInstanceId ?? null;
+  if (!profileInstanceId) {
+    const taskTabs = (Array.isArray(status.taskTabs) ? status.taskTabs : [])
+      .filter((entry) => entry.taskId === taskId);
+    const runTabs = taskTabs.filter((entry) => entry.runId === runId);
+    const evidenceTabs = runTabs.length > 0 ? runTabs : taskTabs;
+    const taskProfiles = [...new Set(evidenceTabs
+      .map((entry) => entry.profileInstanceId)
+      .filter((value) => typeof value === "string" && value.length > 0))];
+    if (taskProfiles.length === 1) profileInstanceId = taskProfiles[0];
+    else if (taskProfiles.length > 1) {
+      throw new CompanionError("resume_session_profile_ambiguous", "This task has retained state in multiple Companion profiles; resume cannot choose one safely", {
+        taskId, runId, profileInstanceIds: taskProfiles,
+      });
+    }
+  }
+
+  if (!profileInstanceId) {
+    const connectedProfiles = (Array.isArray(status.profiles) ? status.profiles : [])
+      .filter((profile) => profile.connected === true && typeof profile.profileInstanceId === "string");
+    if (connectedProfiles.length !== 1) {
+      throw new CompanionError("resume_session_profile_ambiguous", "A unique original Companion profile could not be established for safe resume", {
+        taskId, runId, connectedProfileCount: connectedProfiles.length,
+      });
+    }
+    profileInstanceId = connectedProfiles[0].profileInstanceId;
+  }
+
+  const profile = (Array.isArray(status.profiles) ? status.profiles : [])
+    .find((entry) => entry.profileInstanceId === profileInstanceId);
+  if (!profile?.connected) {
+    throw new CompanionError("profile_not_connected", "The task's original Companion profile has not reconnected", {
+      profileInstanceId, taskId, runId,
+    });
+  }
+
+  const session = await client.request("session.open", {
+    taskId,
+    profileInstanceId,
+    label: `resume:${runId}`.slice(0, 128),
+  }, { timeoutMs: 5_000 });
+  if (session.taskId !== taskId || session.profileInstanceId !== profileInstanceId) {
+    throw new CompanionError("resume_session_owner_readback_mismatch", "The broker did not return the requested task/profile binding", {
+      expectedTaskId: taskId,
+      receivedTaskId: session.taskId ?? null,
+      expectedProfileInstanceId: profileInstanceId,
+      receivedProfileInstanceId: session.profileInstanceId ?? null,
+    });
+  }
+  taskBindings.bindSession(session.sessionId, taskId);
+  return session;
 }
 
 function guarded(handler, { summarizeTransactionText = false } = {}) {
@@ -102,7 +168,10 @@ const locator = z.object({
   nth: z.number().int().min(0).max(4_999).optional().describe("Zero-based match index after filtering; omit to require one target for mutations"),
   last: z.literal(true).optional().describe("Choose the last match after filtering"),
 }).refine((value) => Object.keys(value).some((key) => !["frameId", "exact", "ordinal", "nth", "last", "ancestor", "within"].includes(key)), "Provide at least one selector field")
-  .refine(value => [value.ordinal, value.nth, value.last].filter(part => part !== undefined).length <= 1, "Use only one of ordinal, nth, or last");
+  .refine(value => [value.ordinal, value.nth, value.last].filter(part => part !== undefined).length <= 1, "Use only one of ordinal, nth, or last")
+  .superRefine((value, context) => {
+    try { validateLocatorTree(value); } catch (error) { context.addIssue({ code: "custom", message: error.message }); }
+  });
 const taskCapsule = z.record(z.string(), z.unknown()).optional()
   .describe("Internal task_execution_capsule_v1 fields; no separate runtime or manual tab configuration is required");
 
@@ -137,6 +206,19 @@ server.registerTool("companion_status", {
     ...taskStatus(result, clientTaskId, args.detail),
     clientTaskId,
     brokerClientConnection: client.connectionInfo(),
+    mcpCatalog: {
+      loadedBuildId: INSTALL_BUILD_ID,
+      loadedOperationSchemaDigest: OPERATION_SCHEMA_DIGEST,
+      brokerBuildId: result.expectedBuildId ?? null,
+      brokerOperationSchemaDigest: result.runtimeAttestation?.operationSchemaDigest ?? null,
+      matchesBroker: result.expectedBuildId === INSTALL_BUILD_ID
+        && result.runtimeAttestation?.operationSchemaDigest === OPERATION_SCHEMA_DIGEST,
+      nextAction: result.expectedBuildId === INSTALL_BUILD_ID
+        && result.runtimeAttestation?.operationSchemaDigest === OPERATION_SCHEMA_DIGEST
+        ? "use_current_task_scoped_tools"
+        : "refresh_this_mcp_connection_at_safe_boundary_then_read_status",
+      hostCatalogRefreshVerified: false,
+    },
     clientOwnedLogicalSessionIds: ownedSessions.map((session) => session.sessionId),
     clientOwnedExactTabLeaseIds: ownedLeases.map((lease) => lease.leaseId),
     clientOwnedTaskTabs: ownedTaskTabs,
@@ -207,7 +289,7 @@ server.registerTool("companion_open_session", {
 }));
 
 server.registerTool("companion_close_session", {
-  description: "Close a logical session, release every exact-tab lease, and by default close completed/failed plus safe pre-effect discovered task-owned tabs. Unknown-effect tabs whose owner/transport was lost use ledger-only retention: the tab is disposable and the signed operation/capsule evidence remains without replay. Returns an owner_cleanup_receipt.v1 with closed, retained, skipped, missing, and unknown-effect evidence. Explicit taskTerminal=false skips terminal cleanup. The closing session’s idle leases stay reserved through cleanup and are then released. User-help, pinned, foreign-leased, and actively executing tabs remain protected.",
+  description: "Close a logical session, release every exact-tab lease, and by default close completed/failed plus safe pre-effect discovered task-owned tabs. Attachment-confirmed but unsubmitted workflows are retained by default; explicit exact-owner taskTerminal=true declares terminal completion or abandonment and permits their cleanup. Unknown-effect tabs whose owner/transport was lost use ledger-only retention: the tab is disposable and the signed operation/capsule evidence remains without replay. Returns an owner_cleanup_receipt.v1 with closed, retained, skipped, missing, and unknown-effect evidence. Zero closed tabs is a task-scoped cleanup result, not a global stop condition. Explicit taskTerminal=false skips terminal cleanup. The closing session’s idle leases stay reserved through cleanup and are then released. User-help, pinned, foreign-leased, and actively executing tabs remain protected.",
   inputSchema: { sessionId, taskTerminal: z.boolean().optional() },
 }, guarded(async (args, extra) => {
   assertSession(args, extra);
@@ -269,6 +351,30 @@ server.registerTool("companion_release_tab", {
   return result;
 }));
 
+
+for (const [name, method, stop] of [
+  ["companion_navigation_diagnostics", "tabs.navigationDiagnostics", false],
+  ["companion_stop_loading", "tabs.stopLoading", true],
+]) {
+  server.registerTool(name, {
+    description: stop
+      ? "Explicitly stop loading once on this task's exact leased tab after matching the committed URL, window and pending URL. Requires optIn:true. This local recovery preserves every original unknown operation; it does not reload, navigate, settle effects or continue provider actions."
+      : "Read navigation diagnostics from browser tab/frame metadata on this task's exact leased tab, including while a pending navigation prevents page injection. Requires fresh signed task/run binding and expected committed URL, window and pending URL. Never replays or settles the original operation.",
+    inputSchema: { sessionId, leaseId, tabId, runId: z.string().min(1),
+      taskId: z.string().min(1).optional(), idempotencyKey: z.string().min(1),
+      expectedUrl: z.string().url(), expectedWindowId: z.number().int().nonnegative(),
+      expectedPendingUrl: z.string().url().nullable(),
+      allowedOrigins: z.array(z.string().url()).min(1).max(32),
+      ...(stop ? { optIn: z.literal(true) } : { sourceOperationId: z.string().min(1).max(256).optional()
+        .describe("Original stop operation ID for owner-scoped cleanup metadata readback; never settles its effect") }),
+    },
+    annotations: { readOnlyHint: !stop },
+  }, guarded(async (args, extra) => {
+    const taskId = bindCodexTaskId(args.taskId, process.env, extra);
+    assertSessionAndLease(args, extra);
+    return (await broker()).requestNavigationRecovery({ ...args, taskId, method });
+  }));
+}
 
 server.registerTool("companion_read_page", {
   description: "Read a bounded semantic snapshot and always capture a visual screenshot from the same exact leased tab. Treat any semantic/visual disagreement as unresolved instead of trusting semantic readback alone.",
@@ -423,6 +529,8 @@ server.registerTool("companion_inspect_visual_point", {
 server.registerTool("companion_query_page", {
   description: "Read exact-tab elements by text or a semantic/CSS locator. Returns match counts, paginated results, and explicitly requested attributes; no arbitrary JavaScript execution. Hidden elements require includeHidden=true.",
   inputSchema: { sessionId, leaseId, tabId, frameId: z.number().int().min(0).optional(), query: z.string().min(1).max(500).optional(), locator: locator.optional(),
+    exactEditor: z.boolean().optional().describe("Opt in to an untruncated unique div.ProseMirror body, SHA-256 and UTF-16 selection offsets"),
+    maxEditorChars: z.number().int().min(1).max(100_000).optional(),
     attributes: z.array(z.string().regex(/^[A-Za-z_:][A-Za-z0-9_.:-]*$/u).max(100)).max(16).optional(),
     includeHidden: z.boolean().optional(), offset: z.number().int().min(0).max(4_999).default(0), limit: z.number().int().min(1).max(100).default(25) },
   annotations: { readOnlyHint: true },
@@ -431,6 +539,7 @@ server.registerTool("companion_query_page", {
   if (!args.query && !args.locator) throw new CompanionError("page_query_invalid", "Provide a query or locator");
   return (await broker()).request("operation.execute", { sessionId: args.sessionId, leaseId: args.leaseId, method: "page.query", params: {
     tabId: args.tabId, frameId: args.frameId, query: args.query, locator: args.locator, attributes: args.attributes,
+    exactEditor: args.exactEditor, maxEditorChars: args.maxEditorChars,
     includeHidden: args.includeHidden, offset: args.offset, limit: args.limit,
   } });
 }));
@@ -539,6 +648,24 @@ server.registerTool("companion_clipboard_read", {
   return (await broker()).request("operation.execute", { sessionId: args.sessionId, leaseId: args.leaseId, method: "clipboard.read", params: { tabId: args.tabId } });
 }));
 
+server.registerTool("companion_clipboard_source_receipt", {
+  description: "Read a future clipboard source intent/terminal ACK by exact operation ID and payload hash in the same task, origin and generation. Returns metadata only; never writes the clipboard, proves paste, or clears historical unknown operations. An intent without terminal ACK remains unknown. A completed ACK alone does not authorize continuing a paste dependency.",
+  inputSchema: { sessionId, leaseId, tabId, sourceOperationId: z.string().min(1).max(200), payloadSha256: z.string().regex(/^[a-f0-9]{64}$/u) },
+  annotations: { readOnlyHint: true },
+}, guarded(async (args, extra) => {
+  assertSessionAndLease(args, extra);
+  return (await broker()).request("operation.execute", { sessionId: args.sessionId, leaseId: args.leaseId, method: "clipboard.receipt", params: args });
+}));
+
+server.registerTool("companion_wait_for_commit", {
+  description: "Wait read-only for this exact leased tab and URL to have no pending navigation and a committed document. Any pending URL, including the same URL, remains guarded. Inspect companion_list_tabs diagnostics first; this never reloads, stops navigation, presses Escape, or authorizes replay. A timeout is local to this target and leaves its original unknown operation intact.",
+  inputSchema: { sessionId, leaseId, tabId, expectedUrl: z.string().url(), timeoutMs: z.number().int().min(100).max(15000).default(5000) },
+  annotations: { readOnlyHint: true },
+}, guarded(async (args, extra) => {
+  assertSessionAndLease(args, extra);
+  return (await broker()).request("operation.execute", { sessionId: args.sessionId, leaseId: args.leaseId, method: "tabs.waitForCommit", params: args });
+}));
+
 server.registerTool("companion_clipboard_read_binary", {
   description: "Read explicitly approved clipboard binary items with MIME and size allowlists. Clipboard history and unapproved reads are denied; content is not logged by Companion.",
   inputSchema: { sessionId, leaseId, tabId, mimeTypes: z.array(z.string()).min(1).max(8), maxBytes: z.number().int().min(1).max(2097152).default(2097152), approved: z.literal(true) },
@@ -594,7 +721,7 @@ server.registerTool("companion_authorized_transaction", {
     startUrl: z.string().url(),
     tabId: z.number().int().nonnegative().optional().describe("Continue this exact task-owned tab at its current URL without reloading startUrl. Use the tab.id from the previous result. A missing, foreign, busy or protected tab fails without opening a replacement."),
     allowedOrigins: z.array(z.string().url()).min(1).max(16),
-    actions: z.array(transactionActionSchema(locator)).min(1).max(32).describe("At least one action; initial read-only open uses page.query with params.query"),
+    actions: z.array(transactionActionSchema(locator)).min(1).max(MAX_SPLIT_ACTIONS).describe("At least one action; initial read-only open uses page.query with params.query. More than 32 actions run as consecutive 32-action parts on the same tab (idempotencyKey:part-N-of-M), stopping at the first part that is not verified; split_transaction reports remaining indices in this list"),
     retainOnUnknown: z.boolean().default(false),
     reuseTaskTab: z.boolean().default(true),
     keepTaskTab: z.boolean().optional(),
@@ -611,7 +738,9 @@ server.registerTool("companion_authorized_transaction", {
   assertSession(args, extra);
   const actions = await materializeTransactionActions(args.actions);
   const targetOrigin = args.targetOrigin ?? new URL(args.startUrl).origin;
-  return (await broker()).requestAuthorizedTransaction({ ...args, taskId, targetOrigin, actions, precondition: args.precondition ?? null, capsule: args.capsule ?? null }, { timeoutMs: 120_000 });
+  const client = await broker();
+  return runSplitTransaction((params) => client.requestAuthorizedTransaction(params, { timeoutMs: 120_000 }),
+    { ...args, taskId, targetOrigin, precondition: args.precondition ?? null, capsule: args.capsule ?? null }, actions);
 }, { summarizeTransactionText: true }));
 
 server.registerTool("companion_read_urls", {
@@ -660,7 +789,7 @@ server.registerTool("companion_transaction_status", {
 }));
 
 server.registerTool("companion_prepare_resume", {
-  description: "Read this task's resume state and completed/remaining action indices. After a connection or generation failure, reacquire this client's own session on its original profile once and return the new session_id. Never replay actions or reuse old leases. Reserve and read back the exact returned target before continuing only the remaining work. Use intent=direct_application only for normal current-owner job applications.",
+  description: "Read this task's resume state and completed/remaining action indices. After MCP process replacement, if only the local binding was lost, use fresh broker status and the host-derived task identity to reacquire a safe session on the same task profile; competing owners remain blocked. After connection/generation failure, reacquire the session once. Never replay actions or reuse old leases. Reserve and read back the exact returned target before continuing only the remaining work. Use intent=direct_application only for normal current-owner job applications.",
   inputSchema: {
     sessionId,
     runId: z.string().min(1),
@@ -672,11 +801,38 @@ server.registerTool("companion_prepare_resume", {
   annotations: { readOnlyHint: true },
 }, guarded(async (args, extra) => {
   const taskId = bindCodexTaskId(args.taskId, process.env, extra);
-  assertSession(args, extra);
   const client = await broker();
+  let sessionIdForResume = args.sessionId;
+  let sessionRecovery = null;
   try {
-    return await client.requestPrepareResume({ ...args, taskId }, { timeoutMs: 5_000 });
+    taskBindings.assertSession(sessionIdForResume, taskId);
   } catch (error) {
+    if (error?.code !== "mcp_session_task_binding_missing") throw error;
+    const session = await recoverSessionForPrepareResume(client, {
+      previousSessionId: args.sessionId,
+      runId: args.runId,
+      taskId,
+    });
+    sessionIdForResume = session.sessionId;
+    sessionRecovery = {
+      reason: "mcp_session_task_binding_missing",
+      previous_session_id: args.sessionId,
+      session_id: session.sessionId,
+      profile_instance_id: session.profileInstanceId,
+      generation: session.generation,
+      fresh_lease_required: true,
+      actions_replayed: 0,
+    };
+  }
+  const resumeArgs = { ...args, taskId, sessionId: sessionIdForResume };
+  try {
+    const result = await client.requestPrepareResume(resumeArgs, { timeoutMs: 5_000 });
+    return sessionRecovery ? { ...result, session_recovery: sessionRecovery } : result;
+  } catch (error) {
+    if (sessionRecovery) {
+      error.details = { ...error.details, session_recovery: sessionRecovery };
+      throw error;
+    }
     if (!["broker_reconnect_required", "broker_connection_closed", "broker_request_timeout", "session_not_owned", "session_generation_stale"].includes(error?.code)) throw error;
     const session = await client.recoverOwnedSession({ sessionId: args.sessionId, taskId });
     // Drop obsolete leases even when the broker reused the logical session ID.
@@ -694,8 +850,49 @@ server.registerTool("companion_prepare_resume", {
   }
 }));
 
+server.registerTool("companion_recover_target", {
+  description: "Explicitly create one replacement for an exact recorded owned missing tab with complete broker-proven no-effect history. Supply the failed capsule, operation and stable intended target unchanged, with a new idempotency key. This only creates and snapshots a new target; it never continues actions, adopts another tab or repeats uncertain creation. Retains the original failed record and returns a linked new capsule and fresh target identity for a separate continuation.",
+  inputSchema: {
+    sessionId, runId: z.string().min(1), taskId: z.string().min(1).optional(),
+    idempotencyKey: z.string().min(1), sourceCapsuleId: z.string().min(1),
+    originalOperationKey: z.string().min(1), originalOperationId: z.string().min(1),
+    oldTabId: z.number().int().nonnegative(), targetKey: z.string().min(1), intendedUrl: z.string().url(),
+  },
+  annotations: { destructiveHint: true },
+}, guarded(async (args, extra) => {
+  const taskId = bindCodexTaskId(args.taskId, process.env, extra);
+  assertSession(args, extra);
+  return (await broker()).requestRecoverTarget({ ...args, taskId }, { timeoutMs: 120_000 });
+}));
+
+server.registerTool("companion_resolve_local_editor", {
+  description: "Owner-signed local editor readback resolution. Verifies the exact original page.type payload HMAC using its persisted original binding; appends a one-use different-key surgical repair grant. Preserves the failed receipt and unknown history, never declares provider completion or cleanup readiness.",
+  inputSchema: { sessionId, leaseId, tabId, runId: z.string().min(1), taskId: z.string().min(1).optional(),
+    idempotencyKey: z.string().min(1), capsuleId: z.string().min(1), originalOperationKey: z.string().min(1), originalOperationId: z.string().min(1),
+    originalPayload: z.record(z.string(), z.unknown()), expectedBody: z.string().max(100_000), expectedFullBody: z.string().max(100_000),
+    insertText: z.string().min(1).max(1_000), offset: z.number().int().min(0).max(100_000), repairOperationKey: z.string().min(1),
+    url: z.string().url(), pageInstanceId: z.string().min(1) },
+  annotations: { destructiveHint: true },
+}, guarded(async (args, extra) => {
+  const taskId = bindCodexTaskId(args.taskId, process.env, extra);
+  assertSessionAndLease(args, extra);
+  return (await broker()).requestResolveLocalEditor({ ...args, taskId });
+}));
+
+server.registerTool("companion_resolve_local_selection", {
+  description: "Owner-signed exact local selection reconciliation without replay. Supply the original HMAC-bound page.selectOption command payload unchanged. Supports only one exact option.label on a native single-select; rejects values, indices, arrays and custom controls. Freshly queries the original leased document/control, appends local proof, and preserves original unknown receipts. Never claims provider completion or re-dispatches selection.",
+  inputSchema: { sessionId, leaseId, tabId, runId: z.string().min(1), taskId: z.string().min(1).optional(),
+    idempotencyKey: z.string().min(1), capsuleId: z.string().min(1), originalOperationKey: z.string().min(1), originalOperationId: z.string().min(1),
+    originalPayload: z.record(z.string(), z.unknown()), url: z.string().url(), pageInstanceId: z.string().min(1) },
+  annotations: { destructiveHint: true },
+}, guarded(async (args, extra) => {
+  const taskId = bindCodexTaskId(args.taskId, process.env, extra);
+  assertSessionAndLease(args, extra);
+  return (await broker()).requestResolveLocalSelection({ ...args, taskId });
+}));
+
 server.registerTool("companion_inspect_reconciliation", {
-  description: "Read the exact reconciliation tab, locate visible provider-success text, and capture a same-page screenshot. Inspect the image, then pass reconciliationProof unchanged to companion_complete_reconciliation. This performs no mutation or replay.",
+  description: "Read the exact reconciliation tab, locate visible provider-success text, and capture a same-page screenshot. Inspect the image, then pass reconciliationProof unchanged to companion_complete_reconciliation (call this again for a fresh proof if it expired). This performs no mutation or replay. idempotencyKey is the uncertain transaction's key exactly as returned (companion_transaction_status lists it). For an upload whose attachment the site does not show by filename, pass confirmationFiles to register the confirmation now, e.g. [{ filename: \"photo.png\", locator: { role: \"img\" }, previewOnly: true }]; uploads made with confirmationCountLocator are checked by the list count automatically.",
   inputSchema: {
     sessionId,
     leaseId,
@@ -705,6 +902,11 @@ server.registerTool("companion_inspect_reconciliation", {
     idempotencyKey: z.string().min(1),
     capsuleId: z.string().min(1).optional(),
     successQuery: z.string().min(8).max(500),
+    originalOperationKey: z.string().min(1).optional(),
+    originalOperationId: z.string().min(1).optional(),
+    originalFingerprint: z.string().min(1).optional(),
+    originalUploadPayload: z.record(z.string(), z.unknown()).optional().describe("Exact original dispatched upload params, including file bytes; checked against the saved operation HMAC. Do not materialize a changed local file."),
+    confirmationFiles: z.array(z.object({ filename: z.string().min(1).max(255), locator, previewOnly: z.boolean().optional().describe("One-file uploads on sites that show only a preview: accept the locator without the filename text") })).min(1).max(10).optional().describe("Confirmation-only readiness evidence for every original assigned file, as objects (not strings): [{ filename: <original uploaded file name>, locator: {...}, previewOnly?: true }]. May be given after the upload even if none was declared then; never dispatches another upload"),
   },
   annotations: { readOnlyHint: true },
 }, guarded(async (args, extra) => {
@@ -750,7 +952,7 @@ server.registerTool("companion_rebind_reconciliation", {
 }));
 
 server.registerTool("companion_complete_reconciliation", {
-  description: "After visually confirming companion_inspect_reconciliation, atomically mark that exact reconciliation capsule and task tab completed/cleanup-ready. It revalidates the same visible success evidence, performs no provider mutation, and must be followed by companion_close_session(taskTerminal=true).",
+  description: "After visually confirming companion_inspect_reconciliation, settle only that exact operation using fresh evidence, without any provider mutation. Upload attachment confirmation is not provider submission success: it keeps the workflow unsubmitted and retained with terminal_cleanup_ready=false; continue its unsubmitted workflow or explicitly abandon it. Only when the returned terminal_cleanup_ready is true should completed-work cleanup follow with companion_close_session(taskTerminal=true).",
   inputSchema: {
     sessionId,
     leaseId,

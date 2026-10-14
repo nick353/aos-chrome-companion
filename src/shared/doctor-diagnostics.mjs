@@ -12,8 +12,10 @@ import { INSTALL_BUILD_ID } from "./build-info.mjs";
 import { OPERATION_SCHEMA, OPERATION_SCHEMA_DIGEST, OPERATION_SCHEMA_VERSION, PROTOCOL_VERSION } from "./constants.mjs";
 import { operationRequiresReconciliation, operationEffectStateForEntry } from "./task-runtime.mjs";
 import { resolveBrokerSocketPath, resolveDataDir, resolveStatePath } from "./paths.mjs";
-import { detectTwoExtensionProfile, DEFAULT_COMPANION_EXTENSION_ID } from "../setup/auto-setup.mjs";
+import { controlPlaneSyncReadiness, detectTwoExtensionProfile, DEFAULT_COMPANION_EXTENSION_ID } from "../setup/auto-setup.mjs";
 import { controlPlaneFiles } from "./control-plane-files.mjs";
+import { lockOwnerLiveness } from "../setup/dead-lock-maintenance.mjs";
+import { companionBootIdentity } from "../setup/lock-identity.mjs";
 
 const execFileAsync = promisify(execFileCallback);
 const DEFAULT_SOURCE_ROOT = resolve(fileURLToPath(new URL("../..", import.meta.url)));
@@ -281,9 +283,92 @@ async function runtimeBuildSchema({ sourceRoot, installedRoot, status }) {
   };
 }
 
-async function autoSetupSummary({ dataDir, chromeUserDataDir, env, homePath = homedir() }) {
+export async function inspectSetupLock(path, { probeOwner } = {}) {
+  const v2Guard = path.endsWith(".guard.v2"), anyGuard = v2Guard || path.endsWith(".guard");
+  const info = await inspectPath(path);
+  const result = { ...info, ownerPid: null, ownerState: info.exists ? "unknown" : "absent", ownerFormat: null };
+  if (!info.exists) return result;
+  if (path.endsWith(".guard") ? info.type !== "directory" : info.type !== "file") return { ...result, exactBlocker: "companion_lock_path_type_invalid" };
+  const ownerPath = path.endsWith(".guard") ? join(path, "owner.json") : path;
+  const ownerInfo = await inspectPath(ownerPath);
+  if (ownerInfo.type !== "file" || ownerInfo.size > 16_384) return { ...result,
+    exactBlocker: path.endsWith(".guard") ? "companion_lock_guard_legacy_or_uncertain" : "companion_lock_owner_uncertain" };
+  try {
+    const text = await readFile(ownerPath, "utf8");
+    const legacy = !path.endsWith(".guard") && /^[1-9]\d*\s*$/u.test(text);
+    const owner = legacy ? { pid: Number(text) } : JSON.parse(text);
+    let valid = Number.isSafeInteger(owner?.pid) && owner.pid > 0 && (legacy || (
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu.test(owner.token)
+      && (path.endsWith(".guard") || (v2Guard ? ["companion_lock_guard.v2", "companion_lock_guard.v3"].includes(owner.schema) : ["companion_lock.v1", "companion_lock.v2", "companion_lock.v3"].includes(owner.schema)))));
+    const v3 = ["companion_lock.v3", "companion_lock_guard.v3"].includes(owner.schema);
+    if (valid && ["companion_lock.v2", "companion_lock_guard.v2", "companion_lock.v3", "companion_lock_guard.v3"].includes(owner.schema)) {
+      const keys = v2Guard ? ["schema", "pid", "workPid", "token", "acquireId", "transactionId", "coordinator"] : ["schema", "pid", "token", "acquireId", "coordinator"];
+      if (v3) keys.push("bootIdentity");
+      valid = !path.endsWith(".guard") && Object.keys(owner).length === keys.length && keys.every(key => Object.hasOwn(owner,key))
+        && (!v2Guard || Number.isSafeInteger(owner.workPid) && owner.workPid > 0)
+        && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(owner.acquireId)
+        && (!v2Guard || /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(owner.transactionId))
+        && owner.coordinator && Object.keys(owner.coordinator).sort().join(",") === (v3 ? "dev,id,ino,path" : "dev,ino,path")
+        && (!v3 || /^(darwin:\d+:\d+|linux:[0-9a-f-]{36})$/u.test(owner.bootIdentity));
+    }
+    if (valid) {
+      result.ownerPid = owner.pid;
+      result.ownerFormat = legacy ? "legacy_pid" : "pid_token";
+      result.ownerState = lockOwnerLiveness(owner.pid, probeOwner);
+      if (["companion_lock.v2", "companion_lock_guard.v2", "companion_lock.v3", "companion_lock_guard.v3"].includes(owner.schema)) {
+        const coordinatorPath = (v2Guard ? path.slice(0, -9) : path.endsWith(".guard") ? path.slice(0, -6) : path) + ".coordinator";
+        const coordinator = await lstat(coordinatorPath).catch(() => null);
+        const workState = anyGuard ? lockOwnerLiveness(owner.workPid, probeOwner) : result.ownerState;
+        let stableIdentity = false, bootChanged = false;
+        if (v3 && coordinator?.isFile() && !coordinator.isSymbolicLink()) {
+          const descriptor = await readJson(coordinatorPath);
+          stableIdentity = descriptor.value?.schema === "companion_lock_coordinator.v1"
+            && Object.keys(descriptor.value).sort().join(",") === "id,schema"
+            && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(owner.coordinator.id)
+            && descriptor.value.id === owner.coordinator.id;
+          bootChanged = owner.bootIdentity !== await companionBootIdentity();
+        }
+        const bindingValid = owner.coordinator?.path === coordinatorPath && coordinator?.isFile()
+          && !coordinator.isSymbolicLink() && (coordinator.mode & 0o022) === 0
+          && (!process.getuid || coordinator.uid === process.getuid())
+          && String(coordinator.ino) === owner.coordinator.ino
+          && (!v3 || stableIdentity)
+          && (String(coordinator.dev) === owner.coordinator.dev || v3 && stableIdentity && bootChanged && result.ownerState === "dead" && workState === "dead");
+        result.ownerFormat = v3 ? "kernel_coordinated_v3" : "kernel_coordinated_v2";
+        result.coordinatorVerified = Boolean(bindingValid);
+        result.workOwnerState = workState;
+        result.exactBlocker = !bindingValid ? "companion_lock_coordinator_identity_changed"
+          : result.ownerState === "dead" && workState === "dead" ? v3 ? "companion_lock_dead_v3_recovery_available" : "companion_lock_dead_v2_recovery_available"
+            : result.ownerState === "dead" && anyGuard ? "companion_lock_guard_work_owner_live_or_unverifiable" : null;
+      } else if (result.ownerState === "dead") result.exactBlocker = "companion_legacy_lock_maintenance_required";
+    }
+    if (!valid) result.exactBlocker = anyGuard ? "companion_lock_guard_legacy_or_uncertain" : "companion_lock_owner_uncertain";
+  } catch { result.ownerReadbackError = "companion_lock_owner_unreadable_or_malformed"; result.exactBlocker = "companion_lock_owner_uncertain"; }
+  return result;
+}
+
+async function autoSetupSummary({ dataDir, chromeUserDataDir, env, homePath = homedir(), now = Date.now(), probeOwner, status, buildSchema }) {
   const statePath = join(dataDir, "setup-state.json");
   const receipt = await readJson(statePath);
+  const currentSync = await readJson(join(dataDir, "control-plane-sync-receipt.json"));
+  const locks = await Promise.all(["setup.lock", "setup.lock.guard", "setup.lock.guard.v2", "control-plane-sync.lock", "control-plane-sync.lock.guard", "control-plane-sync.lock.guard.v2"]
+    .map((name) => inspectSetupLock(join(dataDir, name), { probeOwner })));
+  const lockBlockers = [...new Set(locks.filter((lock) => lock.exists || lock.error).map((lock) => {
+    if (lock.error) return "companion_setup_lock_readback_failed";
+    if (lock.exactBlocker) return lock.exactBlocker;
+    if (lock.ownerState === "live") return lock.path.includes("control-plane-sync.lock") ? "control_plane_sync_in_progress" : "auto_setup_convergence_in_progress";
+    return "companion_lock_owner_uncertain";
+  }))];
+  const lockPending = lockBlockers.length > 0;
+  const syncReadiness = controlPlaneSyncReadiness(currentSync.value ?? receipt.value?.components?.control_plane_sync?.receipt
+    ?? receipt.value?.components?.control_plane_sync, { liveStatus: status,
+    expectedBuildId: buildSchema?.installed?.extensionBuildId ?? buildSchema?.installed?.buildId,
+    artifactsMatch: buildSchema?.mismatch === false && buildSchema?.installationIdentityDrift === false
+      && buildSchema?.generatedSchema?.digest === OPERATION_SCHEMA_DIGEST });
+  const reconciled = new Set(syncReadiness.reconciledBlockers ?? []);
+  const currentReceiptBlockers = (receipt.value?.exact_blockers ?? []).filter(blocker => !reconciled.has(blocker));
+  const currentBlockers = [...new Set([...currentReceiptBlockers,
+    ...syncReadiness.exactBlockers, ...lockBlockers])];
   const selectorPath = env.AOS_WEB_OPERATION_BACKEND_CONFIG || env.AUTOMATION_OS_WEB_OPERATION_BACKEND_CONFIG || join(homePath, ".social-flow", "web-operation-backend.json");
   const selector = await readJson(selectorPath);
   const companionExtensionId = receipt.value?.components?.companion_chrome_extension?.extension_id || env.AOS_CHROME_COMPANION_EXTENSION_ID || DEFAULT_COMPANION_EXTENSION_ID;
@@ -296,11 +381,17 @@ async function autoSetupSummary({ dataDir, chromeUserDataDir, env, homePath = ho
   if (receipt.value?.profile_directory && profileDetection?.selected?.directory && receipt.value.profile_directory !== profileDetection.selected.directory) mismatches.push("receipt_profile_directory_mismatch");
   const receiptBackend = receipt.value?.components?.adaptive_selector?.backend;
   if (receiptBackend && selector.value?.backend && receiptBackend !== selector.value.backend) mismatches.push("adaptive_selector_backend_mismatch");
-  if (receipt.value?.components?.control_plane_sync?.result === "deferred") mismatches.push("control_plane_sync_deferred");
-  if (Array.isArray(receipt.value?.exact_blockers) && receipt.value.exact_blockers.length) mismatches.push("receipt_has_exact_blockers");
+  if (syncReadiness.pendingRefresh) mismatches.push("control_plane_sync_deferred");
+  if (lockPending) mismatches.push("companion_setup_lock_pending");
+  if (currentReceiptBlockers.length) mismatches.push("receipt_has_exact_blockers");
+  const checkedTime = Date.parse(receipt.value?.checked_at);
+  const ageMs = Number.isFinite(checkedTime) && checkedTime <= now ? now - checkedTime : null;
+  const currentReady = !syncReadiness.pendingRefresh && !lockPending && currentBlockers.length === 0;
   return {
     statePath,
-    receipt: { exists: receipt.info.exists, schema: receipt.value?.schema ?? null, setupComplete: receipt.value?.setup_complete === true, companionReady: receipt.value?.companion_ready === true, integrationReady: receipt.value?.integration_ready === true, checkedAt: receipt.value?.checked_at ?? null, exactBlockers: receipt.value?.exact_blockers ?? [], nextAction: receipt.value?.next_action ?? null, error: receipt.error ?? null },
+    receipt: { exists: receipt.info.exists, schema: receipt.value?.schema ?? null, setupComplete: receipt.value?.setup_complete === true && currentReady, companionReady: receipt.value?.companion_ready === true && currentReady, integrationReady: receipt.value?.integration_ready === true && currentReady, checkedAt: receipt.value?.checked_at ?? null, ageMs, ageStatus: ageMs === null ? "unknown" : "dated_snapshot", invocationLiveness: "unknown", currentInvocationVerified: false, exactBlockers: currentBlockers, nextAction: receipt.value?.next_action ?? null, error: receipt.error ?? null },
+    locks,
+    controlPlaneSync: { path: join(dataDir, "control-plane-sync-receipt.json"), ...syncReadiness },
     selector: { path: selectorPath, exists: selector.info.exists, backend: selector.value?.backend ?? null, revision: selector.value?.revision ?? null, error: selector.error ?? null },
     profileDetection: profileDetection ? {
       profiles: profileDetection.profiles,
@@ -330,13 +421,14 @@ export async function collectDoctorDiagnostics(options = {}) {
   const sourceRoot = resolve(options.sourceRoot ?? DEFAULT_SOURCE_ROOT);
   const installedRoot = resolve(options.installedRoot ?? env.AOS_CHROME_COMPANION_INSTALL_ROOT ?? DEFAULT_INSTALL_ROOT);
   const chromeUserDataDir = resolve(options.chromeUserDataDir ?? DEFAULT_CHROME_USER_DATA_DIR);
-  const [data, socket, state, secret, brokerProcesses, broker, autoSetup] = await Promise.all([
+  const [data, socket, state, secret, brokerProcesses, broker] = await Promise.all([
     inspectPath(dataDir), inspectPath(socketPath), inspectPath(statePath), inspectPath(secretPath),
     options.brokerProcesses ? { processes: options.brokerProcesses, error: null } : listBrokerProcesses(),
     options.status !== undefined ? { status: options.status, error: options.statusError ?? null, transport: { injected: true } } : readBrokerStatus({ socketPath, secretPath }),
-    autoSetupSummary({ dataDir, chromeUserDataDir, env }),
   ]);
   const buildSchema = await runtimeBuildSchema({ sourceRoot, installedRoot, status: broker.status });
+  const autoSetup = await autoSetupSummary({ dataDir, chromeUserDataDir, env, now: options.now ?? Date.now(),
+    probeOwner: options.probeOwner, status: broker.status, buildSchema });
   const ledger = await readLedger(statePath);
   const status = broker.status;
   const profiles = Array.isArray(status?.profiles) ? status.profiles.map(summarizeProfile) : [];
@@ -358,13 +450,15 @@ export async function collectDoctorDiagnostics(options = {}) {
   if (buildSchema.sourceDrift) maintenance.push({ code: "source_install_control_plane_drift", severity: "high", files: buildSchema.controlPlaneDrift.slice(0, 20), nextAction: "refresh_installed_runtime_at_an_idle_boundary" });
   const activeReconciliationCount = status?.reconciliationPendingActiveCount;
   if (ledger.ledger.reconciliationBacklogCount > 0) {
-    const activeReconciliationKnown = Number.isFinite(Number(activeReconciliationCount));
+    const activeReconciliationKnown = Number.isSafeInteger(activeReconciliationCount) && activeReconciliationCount >= 0;
     const activeReconciliation = activeReconciliationKnown && Number(activeReconciliationCount) > 0;
     maintenance.push({
       code: "reconciliation_backlog",
-      severity: activeReconciliation || !activeReconciliationKnown ? "high" : "medium",
+      severity: "medium",
       durable: ledger.ledger.reconciliationBacklogCount,
       active: activeReconciliationKnown ? Number(activeReconciliationCount) : null,
+      activeState: activeReconciliationKnown ? activeReconciliation ? "pending" : "clear" : "unknown",
+      scope: "historical_exact_targets_only",
       nextAction: "inspect_exact_targets_and_reconcile_without_replay",
     });
   }
@@ -384,6 +478,15 @@ export async function collectDoctorDiagnostics(options = {}) {
     generatedAt: new Date(options.now ?? Date.now()).toISOString(),
     readOnly: true,
     result,
+    brokerHealth: result,
+    readinessScope: "local_integration_not_current_chat_catalog_or_business_completion",
+    exposure: {
+      source: "file_hash_and_schema_inspection",
+      installed: "file_hash_inspection_not_loaded_tool_proof",
+      runtime: status ? "broker_status_readback" : "unknown",
+      currentChatCatalog: { state: "unknown", verified: false, reason: "doctor_cannot_observe_the_calling_chat_tool_catalog",
+        nextAction: { code: "refresh_current_task_mcp_catalog_at_safe_boundary", scope: "calling_task_only", safetyBoundary: "reconcile_original_invocation_and_finish_inflight_calls_before_plugin_restart_or_new_task", foreignRestartAllowed: false } },
+    },
     blockers,
     maintenance,
     paths: { dataDir: data.path, socketPath: socket.path, statePath: state.path, secretPath: secret.path, sourceRoot, installedRoot, chromeUserDataDir },
@@ -398,8 +501,30 @@ export async function collectDoctorDiagnostics(options = {}) {
   };
 }
 
+export function evaluateDoctorReadiness(report, { strict = false } = {}) {
+  const receipt = report.autoSetup?.receipt;
+  const blockers = [
+    ...(report.blockers ?? []).map((item) => item.code),
+    ...(report.maintenance ?? []).filter((item) => item.severity === "high").map((item) => item.code),
+  ];
+  if (receipt?.exists !== true) blockers.push("setup_receipt_missing");
+  if (receipt?.integrationReady !== true) blockers.push("integration_not_ready");
+  blockers.push(...(receipt?.exactBlockers ?? []));
+  const strictReady = report.result === "ok" && blockers.length === 0;
+  return {
+    strict_ready: strictReady,
+    strict_blockers: [...new Set(blockers)],
+    exitCode: report.result === "ok" && (!strict || strictReady) ? 0 : 1,
+  };
+}
+
 export function formatDoctorText(report) {
-  const lines = [`AOS Chrome Companion doctor: ${report.result}`, `read-only: ${report.readOnly}`, `broker processes: ${report.broker.processCount}`, `broker socket: ${report.broker.socket.exists ? report.broker.socket.type : "missing"}`, `connected profiles: ${report.profiles.connectedCount}/${report.profiles.count}`, `sessions / leases: ${report.sessions.count} / ${report.leases.count}`, `reconciliation backlog: ${report.ledger.reconciliationBacklogCount}`, `maintenance items: ${(report.maintenance ?? []).length}`];
+  const lines = [`AOS Chrome Companion doctor: ${report.result}`, `broker health: ${report.brokerHealth ?? report.result}`, `read-only: ${report.readOnly}`, `broker processes: ${report.broker.processCount}`, `broker socket: ${report.broker.socket.exists ? report.broker.socket.type : "missing"}`, `connected profiles: ${report.profiles.connectedCount}/${report.profiles.count}`, `sessions / leases: ${report.sessions.count} / ${report.leases.count}`, `historical reconciliation backlog: ${report.ledger.reconciliationBacklogCount}`, `active reconciliation: ${report.live?.reconciliationPendingActiveCount ?? "unknown"}`, `maintenance items: ${(report.maintenance ?? []).length}`];
+  const receipt = report.autoSetup?.receipt;
+  lines.push(`integration ready: ${receipt?.integrationReady === true}`, `setup receipt: ${receipt?.exists === true ? "present" : "missing"}`);
+  lines.push(`setup receipt age (ms): ${receipt?.ageMs ?? "unknown"}; invocation liveness: ${receipt?.invocationLiveness ?? "unknown"}`, `current chat catalog: ${report.exposure?.currentChatCatalog?.state ?? "unknown"}`);
+  if (receipt?.exactBlockers?.length) lines.push("integration blockers:", ...receipt.exactBlockers.map((blocker) => `- ${blocker}`));
+  if (report.strict_ready !== undefined) lines.push(`strict ready: ${report.strict_ready}`, `strict blockers: ${report.strict_blockers?.join(", ") || "none"}`);
   if (report.blockers.length) lines.push("blockers:", ...report.blockers.map((blocker) => `- ${blocker.code}`));
   else lines.push("blockers: none");
   if (report.maintenance?.length) lines.push("maintenance:", ...report.maintenance.map((item) => `- ${item.code}${item.count ?? item.durable ? ` (${item.count ?? item.durable})` : ""}${item.nextAction ? ` -> ${item.nextAction}` : ""}`));

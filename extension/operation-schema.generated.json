@@ -1,7 +1,7 @@
 {
   "schema": "aos.chrome_companion.operation_schema.v1",
   "version": 1,
-  "schemaDigest": "4975f94895d5bcd43d08fe51e7b9b5b13c55da5ba27c24831836501b0360f04d",
+  "schemaDigest": "a288211c5de286783d2fb0bf3b0aed306f2c05046605e11d6615ea8fd92bb7e4",
   "methods": [
     {
       "method": "extension.reload",
@@ -19,6 +19,24 @@
       "method": "tabs.get",
       "targetScoped": true,
       "mutation": false,
+      "profileGlobal": false
+    },
+    {
+      "method": "tabs.waitForCommit",
+      "targetScoped": true,
+      "mutation": false,
+      "profileGlobal": false
+    },
+    {
+      "method": "tabs.navigationDiagnostics",
+      "targetScoped": true,
+      "mutation": false,
+      "profileGlobal": false
+    },
+    {
+      "method": "tabs.stopLoading",
+      "targetScoped": true,
+      "mutation": true,
       "profileGlobal": false
     },
     {
@@ -187,13 +205,28 @@
       "method": "visual.typeText",
       "targetScoped": true,
       "mutation": true,
-      "profileGlobal": true
+      "profileGlobal": true,
+      "optIns": {
+        "clickBeforeType": false,
+        "editorGuardRequired": true,
+        "clear": false,
+        "maxInsertChars": 1000,
+        "verification": "exact-full-body-before-and-after"
+      }
     },
     {
       "method": "page.query",
       "targetScoped": true,
       "mutation": false,
-      "profileGlobal": false
+      "profileGlobal": false,
+      "optIns": {
+        "exactEditor": {
+          "locatorCss": "div.ProseMirror",
+          "maxChars": 100000,
+          "truncated": false,
+          "offsetUnit": "utf16"
+        }
+      }
     },
     {
       "method": "page.assets",
@@ -263,6 +296,12 @@
     },
     {
       "method": "clipboard.read",
+      "targetScoped": true,
+      "mutation": false,
+      "profileGlobal": true
+    },
+    {
+      "method": "clipboard.receipt",
       "targetScoped": true,
       "mutation": false,
       "profileGlobal": true
@@ -388,6 +427,24 @@
       "profileGlobal": true
     },
     {
+      "method": "recording.status",
+      "targetScoped": false,
+      "mutation": false,
+      "profileGlobal": true
+    },
+    {
+      "method": "recording.startAuto",
+      "targetScoped": false,
+      "mutation": true,
+      "profileGlobal": true
+    },
+    {
+      "method": "recording.stopAuto",
+      "targetScoped": false,
+      "mutation": true,
+      "profileGlobal": true
+    },
+    {
       "method": "page.waitFor",
       "targetScoped": true,
       "mutation": false,
@@ -404,6 +461,9 @@
     "extension.reload",
     "tabs.list",
     "tabs.get",
+    "tabs.waitForCommit",
+    "tabs.navigationDiagnostics",
+    "tabs.stopLoading",
     "tabs.create",
     "tabs.close",
     "tabs.activate",
@@ -445,6 +505,7 @@
     "page.elementScreenshot",
     "page.download",
     "clipboard.read",
+    "clipboard.receipt",
     "clipboard.readBinary",
     "clipboard.write",
     "page.inspectDialog",
@@ -465,6 +526,9 @@
     "page.nativeChooser",
     "page.submit",
     "tabs.claimExisting",
+    "recording.status",
+    "recording.startAuto",
+    "recording.stopAuto",
     "page.waitFor",
     "page.delay"
   ],
@@ -498,6 +562,8 @@
     "page.webMcpCall",
     "page.nativeChooser",
     "tabs.claimExisting",
+    "recording.startAuto",
+    "recording.stopAuto",
     "page.query",
     "page.selectOption",
     "page.type",

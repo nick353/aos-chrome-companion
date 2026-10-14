@@ -1,15 +1,52 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
+import { runInNewContext } from "node:vm";
 import { CompanionBroker } from "../src/broker/broker.mjs";
 import { DEFAULT_CAPABILITIES, PROTOCOL_VERSION } from "../src/shared/constants.mjs";
 import { INSTALL_BUILD_ID } from "../src/shared/build-info.mjs";
 import { encodeNativeMessage, NativeMessageDecoder, JsonLineDecoder, writeJsonLine } from "../src/shared/framing.mjs";
 import { NativeCommandAssembler } from "../extension/native-command-transfer.js";
 import { ensureBrokerSecret } from "../src/shared/security.mjs";
+import { resolveCompanionCodexSelection } from "../src/setup/auto-setup.mjs";
+
+test("native setup entrypoint requires explicit managed-child provenance and runs once", async () => {
+  const source = await readFile(resolve("src/native-host/main.mjs"), "utf8");
+  // Isolate the actual hello-triggered setup function from the relay's broker
+  // connection so the adapter check cannot install plugins or launch a broker.
+  const entrypoint = source.slice(source.indexOf("function startAutoSetupOnce()"), source.indexOf("\nconst expectedOrigin"));
+  assert.ok(entrypoint.startsWith("function startAutoSetupOnce()"));
+  const cases = [
+    { tag: {}, managed: false },
+    { tag: { AOS_CHROME_COMPANION_MANAGED_CHILD: "1" }, managed: false },
+    { tag: { AOS_CHROME_COMPANION_MANAGED_CHILD_PROVENANCE: "companion_native_host_wrapper" }, managed: false },
+    { tag: { AOS_CHROME_COMPANION_MANAGED_CHILD: "1", AOS_CHROME_COMPANION_MANAGED_CHILD_PROVENANCE: "custom" }, managed: false },
+    { tag: { AOS_CHROME_COMPANION_MANAGED_CHILD: "1", AOS_CHROME_COMPANION_MANAGED_CHILD_PROVENANCE: "companion_native_host_wrapper" }, managed: true },
+  ];
+  for (const { tag, managed } of cases) {
+    const environment = { PATH: "/usr/bin:/bin", CODEX_CLI_PATH: "/stale/ChatGPT/codex", ...tag };
+    const original = { ...environment };
+    const calls = [];
+    const context = { process: { env: environment }, setupPromise: null,
+      callerOrigin: "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/",
+      convergeCompanionSetup: async (options) => { calls.push(options); return {}; }, writeNative: () => {} };
+    runInNewContext(`${entrypoint}\nstartAutoSetupOnce(); startAutoSetupOnce();`, context);
+    await context.setupPromise;
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].trigger, "native_host");
+    assert.equal(calls[0].companionExtensionId, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    const selection = await resolveCompanionCodexSelection(environment, {
+      managedChild: calls[0].managedChild, provenance: calls[0].managedChildProvenance,
+      executableExists: async (path) => path === "/usr/local/bin/codex",
+    });
+    assert.equal(selection.managedChild, managed);
+    assert.equal(selection.command, managed ? "/usr/local/bin/codex" : original.CODEX_CLI_PATH);
+    assert.deepEqual(environment, original);
+  }
+});
 
 test("native host relays Chrome framing to the resident broker", async (t) => {
   const dataDir = await mkdtemp(join(tmpdir(), "aos-companion-native-"));

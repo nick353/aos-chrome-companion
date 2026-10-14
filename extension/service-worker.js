@@ -6,7 +6,13 @@ import { JavaScriptDialogs } from "./javascript-dialog.js";
 import { ViewportControls } from "./viewport-control.js";
 import { AccessibilityHistory } from "./accessibility-history.js";
 import { executeWithExpectedDialog } from "./action-event-wait.js";
-import { INSTALL_BUILD_ID } from "./build-info.js";
+import { exactNavigationDiagnostics, stopExactNavigation } from "./navigation-recovery.js";
+import {
+  BUNDLE_TREE_SHA256,
+  EXTENSION_TREE_SHA256,
+  INSTALL_BUILD_ID,
+  NATIVE_RECORDER_SHA256,
+} from "./build-info.js";
 import { createUserControls } from "./user-controls.js";
 import { searchBrowserLibrary, configureTaskTab, bookmarkTaskPage } from "./browser-library.js";
 import {
@@ -91,6 +97,7 @@ const EXTENSION_RELOAD_DELAY_MS = 150;
 const PAGE_MUTATION_EXECUTION_TIMEOUT_MS = 30_000;
 let lastScreenshotStartedAt = 0;
 let lastReconnectTriggerAt = 0;
+let pendingAutoRecordingTabId = null;
 
 function boundedTabText(value, maxChars) {
   const text = String(value ?? "");
@@ -128,6 +135,7 @@ const READ_ONLY_PAGE_ACTIONS = new Set([
   "webMcpDiscover",
   "verifyTypeValue",
   "verifyTypeSelection",
+  "verifyExactEditor",
   "verifyUpload",
   "waitFor",
 ]);
@@ -136,28 +144,14 @@ const READ_ONLY_PAGE_ACTIONS = new Set([
 // whether a command can mutate the leased surface.
 const MUTATION_OPERATION_METHODS = new Set(MUTATION_METHODS);
 
-async function executePageScriptWithReadRetry(target, action, payload) {
-  const execute = () => chrome.scripting.executeScript({
+async function executePageScriptWithReadRetry(target, action, payload, timeoutMs = READ_API_TIMEOUT_MS) {
+  return await withTimeout(chrome.scripting.executeScript({
     target,
     world: "ISOLATED",
     func: injectedPageOperation,
     args: [action, payload],
-  });
-  let lastError;
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    try {
-      return await withTimeout(
-        execute(),
-        READ_API_TIMEOUT_MS,
-        "page_execution_timeout",
-        "Chrome did not return a semantic page result within the bounded read window",
-      );
-    } catch (error) {
-      lastError = error;
-      if (attempt === 0) await new Promise((resolve) => setTimeout(resolve, 120));
-    }
-  }
-  throw lastError;
+  }), Math.min(READ_API_TIMEOUT_MS, timeoutMs), "page_execution_timeout",
+  "Chrome did not return a semantic page result within the bounded read window");
 }
 
 // `chrome.scripting.executeScript` returns a browser-owned documentId for
@@ -193,46 +187,100 @@ function screenshotBytes(dataUrl) {
   return Math.floor((String(dataUrl).length - comma - 1) * 3 / 4);
 }
 
-async function captureExactTabScreenshot(tabId, { quality = DEFAULT_SCREENSHOT_QUALITY, maxBytes = MAX_SCREENSHOT_BYTES, restoreActive = true } = {}) {
+async function captureExactTabScreenshot(tabId, { quality = DEFAULT_SCREENSHOT_QUALITY, maxBytes = MAX_SCREENSHOT_BYTES, restoreActive = true, allowedOrigins } = {}) {
   const target = await chrome.tabs.get(tabId);
   if (!Number.isSafeInteger(target.windowId)) throw companionError("screenshot_window_unavailable", "Target tab has no capturable window");
   const activeTabs = await chrome.tabs.query({ windowId: target.windowId, active: true });
   const previousActiveId = activeTabs[0]?.id ?? null;
   const switched = previousActiveId !== tabId;
   let interrupted = false;
+  let activationInterruption = false;
+  let urlInterruption = false;
+  let loadingInterruption = false;
+  let captureDocumentId = null;
   let restored = !switched;
   let result;
-  const activated = (info) => { if (info.windowId === target.windowId && info.tabId !== tabId) interrupted = true; };
-  const updated = (id, info) => { if (id === tabId && (info.status === "loading" || (info.url && info.url !== target.url))) interrupted = true; };
-  const assertTarget = async () => {
+  const activated = (info) => {
+    if (info.windowId === target.windowId && info.tabId !== tabId) interrupted = activationInterruption = true;
+  };
+  const updated = (id, info) => {
+    if (id !== tabId) return;
+    if (info.status === "loading") interrupted = loadingInterruption = true;
+    if (info.url && info.url !== target.url) interrupted = urlInterruption = true;
+  };
+  const assertTarget = async (phase, attempt) => {
     const [active, current] = await Promise.all([
       chrome.tabs.query({ windowId: target.windowId, active: true }), chrome.tabs.get(tabId),
     ]);
-    if (interrupted || active[0]?.id !== tabId || current.windowId !== target.windowId || current.url !== target.url || current.status === "loading") {
-      throw companionError("screenshot_target_changed", "The target tab or document changed during capture; discard this image and read the exact target again");
+    let documentChanged = false;
+    let readinessError = null;
+    const loadingChanged = current.status === "loading" && target.status !== "loading";
+    if (!interrupted && active[0]?.id === tabId && current.windowId === target.windowId && current.url === target.url && !loadingChanged) {
+      try {
+        const document = await probeCommittedDocument(tabId, { expectedWindowId: target.windowId, expectedUrl: target.url, allowedOrigins });
+        documentChanged = captureDocumentId !== null && document.documentId !== captureDocumentId;
+        if (captureDocumentId === null) captureDocumentId = document.documentId;
+      } catch (error) { readinessError = error; }
+    }
+    if (interrupted || active[0]?.id !== tabId || current.windowId !== target.windowId || current.url !== target.url || loadingChanged || readinessError || documentChanged) {
+      // Retain observed interruption causes even if the tab returns to its original state.
+      // IDs and booleans are sufficient for diagnosis; never expose either document URL.
+      const numericId = (id) => Number.isSafeInteger(id) ? id : null;
+      throw companionError("screenshot_target_changed", "The target tab or document changed during capture; discard this image and read the exact target again", {
+        reasons: {
+          activationInterruption,
+          activeTabMismatch: active[0]?.id !== tabId,
+          windowMismatch: current.windowId !== target.windowId,
+          urlMismatch: urlInterruption || current.url !== target.url,
+          loading: loadingInterruption || loadingChanged || readinessError?.code === "document_not_ready",
+        },
+        // Bounded diagnostic only: preserve every rejection and never expose
+        // Chrome error messages, URLs, or arbitrary caller-controlled codes.
+        ...(readinessError ? { documentProbeFailure: [
+          "document_not_ready", "document_identity_unavailable", "document_probe_invalid",
+          "document_target_changed", "target_origin_not_allowed", "document_readiness_timeout",
+          "permission_denied",
+        ].includes(readinessError.code) ? readinessError.code : "document_probe_failed" } : {}),
+        ...(readinessError?.details?.documentProbeTarget ? { documentProbeTarget: (() => {
+          const raw = readinessError.details.documentProbeTarget;
+          const safe = {};
+          if (["before_injection", "after_injection", "document_url"].includes(raw.stage)) safe.stage = raw.stage;
+          for (const key of ["tabIdMatches", "windowMatches", "tabUrlMatches", "pendingNavigationPresent", "pendingUrlMatchesCommitted", "documentUrlMatches", "normalizedUrlMatches"]) {
+            if (typeof raw[key] === "boolean") safe[key] = raw[key];
+          }
+          return safe;
+        })() } : {}),
+        ...(documentChanged ? { documentChanged: true } : {}),
+        phase, attempt,
+        targetTabId: numericId(tabId), targetWindowId: numericId(target.windowId),
+        currentTabId: numericId(current.id), currentWindowId: numericId(current.windowId),
+        activeTabId: numericId(active[0]?.id), activeWindowId: numericId(active[0]?.windowId),
+      });
     }
   };
   try {
     if (switched) await chrome.tabs.update(tabId, { active: true });
     chrome.tabs.onActivated?.addListener(activated);
     chrome.tabs.onUpdated?.addListener(updated);
-    await assertTarget();
+    await assertTarget("before_capture", 0);
     const requestedQuality = Math.min(Math.max(Number.isFinite(quality) ? Math.round(quality) : DEFAULT_SCREENSHOT_QUALITY, MIN_SCREENSHOT_QUALITY), 90);
     const requestedMaxBytes = Math.min(Math.max(Number.isSafeInteger(maxBytes) ? maxBytes : MAX_SCREENSHOT_BYTES, 100_000), MAX_SCREENSHOT_BYTES);
     let dataUrl = null;
     let usedQuality = requestedQuality;
+    let captureAttempt = 0;
     for (const candidateQuality of [requestedQuality, Math.max(MIN_SCREENSHOT_QUALITY, requestedQuality - 20)]) {
       for (let attempt = 0; attempt < 2; attempt += 1) {
+        captureAttempt += 1;
         await waitForScreenshotSlot();
-        await assertTarget();
+        await assertTarget("after_slot", captureAttempt);
         try {
           dataUrl = await chrome.tabs.captureVisibleTab(target.windowId, { format: "jpeg", quality: candidateQuality });
-          await assertTarget();
+          await assertTarget("after_capture", captureAttempt);
           break;
         } catch (error) {
           // A bounded retry is safe only for the capture read itself, on the same target.
           if (attempt !== 0 || !/image readback failed/i.test(String(error?.message))) throw error;
-          await assertTarget();
+          await assertTarget("retry_guard", captureAttempt);
         }
       }
       usedQuality = candidateQuality;
@@ -311,6 +359,9 @@ function publicState() {
     profileInstanceId: runtimeState.profileInstanceId,
     extensionRuntimeId: runtimeState.extensionRuntimeId,
     buildId: INSTALL_BUILD_ID,
+    bundleTreeSha256: BUNDLE_TREE_SHA256,
+    extensionTreeSha256: EXTENSION_TREE_SHA256,
+    nativeRecorderSha256: NATIVE_RECORDER_SHA256,
     generation: runtimeState.generation,
     connected: runtimeState.connected,
     connecting: runtimeState.connecting,
@@ -478,6 +529,9 @@ async function connectNative() {
       profileInstanceId: runtimeState.profileInstanceId,
       extensionRuntimeId: runtimeState.extensionRuntimeId,
       buildId: INSTALL_BUILD_ID,
+      bundleTreeSha256: BUNDLE_TREE_SHA256,
+      extensionTreeSha256: EXTENSION_TREE_SHA256,
+      nativeRecorderSha256: NATIVE_RECORDER_SHA256,
       operationSchema: OPERATION_SCHEMA,
       operationSchemaDigest: OPERATION_SCHEMA_DIGEST,
       operationSchemaVersion: OPERATION_SCHEMA_VERSION,
@@ -615,6 +669,7 @@ async function handleNativeMessage(message) {
       taskId: message.taskId,
       taskLabel: message.taskLabel,
       sessionId: message.sessionId,
+      profileInstanceId: message.profileInstanceId,
       generation: message.generation,
       replyPort: commandPort,
       executionTiming,
@@ -703,21 +758,79 @@ async function assertLiveOrigin(tabId, params, { allowBlank = false } = {}) {
   return tab;
 }
 
-async function waitForCommittedTab(tabId, { requestedUrl, previousUrl = null, timeoutMs = DEFAULT_NAVIGATION_TIMEOUT_MS } = {}) {
+async function probeCommittedDocument(tabId, { expectedWindowId, expectedUrl, allowedOrigins, deadline = Date.now() + READ_API_TIMEOUT_MS } = {}) {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) throw companionError("document_readiness_timeout", "Committed document probe exceeded its deadline");
+  return await withTimeout((async () => {
+    const before = await chrome.tabs.get(tabId);
+    const windowId = expectedWindowId ?? before.windowId;
+    const url = expectedUrl ?? before.url;
+    const allowed = allowedOriginsOf(allowedOrigins ?? [url]);
+    const targetConditions = (tab) => ({
+      tabIdMatches: tab.id === tabId,
+      windowMatches: Number.isSafeInteger(windowId) && tab.windowId === windowId,
+      tabUrlMatches: tab.url === url,
+      pendingNavigationPresent: Boolean(tab.pendingUrl),
+      pendingUrlMatchesCommitted: Boolean(tab.pendingUrl) && tab.pendingUrl === url,
+    });
+    const assertTab = (tab, stage) => {
+      if (tab.id !== tabId || !Number.isSafeInteger(windowId) || tab.windowId !== windowId || tab.url !== url || tab.pendingUrl) {
+        throw companionError("document_target_changed", "The exact committed tab changed during its readiness probe", {
+          documentProbeTarget: { stage, ...targetConditions(tab) },
+          nextAction: tab.pendingUrl ? "read_exact_tab_pending_navigation_then_bounded_commit_wait" : "read_exact_tab_identity_before_retrying_read",
+        });
+      }
+      if (!allowed || !allowed.has(originOf(tab.url))) throw companionError("target_origin_not_allowed", "Committed document origin is outside the allowlist");
+    };
+    assertTab(before, "before_injection");
+    if (Date.now() >= deadline) throw companionError("document_readiness_timeout", "Committed document probe exceeded its deadline");
+    const results = bindInjectionDocumentIdentity(await executePageScriptWithReadRetry(
+      { tabId, frameIds: [0] }, "snapshot", { maxTextChars: 0 }, deadline - Date.now(),
+    ));
+    const entry = results[0];
+    if (results.length !== 1 || entry?.frameId !== 0 || !entry.result || typeof entry.result !== "object" || Array.isArray(entry.result)) {
+      throw companionError("document_probe_invalid", "Chrome returned a malformed committed document probe");
+    }
+    if (typeof entry.documentId !== "string" || entry.documentId.length === 0 || entry.result.pageInstanceId !== `chrome-document:${entry.documentId}`) {
+      throw companionError("document_identity_unavailable", "Chrome did not provide the committed document identity");
+    }
+    if (entry.result.url !== url) {
+      let normalizedUrlMatches = false;
+      try { normalizedUrlMatches = new URL(entry.result.url).href === new URL(url).href; } catch {}
+      throw companionError("document_target_changed", "Document URL does not match the committed tab", {
+        documentProbeTarget: { stage: "document_url", documentUrlMatches: false, normalizedUrlMatches },
+      });
+    }
+    if (!["interactive", "complete", "loading"].includes(entry.result.readyState)) throw companionError("document_probe_invalid", "Chrome returned an invalid document readiness state");
+    if (entry.result.readyState === "loading") throw companionError("document_not_ready", "The committed document DOM is still loading");
+    const after = await chrome.tabs.get(tabId);
+    assertTab(after, "after_injection");
+    if (Date.now() >= deadline) throw companionError("document_readiness_timeout", "Committed document probe exceeded its deadline");
+    return { documentId: entry.documentId, readyState: entry.result.readyState, url: entry.result.url, tab: after };
+  })(), Math.min(READ_API_TIMEOUT_MS, remaining), "document_readiness_timeout", "Committed document probe exceeded its deadline").catch((error) => {
+    // The nested script timer and the whole-probe timer share the same bound.
+    // Whichever fires first must expose the same readiness timeout classification.
+    if (error?.code === "page_execution_timeout") throw companionError("document_readiness_timeout", "Committed document probe exceeded its deadline");
+    throw error;
+  });
+}
+
+async function waitForCommittedTab(tabId, { requestedUrl, previousUrl = null, previousDocumentId = null, fragmentRequestedUrl = null, expectedWindowId, allowedOrigins, timeoutMs = DEFAULT_NAVIGATION_TIMEOUT_MS, deadline = Date.now() + timeoutMs } = {}) {
   const requested = requestedUrl ? requireSafeUrl(requestedUrl) : null;
-  const previous = previousUrl ? requireSafeUrl(previousUrl) : null;
-  let sawNavigation = previous === null || requested === previous;
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() <= deadline) {
-    const tab = await chrome.tabs.get(tabId);
-    if (tab.status === "loading" || (tab.pendingUrl && tab.pendingUrl !== previous) || (previous && tab.url && tab.url !== previous)) {
-      sawNavigation = true;
+  if (previousUrl !== null && (typeof previousDocumentId !== "string" || !previousDocumentId)) {
+    throw companionError("previous_document_identity_required", "Navigation requires the browser document identity observed before dispatch");
+  }
+  while (Date.now() < deadline) {
+    try {
+      const document = await probeCommittedDocument(tabId, { expectedWindowId, allowedOrigins: allowedOrigins ?? [requested], deadline });
+      if (previousDocumentId === null || document.documentId !== previousDocumentId) return document.tab;
+      if (fragmentRequestedUrl !== null && fragmentRequestedUrl === requested && requested !== previousUrl
+        && document.documentId === previousDocumentId && document.url === fragmentRequestedUrl && document.tab.url === fragmentRequestedUrl) return document.tab;
+    } catch (error) {
+      if (["document_readiness_timeout", "page_execution_timeout"].includes(error?.code)) break;
+      if (!["document_target_changed", "document_not_ready"].includes(error?.code)) throw error;
     }
-    const committedHttpOrigin = originOf(tab.url);
-    if (sawNavigation && tab.status === "complete" && (requested === "about:blank" || committedHttpOrigin)) {
-      return tab;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await new Promise((resolve) => setTimeout(resolve, Math.min(50, Math.max(0, deadline - Date.now()))));
   }
   throw companionError("navigation_commit_timeout", "Timed out waiting for navigation commit");
 }
@@ -748,11 +861,17 @@ function sanitizeTab(tab) {
   return {
     id: tab.id,
     windowId: tab.windowId,
+    // Preserve the browser-provided opener lineage so the broker can bind an
+    // authentication popup to the exact task-owned tab that opened it. This
+    // is metadata only; it never grants ownership by itself.
+    ...(Number.isSafeInteger(tab.openerTabId) ? { openerTabId: tab.openerTabId } : {}),
     index: tab.index,
     active: tab.active,
     pinned: tab.pinned,
     groupId: tab.groupId,
     url: boundedTabText(tab.url, MAX_TAB_URL_CHARS),
+    pendingNavigationPresent: Boolean(tab.pendingUrl),
+    pendingUrlMatchesCommitted: Boolean(tab.pendingUrl) && tab.pendingUrl === tab.url,
     title: boundedTabText(tab.title, MAX_TAB_TITLE_CHARS),
     status: tab.status,
     discarded: tab.discarded,
@@ -860,9 +979,52 @@ async function ensureOffscreenClipboard() {
   if (await chrome.offscreen.hasDocument()) return;
   await chrome.offscreen.createDocument({
     url: "offscreen.html",
-    reasons: ["CLIPBOARD"],
-    justification: "Read or write bounded clipboard text, PNG or HTML after explicit Companion permission",
+    reasons: ["CLIPBOARD", "USER_MEDIA", "AUDIO_PLAYBACK"],
+    justification: "Read or write bounded clipboard data and record an explicitly selected tab with its audio",
   });
+}
+
+async function startCompanionTabRecording(params) {
+  await requireOptionalPermission("downloads", "recording_download_permission_required");
+  const tabId = requireTabId(params.tabId);
+  const tab = await chrome.tabs.get(tabId);
+  let protocol;
+  try { protocol = new URL(tab.url ?? "").protocol; } catch { protocol = null; }
+  if (!tab?.id || !/^https?:$/u.test(protocol ?? "")) {
+    throw companionError("recording_target_invalid", "Recording requires an exact HTTP(S) tab");
+  }
+  if (params.userGesture !== true && params.nativeHostTrigger !== true) {
+    throw companionError("recording_user_gesture_required", "Start tab recording from the Companion popup after selecting the exact target tab", { tabId, audioRequired: true });
+  }
+  await ensureOffscreenClipboard();
+  const streamId = String(params.streamId ?? await chrome.tabCapture.getMediaStreamId({ targetTabId: tabId }));
+  if (!streamId) throw companionError("recording_stream_id_missing", "Chrome did not provide a tab capture stream id");
+  const result = await chrome.runtime.sendMessage({ kind: "offscreen.recording.start", streamId, tabId, taskId: params.taskId ?? null });
+  if (!result?.ok) throw companionError(result?.code ?? "recording_start_failed", result?.error ?? "Tab recording could not start");
+  return { ...result, url: tab.url, title: tab.title ?? null, surface: "chrome-extension-tab", captureEngine: "chrome.tabCapture+offscreen+MediaRecorder", audioCaptured: true };
+}
+
+async function stopCompanionTabRecording(params) {
+  await ensureOffscreenClipboard();
+  const result = await chrome.runtime.sendMessage({ kind: "offscreen.recording.stop", filename: params.filename });
+  if (!result?.ok) throw companionError(result?.code ?? "recording_stop_failed", result?.error ?? "Tab recording could not stop");
+  return { ...result, surface: "chrome-extension-tab", captureEngine: "chrome.tabCapture+offscreen+MediaRecorder", audioCaptured: true, mediaVerified: result.bytes > 0 && result.chunks > 0 };
+}
+
+async function companionTabRecordingStatus(params) {
+  await ensureOffscreenClipboard();
+  if (params.armOnly === true) {
+    const tabId = requireTabId(params.tabId);
+    pendingAutoRecordingTabId = tabId;
+    return { armed: true, active: false, tabId, audioRequired: true, captureEngine: "chrome.tabCapture+offscreen+MediaRecorder" };
+  }
+  const result = await chrome.runtime.sendMessage({ kind: "offscreen.recording.status" });
+  if (!result?.ok) throw companionError(result?.code ?? "recording_status_failed", result?.error ?? "Recording status is unavailable");
+  if (result.active && Number.isSafeInteger(params.tabId) && result.tabId !== params.tabId) {
+    throw companionError("recording_target_mismatch", "The active recording belongs to another tab", { requestedTabId: params.tabId, activeTabId: result.tabId });
+  }
+  const last = result.lastResult && typeof result.lastResult === "object" ? result.lastResult : {};
+  return { ...result, ...last, surface: "chrome-extension-tab", captureEngine: "chrome.tabCapture+offscreen+MediaRecorder", audioCaptured: result.active || last.audioCaptured === true };
 }
 
 function redactPeripheralText(value, maxChars = 30_000) {
@@ -876,7 +1038,122 @@ function redactPeripheralText(value, maxChars = 30_000) {
   return { text: text.slice(0, maxChars), truncated: text.length > maxChars };
 }
 
+async function handleClipboardSourceStorage(message, sender) {
+  if (sender?.id !== chrome.runtime.id || sender?.tab || sender?.url !== chrome.runtime.getURL("offscreen.html")) {
+    throw companionError("clipboard_source_storage_sender_invalid", "Only the exact Companion offscreen document can access source metadata");
+  }
+  const prefix = "companion.clipboard.source.v1:";
+  const requestBinding = message.sourceBinding;
+  if (!requestBinding || typeof requestBinding.operationId !== "string"
+    || !/^[A-Za-z0-9_.:-]{1,200}$/u.test(requestBinding.operationId)) throw companionError("clipboard_source_storage_key_invalid", "Exact source operation binding is required");
+  if (message.action === "count") {
+    const values = await chrome.storage.local.get(null);
+    const records = Object.entries(values).filter(([key]) => key.startsWith(prefix));
+    // Reclaim full terminal ACK metadata, never the operation identity. One
+    // storage replacement leaves every unresolved intent untouched, including
+    // if compaction fails or the worker restarts before acknowledging it.
+    const active = records.filter(([, value]) => value?.compacted !== true);
+    if (active.length >= 512) {
+      const replacements = Object.fromEntries(active.filter(([, value]) => value?.state === "completed" && value.ack?.writeAcknowledged === true)
+        .map(([key, value]) => [key, { schema: value.schema, sourceBinding: value.sourceBinding,
+          state: "completed", completedAt: value.completedAt, compacted: true, writeAcknowledged: true }]));
+      if (Object.keys(replacements).length) await chrome.storage.local.set(replacements);
+      return active.length - Object.keys(replacements).length;
+    }
+    return active.length;
+  }
+  if (message.key !== prefix + requestBinding.operationId || typeof message.key !== "string" || !message.key.startsWith(prefix)
+    || !/^[A-Za-z0-9_.:-]{1,200}$/u.test(message.key.slice(prefix.length))) {
+    throw companionError("clipboard_source_storage_key_invalid", "Clipboard metadata is restricted to the source operation namespace");
+  }
+  const existing = (await chrome.storage.local.get(message.key))[message.key];
+  if (existing && JSON.stringify(existing.sourceBinding) !== JSON.stringify(requestBinding)) {
+    throw companionError("clipboard_source_binding_mismatch", "Source metadata does not belong to this exact request binding");
+  }
+  if (message.action === "get") return existing ?? null;
+  const value = message.value, binding = value?.sourceBinding;
+  const allowedKeys = value?.state === "intent" ? ["schema", "sourceBinding", "state", "intendedAt"]
+    : ["schema", "sourceBinding", "state", "completedAt", "ack"];
+  const ackKeys = new Set(["ok", "binary", "mimeType", "size", "formats", "writeAcknowledged", "pasteVerified", "contentReturned", "taskId", "targetOrigin", "chars"]);
+  let origin;
+  try { origin = new URL(binding?.targetOrigin).origin; } catch {}
+  if (message.action !== "set" || value?.schema !== "aos.chrome_companion.clipboard_source.v1"
+    || !["intent", "completed"].includes(value.state) || !binding || JSON.stringify(binding) !== JSON.stringify(requestBinding) || binding.operationId !== message.key.slice(prefix.length)
+    || typeof binding.taskId !== "string" || !binding.taskId || binding.taskId.length > 512
+    || typeof binding.generation !== "string" || !binding.generation || binding.generation.length > 200
+    || !/^https?:\/\//u.test(binding.targetOrigin ?? "") || origin !== binding.targetOrigin
+    || !/^[a-f0-9]{64}$/u.test(binding.payloadSha256 ?? "")
+    || Object.keys(binding).some(key => !["operationId", "taskId", "targetOrigin", "generation", "payloadSha256"].includes(key))
+    || Object.keys(value).some(key => !allowedKeys.includes(key)) || JSON.stringify(value).length > 3000
+    || (value.state === "completed" && (value.ack?.writeAcknowledged !== true
+      || value.ack.ok !== true
+      || (value.ack.chars !== undefined && (!Number.isSafeInteger(value.ack.chars) || value.ack.chars < 0 || value.ack.chars > 100_000))
+      || (value.ack.size !== undefined && (!Number.isSafeInteger(value.ack.size) || value.ack.size < 1 || value.ack.size > MAX_CLIPBOARD_BINARY_BYTES))
+      || (value.ack.mimeType !== undefined && value.ack.mimeType !== null && !["text/plain", "text/html", "image/png"].includes(value.ack.mimeType))
+      || (value.ack.taskId !== undefined && value.ack.taskId !== binding.taskId)
+      || (value.ack.targetOrigin !== undefined && value.ack.targetOrigin !== binding.targetOrigin)
+      || (value.ack.binary !== undefined && value.ack.binary !== true)
+      || (value.ack.pasteVerified !== undefined && value.ack.pasteVerified !== false)
+      || (value.ack.contentReturned !== undefined && value.ack.contentReturned !== false)
+      || Object.keys(value.ack).some(key => !ackKeys.has(key))
+      || (value.ack.formats && (!Array.isArray(value.ack.formats) || value.ack.formats.length > 3
+        || value.ack.formats.some(format => !["text/plain", "text/html", "image/png"].includes(format.mimeType)
+          || !Number.isSafeInteger(format.inputBytes) || format.inputBytes < 1 || format.inputBytes > MAX_CLIPBOARD_BINARY_BYTES
+          || Object.keys(format).some(key => !["mimeType", "inputBytes"].includes(key)))))))) {
+    throw companionError("clipboard_source_storage_value_invalid", "Only bounded request-bound intent and terminal ACK metadata may be persisted");
+  }
+  if (existing && (JSON.stringify(existing.sourceBinding) !== JSON.stringify(binding)
+    || existing.state === "completed" || value.state === "intent")) {
+    throw companionError("clipboard_source_storage_immutable", "Stored clipboard intent binding and completed receipts cannot be replaced");
+  }
+  if (!existing && value.state !== "intent") throw companionError("clipboard_source_intent_required", "Terminal ACK requires a previously durable source intent");
+  if (!existing) {
+    const values = await chrome.storage.local.get(null);
+    if (Object.entries(values).filter(([key, record]) => key.startsWith(prefix) && record?.compacted !== true).length >= 512)
+      throw companionError("clipboard_source_capacity_reached", "Unresolved/full source metadata is at finite capacity");
+    // Keep permanent tombstones until the real storage byte limit is reached.
+    // Reserve terminal metadata before starting a new clipboard effect.
+    const usedBytes = typeof chrome.storage.local.getBytesInUse === "function"
+      ? await chrome.storage.local.getBytesInUse(null)
+      : Object.entries(values).reduce((total, [key, record]) => total + new TextEncoder().encode(key + JSON.stringify(record)).length, 0);
+    const quotaBytes = chrome.storage.local.QUOTA_BYTES ?? 10 * 1024 * 1024;
+    // The validated terminal JSON is at most 3000 UTF-16 units; reserving
+    // four bytes per unit also covers non-ASCII task bindings conservatively.
+    if (usedBytes + new TextEncoder().encode(message.key + JSON.stringify(value)).length + 12_000 > quotaBytes)
+      throw companionError("clipboard_source_capacity_reached", "Durable source identities reached the storage byte limit; a new clipboard write was not started");
+  }
+  await chrome.storage.local.set({ [message.key]: value });
+  return true;
+}
+
 async function runClipboardOperation(method, params) {
+  const sourceMessage = async payload => {
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(payload)));
+    return { operationId: params.operationId, taskId: params.taskId, generation: params.generation,
+      targetOrigin: params.targetOrigin ?? params.origin,
+      payloadSha256: [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, "0")).join("") };
+  };
+  const compactedDuplicate = (result, message) => {
+    if (result.compacted !== true) return null;
+    const receipt = result.sourceReceipt, binding = receipt?.sourceBinding;
+    if (result.ok !== true || result.duplicateDelivery !== true || result.acknowledgedHistorical !== true
+      || receipt?.state !== "completed" || receipt.compacted !== true || receipt.writeAcknowledged !== true
+      || binding?.operationId !== message.operationId || binding?.taskId !== message.taskId
+      || binding?.generation !== message.generation || binding?.targetOrigin !== new URL(message.targetOrigin).origin
+      || binding?.payloadSha256 !== message.payloadSha256)
+      throw companionError("clipboard_write_result_unknown", "Compacted receipt did not match the exact historical source request", { operationEffectState: "unknown", mutationDispatchAttempted: false, retryWrite: false });
+    return { written: false, writeAcknowledged: true, acknowledgedHistorical: true, compacted: true,
+      duplicateDelivery: true, sourceReceipt: receipt, pasteVerified: false, contentReturned: false,
+      operationEffectState: "none", mutationDispatchAttempted: false };
+  };
+  if (method === "clipboard.receipt") {
+    await ensureOffscreenClipboard();
+    const live = await chrome.tabs.get(requireTabId(params.tabId));
+    const result = await chrome.runtime.sendMessage({ kind: "offscreen.clipboard.receipt", sourceOperationId: params.sourceOperationId,
+      payloadSha256: params.payloadSha256, taskId: params.taskId, generation: params.generation, targetOrigin: new URL(live.url).origin });
+    if (!result?.ok) throw companionError(result?.code ?? "clipboard_receipt_failed", result?.error ?? "Source receipt lookup failed", result?.details);
+    return result;
+  }
   if (method === "clipboard.write" && params.formats !== undefined) {
     let message, expectedBytes = 0; const expectedFormats = [];
     try {
@@ -897,7 +1174,8 @@ async function runClipboardOperation(method, params) {
       }
       await requireOptionalPermission("clipboardWrite", "clipboard_permission_required");
       await ensureOffscreenClipboard();
-      message = { kind: "offscreen.clipboard.binary.write", formats: params.formats, maxBytes: MAX_CLIPBOARD_BINARY_BYTES, optIn: true, taskId: params.taskId, targetOrigin: params.targetOrigin ?? params.origin };
+      message = { kind: "offscreen.clipboard.binary.write", formats: params.formats, maxBytes: MAX_CLIPBOARD_BINARY_BYTES, optIn: true,
+        ...await sourceMessage({ formats: params.formats.map(({ mimeType, dataBase64 }) => ({ mimeType, dataBase64 })) }) };
       expectedBytes = totalBytes;
     } catch (error) {
       error.details = { ...(error?.details ?? {}), operationEffectState: "none", mutationDispatchAttempted: false };
@@ -907,11 +1185,23 @@ async function runClipboardOperation(method, params) {
     try { result = await chrome.runtime.sendMessage(message); }
     catch { throw companionError("clipboard_write_result_unknown", "The clipboard write acknowledgement was lost; read back before continuing", { operationEffectState: "unknown", mutationDispatchAttempted: true, retryWrite: false }); }
     if (!result?.ok) throw companionError(result?.code ?? "clipboard_write_result_unknown", result?.error ?? "Clipboard write was not acknowledged", result?.details ?? { operationEffectState: "unknown", mutationDispatchAttempted: true, retryWrite: false });
-    if (result.writeAcknowledged !== true || result.taskId !== message.taskId || result.targetOrigin !== new URL(message.targetOrigin).origin
-      || result.size !== expectedBytes || JSON.stringify(result.formats) !== JSON.stringify(expectedFormats)) {
+    const historical = compactedDuplicate(result, message);
+    if (historical) return historical;
+    if (result.ok !== true || result.binary !== true || result.writeAcknowledged !== true || result.taskId !== message.taskId || result.targetOrigin !== new URL(message.targetOrigin).origin
+      || result.size !== expectedBytes || JSON.stringify(result.formats) !== JSON.stringify(expectedFormats)
+      || result.sourceReceipt?.sourceBinding?.operationId !== message.operationId
+      || result.sourceReceipt?.sourceBinding?.taskId !== message.taskId
+      || result.sourceReceipt?.sourceBinding?.targetOrigin !== new URL(message.targetOrigin).origin
+      || result.sourceReceipt?.sourceBinding?.generation !== message.generation
+      || result.sourceReceipt?.sourceBinding?.payloadSha256 !== message.payloadSha256
+      || result.sourceReceipt?.ack?.ok !== true || result.sourceReceipt?.ack?.binary !== true
+      || result.sourceReceipt?.ack?.writeAcknowledged !== true || result.sourceReceipt?.ack?.size !== expectedBytes
+      || JSON.stringify(result.sourceReceipt?.ack?.formats) !== JSON.stringify(expectedFormats)
+      || result.sourceReceipt?.state !== "completed") {
       throw companionError("clipboard_write_result_unknown", "The clipboard write acknowledgement did not match this request", { operationEffectState: "unknown", mutationDispatchAttempted: true, retryWrite: false });
     }
-    return { written: true, binary: true, mimeType: result.mimeType, size: result.size, formats: result.formats, writeAcknowledged: true, pasteVerified: false, contentReturned: false };
+    return { written: true, binary: true, mimeType: result.mimeType, size: result.size, formats: result.formats, writeAcknowledged: true,
+      sourceReceipt: result.sourceReceipt, duplicateDelivery: result.duplicateDelivery === true, pasteVerified: false, contentReturned: false };
   }
   if (method === "clipboard.write" && typeof params.text !== "string") throw companionError("clipboard_write_payload_invalid", "Provide explicit text or MIME formats", { operationEffectState: "none", mutationDispatchAttempted: false });
   const permission = method === "clipboard.read" ? "clipboardRead" : "clipboardWrite";
@@ -924,10 +1214,21 @@ async function runClipboardOperation(method, params) {
     return { read: true, ...redacted, originalTruncated: result.truncated === true, redactionApplied: redacted.text !== result.text };
   }
   const text = String(params.text ?? "");
-  if (text.length > 100_000) throw companionError("clipboard_payload_too_large", "Clipboard write is limited to 100000 characters");
-  const result = await chrome.runtime.sendMessage({ kind: "offscreen.clipboard.write", text });
-  if (!result?.ok) throw companionError("clipboard_write_failed", result?.error ?? "Clipboard write failed");
-  return { written: true, chars: result.chars };
+  if (text.length > 100_000) throw companionError("clipboard_payload_too_large", "Clipboard write is limited to 100000 characters", { operationEffectState: "none", mutationDispatchAttempted: false });
+  const message = { kind: "offscreen.clipboard.write", text, ...await sourceMessage({ text }) };
+  let result;
+  try { result = await chrome.runtime.sendMessage(message); }
+  catch { throw companionError("clipboard_write_result_unknown", "Text clipboard acknowledgement was lost; inspect the source receipt without repeating the write", { operationEffectState: "unknown", mutationDispatchAttempted: true, retryWrite: false, sourceBinding: { operationId: message.operationId, payloadSha256: message.payloadSha256 } }); }
+  if (!result?.ok) throw companionError(result?.code ?? "clipboard_write_result_unknown", result?.error ?? "Clipboard write failed", result?.details ?? { operationEffectState: "unknown", mutationDispatchAttempted: true, retryWrite: false });
+  const historical = compactedDuplicate(result, message);
+  if (historical) return historical;
+  const binding = result.sourceReceipt?.sourceBinding;
+  if (result.writeAcknowledged !== true || result.chars !== text.length || result.sourceReceipt?.state !== "completed"
+    || binding?.operationId !== message.operationId || binding?.taskId !== message.taskId
+    || binding?.generation !== message.generation || binding?.targetOrigin !== new URL(message.targetOrigin).origin
+    || binding?.payloadSha256 !== message.payloadSha256) throw companionError("clipboard_write_result_unknown", "Text clipboard ACK did not match this source request", { operationEffectState: "unknown", mutationDispatchAttempted: true, retryWrite: false });
+  return { written: true, chars: result.chars, writeAcknowledged: true, sourceReceipt: result.sourceReceipt,
+    duplicateDelivery: result.duplicateDelivery === true, pasteVerified: false, contentReturned: false };
 }
 
 async function runBinaryClipboardOperation(params) {
@@ -1333,6 +1634,32 @@ function visualModifiers(value) {
   return { bits: modifiers, values: [...new Set(normalized)] };
 }
 
+async function trustedVisualKeyMetadata(key, modifiers) {
+  const named = {
+    Enter: 13, Escape: 27, Tab: 9, Backspace: 8, Delete: 46, Space: 32,
+    Home: 36, End: 35, PageUp: 33, PageDown: 34,
+    ArrowLeft: 37, ArrowUp: 38, ArrowRight: 39, ArrowDown: 40,
+  };
+  const letter = /^[a-z]$/iu.test(key);
+  const digit = /^[0-9]$/u.test(key);
+  const functionKey = /^F(?:[1-9]|1[0-2])$/u.test(key);
+  const metadata = {
+    key: key === "Space" ? " " : key,
+    code: letter ? `Key${key.toUpperCase()}` : digit ? `Digit${key}` : key,
+    windowsVirtualKeyCode: letter || digit ? key.toUpperCase().charCodeAt(0) : functionKey ? 111 + Number(key.slice(1)) : named[key],
+    modifiers,
+  };
+  const command = { a: "selectAll", c: "copy", x: "cut", v: "paste" }[key.toLowerCase()];
+  if (command && (modifiers === 2 || modifiers === 4)) {
+    let platform = "";
+    try { platform = String((await chrome.runtime.getPlatformInfo())?.os || ""); }
+    catch { platform = String(globalThis.navigator?.userAgentData?.platform || globalThis.navigator?.platform || ""); }
+    const shortcut = /mac/iu.test(platform) ? 4 : /win|linux|cros/iu.test(platform) ? 2 : null;
+    if (modifiers === shortcut) metadata.commands = [command];
+  }
+  return metadata;
+}
+
 async function dispatchMouseClick(target, point, clickCount, { button = "left", holdMs = 0 } = {}) {
   const normalizedButton = visualButton(button);
   const normalizedCount = visualClickCount(clickCount);
@@ -1399,12 +1726,49 @@ async function runTrustedVisualInput(tabId, method, params) {
       void acquisition.then(lease => lease.release()).catch(() => {});
       throw error;
     }
+    if (method === "visual.typeText" && params.clickBeforeType === false) {
+      const guard = params.editorGuard;
+      const text = params.text;
+      if (params.clear !== false || !guard || typeof text !== "string" || text.length < 1 || text.length > 1_000
+        || typeof guard.expectedBody !== "string" || typeof guard.expectedFullBody !== "string"
+        || guard.expectedBody.length > 100_000 || guard.expectedFullBody.length > 100_000
+        || !Number.isSafeInteger(guard.offset) || guard.offset < 0 || guard.offset > guard.expectedBody.length
+        || guard.expectedFullBody !== guard.expectedBody.slice(0, guard.offset) + text + guard.expectedBody.slice(guard.offset)) {
+        throw companionError("exact_editor_guard_required", "No-click insertion requires a bounded exact full-body projection and clear:false", { operationEffectState: "none", mutationDispatchAttempted: false });
+      }
+      const payload = { locator: { css: "div.ProseMirror", frameId: params.frameId ?? 0 },
+        expectedBody: guard.expectedBody, offset: guard.offset, requireSelection: true, establishSelection: guard.establishSelection === true };
+      if (guard.establishSelection === true) {
+        await runPageOperation(tabId, "prepareExactEditor", payload, { allowedOrigins: params.allowedOrigins });
+      }
+      const before = await runPageOperation(tabId, "verifyExactEditor", payload, { allowedOrigins: params.allowedOrigins });
+      if (before.pageInstanceId !== params.pageInstanceId || before.url !== guard.url) {
+        throw companionError("exact_editor_target_changed", "Exact editor page identity changed", { operationEffectState: "none", mutationDispatchAttempted: false });
+      }
+      // One trusted insertion only: no mouse, clipboard, whole-field replace,
+      // semantic input fallback or automatic retry after an ambiguous result.
+      await sendDebuggerCommand(target, "Input.insertText", { text });
+      let after;
+      try {
+        after = await runPageOperation(tabId, "verifyExactEditor", { ...payload, requireSelection: false,
+          expectedBody: guard.expectedFullBody }, { allowedOrigins: params.allowedOrigins });
+      } catch (error) {
+        throw companionError("exact_editor_input_not_committed", "Trusted insertion full-body readback failed; reconcile this attempt", { operationEffectState: "unknown", mutationDispatchAttempted: true, causeCode: error?.code });
+      }
+      if (after.pageInstanceId !== before.pageInstanceId || after.url !== before.url) {
+        throw companionError("exact_editor_input_target_changed", "Document changed after trusted insertion", { operationEffectState: "unknown", mutationDispatchAttempted: true });
+      }
+      return { typed: true, valueVerified: true, chars: text.length, trustedInput: true, clickBeforeType: false,
+        clipboardUsed: false, fullBodyVerified: true, bodySha256: after.bodySha256, selection: after.selection,
+        pageInstanceId: after.pageInstanceId, url: after.url, osCursorMoved: false, foregroundActivated: true };
+    }
     const point = requireVisualPoint(params.point);
     // This is deliberately an in-page overlay only. Chrome debugger input
     // events do not move the user's macOS cursor, and the overlay has
     // pointer-events:none so it cannot intercept the page or the user's own
     // mouse. It is visual ownership evidence, not success evidence.
     let virtualCursorShown = false;
+    let clickGuardReadback = null;
     try {
       await runPageOperation(tabId, "showVisualPoint", {
         point,
@@ -1417,6 +1781,55 @@ async function runTrustedVisualInput(tabId, method, params) {
       // cannot render the overlay must not turn a visual action into a blind
       // operation or an OS-level fallback.
     }
+    if (method === "visual.click" || method === "visual.doubleClick") {
+      const guard = params.visualTargetGuard;
+      if (!guard || !["target", "point"].includes(guard.kind)) {
+        throw companionError("visual_click_guard_required", "Trusted clicks require broker-verified geometry", {
+          operationEffectState: "none", mutationDispatchAttempted: false,
+        });
+      }
+      let current;
+      try {
+        current = await runPageOperation(tabId, guard.kind === "target" ? "inspectVisualTarget" : "inspectVisualPoint", {
+          locator: guard.locator, point, frameId: guard.frameId,
+          scroll: false, requireHitOwner: guard.kind === "target",
+        }, { allowedOrigins: params.allowedOrigins });
+      } catch (error) {
+        throw companionError(error?.code ?? "visual_target_proof_stale_geometry", error?.message ?? "The click target cannot be verified after activation", {
+          operationEffectState: "none", mutationDispatchAttempted: false,
+        });
+      }
+      const samePoint = Number(current?.point?.x) === Number(guard.point?.x)
+        && Number(current?.point?.y) === Number(guard.point?.y);
+      // Native debugger attachment can change the content height. For an
+      // exact target, identical clipped geometry and hit ownership prove the
+      // same click despite a height-only extent change. Explicit point proofs
+      // have no target identity, so they retain the full viewport boundary.
+      const sameViewport = ["width", "devicePixelRatio"].every(key => Number(current?.viewport?.[key]) === Number(guard.viewport?.[key]))
+        && Number(current?.viewport?.scale ?? 1) === Number(guard.viewport?.scale ?? 1)
+        && (guard.kind === "target" || Number(current?.viewport?.height) === Number(guard.viewport?.height));
+      const sameScroll = !guard.scroll || ["x", "y"].every(key => Number(current?.scroll?.[key]) === Number(guard.scroll?.[key]));
+      const sameRect = guard.kind === "point" || ["x", "y", "width", "height"].every(key => Number(current?.clippedRect?.[key]) === Number(guard.rect?.[key]));
+      const sameFrame = guard.kind === "point" || (JSON.stringify(current?.framePath ?? []) === JSON.stringify(guard.framePath ?? [])
+        && String(current?.coordinateSpace ?? "viewport") === String(guard.coordinateSpace ?? "viewport"));
+      const samePage = String(current?.topLevelUrl || current?.url || "") === String(guard.pageUrl || "")
+        && (guard.pageInstanceId === null || current?.pageInstanceId === guard.pageInstanceId);
+      const targetWithinViewport = guard.kind === "point" || (Number(current?.clippedRect?.x) >= 0 && Number(current?.clippedRect?.y) >= 0
+        && Number(current?.clippedRect?.x) + Number(current?.clippedRect?.width) <= Number(current?.viewport?.width)
+        && Number(current?.clippedRect?.y) + Number(current?.clippedRect?.height) <= Number(current?.viewport?.height));
+      const checks = { supported: current?.supported !== false, samePage, samePoint, sameViewport, sameScroll, sameRect, sameFrame, targetWithinViewport };
+      if (Object.values(checks).some(matched => !matched)) {
+        throw companionError("visual_target_proof_stale_geometry", "The inspected click target moved or changed after foreground activation", {
+          operationEffectState: "none", mutationDispatchAttempted: false,
+          mismatches: Object.keys(checks).filter(key => !checks[key]),
+          expectedViewport: guard.viewport, observedViewport: current?.viewport,
+        });
+      }
+      clickGuardReadback = { verified: true, kind: guard.kind, expectedViewport: guard.viewport, observedViewport: current.viewport,
+        viewportHeightChanged: Number(current.viewport.height) !== Number(guard.viewport.height),
+        sameTargetGeometry: guard.kind === "target" && sameRect && samePoint,
+        hitOwnerVerified: guard.kind === "target" };
+    }
     if (method === "visual.pointerMove") {
       const from = params.from ? requireVisualPoint(params.from, "from") : point;
       await moveMouse(target, from, point, params.steps);
@@ -1428,7 +1841,7 @@ async function runTrustedVisualInput(tabId, method, params) {
         throw companionError("visual_secondary_button_requires_explicit_opt_in", "Right or middle visual clicks require explicit per-action opt-in");
       }
       const click = await dispatchMouseClick(target, point, params.clickCount ?? 1, { button, holdMs: params.holdMs ?? 0 });
-      return { clicked: true, point, ...click, trustedInput: true, virtualCursorShown, osCursorMoved: false, foregroundActivated: true };
+      return { clicked: true, point, ...click, trustedInput: true, virtualCursorShown, clickGuardReadback, osCursorMoved: false, foregroundActivated: true };
     }
     if (method === "visual.doubleClick") {
       const button = visualButton(params.button);
@@ -1437,7 +1850,7 @@ async function runTrustedVisualInput(tabId, method, params) {
       }
       const first = await dispatchMouseClick(target, point, 1, { button, holdMs: params.holdMs ?? 0 });
       await dispatchMouseClick(target, point, 2, { button, holdMs: params.holdMs ?? 0 });
-      return { doubleClicked: true, point, ...first, trustedInput: true, virtualCursorShown, osCursorMoved: false, foregroundActivated: true };
+      return { doubleClicked: true, point, ...first, trustedInput: true, virtualCursorShown, clickGuardReadback, osCursorMoved: false, foregroundActivated: true };
     }
     if (method === "visual.drag") {
       const to = requireVisualPoint(params.to, "to");
@@ -1465,13 +1878,15 @@ async function runTrustedVisualInput(tabId, method, params) {
         throw companionError("visual_modifier_requires_explicit_opt_in", "Alt, Ctrl, or Meta visual key combinations require explicit per-action opt-in", { modifiers: shortcutModifiers });
       }
       if (method === "visual.pressKey" && params.clickBeforeKey !== false) await dispatchMouseClick(target, point, 1);
-      const normalizedKey = key === "Space" ? " " : key;
+      const keyMetadata = await trustedVisualKeyMetadata(key, modifierState.bits);
       const keyEventType = method === "visual.keyDown" ? "keyDown" : method === "visual.keyUp" ? "keyUp" : null;
       if (keyEventType) {
-        await sendDebuggerCommand(target, "Input.dispatchKeyEvent", { type: keyEventType, key: normalizedKey, modifiers: modifierState.bits });
+        const { commands, ...releaseMetadata } = keyMetadata;
+        await sendDebuggerCommand(target, "Input.dispatchKeyEvent", { type: keyEventType, ...(keyEventType === "keyUp" ? releaseMetadata : keyMetadata) });
       } else {
-        await sendDebuggerCommand(target, "Input.dispatchKeyEvent", { type: "keyDown", key: normalizedKey, modifiers: modifierState.bits });
-        await sendDebuggerCommand(target, "Input.dispatchKeyEvent", { type: "keyUp", key: normalizedKey, modifiers: modifierState.bits });
+        await sendDebuggerCommand(target, "Input.dispatchKeyEvent", { type: "keyDown", ...keyMetadata });
+        const { commands, ...releaseMetadata } = keyMetadata;
+        await sendDebuggerCommand(target, "Input.dispatchKeyEvent", { type: "keyUp", ...releaseMetadata });
       }
       return { keyPressed: key, keyEventType: keyEventType ?? "keyDown+keyUp", modifiers: modifierState.values, point, trustedInput: true, virtualCursorShown, osCursorMoved: false, foregroundActivated: true };
     }
@@ -1780,14 +2195,45 @@ async function executeCommand(method, params) {
         "tabs_query_timeout",
         "Chrome did not return the tab inventory within the bounded read window",
       )).slice(0, MAX_TAB_LIST_ENTRIES).map(sanitizeTab);
+    case "recording.status":
+      return companionTabRecordingStatus(params);
+    case "recording.startAuto":
+      return startCompanionTabRecording({ ...params, userGesture: true });
+    case "recording.stopAuto":
+      return stopCompanionTabRecording(params);
     case "tabs.get":
       return sanitizeTab(await chrome.tabs.get(requireTabId(params.tabId)));
+    case "tabs.navigationDiagnostics":
+      return exactNavigationDiagnostics(await withTimeout(chrome.tabs.get(requireTabId(params.tabId)), READ_API_TIMEOUT_MS,
+        "tabs_query_timeout", "Exact tab navigation diagnostics exceeded its read deadline"), params);
+    case "tabs.stopLoading":
+      return stopExactNavigation({ tabs: chrome.tabs, pool: debuggerSessions, sendCommand: sendDebuggerCommand,
+        requirePermission: requireTrustedDebuggerAccess, params,
+        onCleanup: outcome => postNativeMessage({ kind: "extension.event", event: "debugger.cleanup",
+          operationId: params.operationId, taskId: params.taskId, sessionId: params.sessionId,
+          profileInstanceId: params.profileInstanceId, generation: params.generation, tabId: params.tabId,
+          status: outcome.status, reason: outcome.reason }, { port: params.replyPort }) });
+    case "tabs.waitForCommit": {
+      const tab = await chrome.tabs.get(requireTabId(params.tabId));
+      if (tab.url !== params.expectedUrl) throw companionError("document_target_changed", "Commit wait requires the exact previously observed URL");
+      const timeoutMs = Math.min(15_000, Math.max(100, Number(params.timeoutMs) || 5_000));
+      const committed = await waitForCommittedTab(tab.id, { expectedWindowId: tab.windowId, allowedOrigins: [tab.url], timeoutMs });
+      if (committed.url !== params.expectedUrl) throw companionError("document_target_changed", "Commit wait observed another exact URL");
+      return { ...sanitizeTab(committed), committed: true, readOnly: true, timeoutMs };
+    }
     case "browser.searchLibrary":
       return searchBrowserLibrary(chrome, params, userControls.state().blockedOrigins);
     case "browser.listWindows":
-      return (await chrome.windows.getAll({ populate: false, windowTypes: ["normal"] })).map(window => ({
+      return (await chrome.windows.getAll({ populate: true, windowTypes: ["normal"] })).map(window => ({
         id: window.id, focused: window.focused, state: window.state, type: window.type,
-        left: window.left, top: window.top, width: window.width, height: window.height }));
+        left: window.left, top: window.top, width: window.width, height: window.height,
+        // Keep window choice deterministic for multi-window workflows without
+        // exposing page contents.  Callers can use the exact tab IDs in the
+        // bounded inventory for a subsequent owner-scoped lease.
+        activeTabId: window.tabs?.find(tab => tab.active)?.id ?? null,
+        tabCount: Array.isArray(window.tabs) ? window.tabs.length : 0,
+        tabs: (window.tabs ?? []).slice(0, MAX_TAB_LIST_ENTRIES).map(sanitizeTab),
+      }));
     case "tabs.configure":
       await assertLiveOrigin(requireTabId(params.tabId), params);
       return configureTaskTab(chrome, params);
@@ -1824,7 +2270,7 @@ async function executeCommand(method, params) {
       try {
         const committed = requestedUrl === "about:blank"
           ? tab
-          : await waitForCommittedTab(tab.id, { requestedUrl });
+          : await waitForCommittedTab(tab.id, { requestedUrl, expectedWindowId: tab.windowId, allowedOrigins: params.allowedOrigins });
         finishPhase("navigation_commit");
         if (params.mutation && requestedUrl !== "about:blank") await assertLiveOrigin(committed.id, params);
         finishPhase("origin_check");
@@ -1858,10 +2304,18 @@ async function executeCommand(method, params) {
       const allowed = allowedOriginsOf(params.allowedOrigins);
       if (params.mutation && (!allowed || !allowed.has(requestedOrigin))) throw companionError("target_origin_not_allowed", "Navigation target origin is not allowlisted");
       const before = await chrome.tabs.get(requireTabId(params.tabId));
-      const tab = await chrome.tabs.update(requireTabId(params.tabId), {
+      const previousUrl = requireSafeUrl(before.url);
+      const previousBase = new URL(previousUrl), requestedBase = new URL(requestedUrl);
+      previousBase.hash = requestedBase.hash = "";
+      // Bind fragment intent before dispatch; an observed URL change cannot grant this exception.
+      const fragmentRequestedUrl = previousUrl !== requestedUrl && previousBase.href === requestedBase.href ? requestedUrl : null;
+      const deadline = Date.now() + DEFAULT_NAVIGATION_TIMEOUT_MS;
+      const previousDocument = await probeCommittedDocument(before.id, { expectedWindowId: before.windowId, expectedUrl: before.url, allowedOrigins: params.allowedOrigins, deadline });
+      const tab = await withTimeout(chrome.tabs.update(requireTabId(params.tabId), {
         url: requestedUrl,
-      });
-      const committed = await waitForCommittedTab(tab.id, { requestedUrl, previousUrl: before.url });
+      }), Math.max(1, deadline - Date.now()), "navigation_commit_timeout", "Timed out waiting for navigation commit");
+      const committed = await waitForCommittedTab(tab.id, { requestedUrl, previousUrl, previousDocumentId: previousDocument.documentId, fragmentRequestedUrl,
+        expectedWindowId: before.windowId, allowedOrigins: params.allowedOrigins, deadline });
       if (params.mutation) await assertLiveOrigin(committed.id, params);
       return sanitizeTab(committed);
     }
@@ -1956,6 +2410,9 @@ async function executeCommand(method, params) {
         query: String(params.query ?? ""),
         locator: params.locator,
         attributes: params.attributes,
+        exactEditor: params.exactEditor === true,
+        splitBinding: params.splitBinding === true,
+        maxEditorChars: params.maxEditorChars,
         offset: params.offset,
         includeHidden: params.includeHidden === true,
         limit: Math.min(Math.max(Number(params.limit ?? 25), 1), 100),
@@ -2008,6 +2465,7 @@ async function executeCommand(method, params) {
       await assertLiveOrigin(requireTabId(params.tabId), params);
       return runBinaryClipboardOperation(params);
     case "clipboard.read":
+    case "clipboard.receipt":
     case "clipboard.write":
       await assertLiveOrigin(requireTabId(params.tabId), params);
       return runClipboardOperation(method, params);
@@ -2061,6 +2519,11 @@ async function executeCommand(method, params) {
         blockTag: params.blockTag,
         text: params.text,
         occurrence: params.occurrence,
+        expectedBody: params.expectedBody,
+        expectedFullBody: params.expectedFullBody,
+        expectedSelection: params.expectedSelection,
+        expectedCaret: params.expectedCaret,
+        expectedEditorHtml: params.expectedEditorHtml,
         companionContext,
       }, params);
     case "page.scroll":
@@ -2110,6 +2573,11 @@ async function executeCommand(method, params) {
       }, params);
     case "page.upload":
       await assertLiveOrigin(requireTabId(params.tabId), params);
+      // Sites such as Etsy reject videos rebuilt from bytes inside the page;
+      // hand Chrome the validated file path like its own file chooser does.
+      if (String(params.file?.mimeType ?? "").startsWith("video/") && typeof params.file?.filePath === "string") {
+        return runNativeFileUpload(requireTabId(params.tabId), { locator: params.locator, file: params.file, companionContext }, params);
+      }
       return runAndCheckMutation(requireTabId(params.tabId), "upload", {
         locator: params.locator,
         file: params.file,
@@ -2258,6 +2726,68 @@ async function runAndCheckMutation(tabId, action, payload, params) {
     throw companionError("semantic_input_not_committed", "The field did not retain the requested text", { operationEffectState: "unknown", mutationDispatchAttempted: true, valueLength: result.valueLength, expectedValueLength: result.expectedValueLength });
   }
   return result;
+}
+
+async function runNativeFileUpload(tabId, payload, params) {
+  const startedAt = Date.now();
+  const file = payload.file;
+  if (Number.isSafeInteger(payload.locator?.frameId) && payload.locator.frameId !== 0) {
+    throw companionError("native_upload_frame_unsupported", "Native video upload supports only the top frame", { operationEffectState: "none", mutationDispatchAttempted: false });
+  }
+  if (!file?.filePath?.startsWith("/") || typeof file.name !== "string" || !Number.isSafeInteger(file.size)) {
+    throw companionError("upload_payload_invalid", "Validated native upload payload is missing", { operationEffectState: "none", mutationDispatchAttempted: false });
+  }
+  const nonce = crypto.randomUUID();
+  const options = { allowedOrigins: params.allowedOrigins };
+  const marked = await runPageOperation(tabId, "markUploadTarget", { locator: payload.locator, nonce, companionContext: payload.companionContext }, options);
+  await assertLiveOrigin(tabId, params);
+  const expectedFiles = [{ name: file.name, size: file.size, type: file.mimeType }];
+  let dispatched = false;
+  try {
+    await withReadOnlyDebugger(tabId, async (target) => {
+      const documentNode = await sendDebuggerCommand(target, "DOM.getDocument", { depth: 0 });
+      const match = await sendDebuggerCommand(target, "DOM.querySelector", {
+        nodeId: documentNode.root.nodeId,
+        selector: `input[type=file][data-aos-upload-target="${nonce}"]`,
+      });
+      if (!match?.nodeId) throw companionError("native_upload_target_missing", "The marked file input was not found", { operationEffectState: "none", mutationDispatchAttempted: false });
+      dispatched = true;
+      await sendDebuggerCommand(target, "DOM.setFileInputFiles", { files: [file.filePath], nodeId: match.nodeId });
+    });
+  } catch (error) {
+    if (dispatched) error.details = { ...(error.details ?? {}), operationEffectState: "unknown", mutationDispatchAttempted: true,
+      nextAction: "inspect_existing_attachment_state_without_reupload" };
+    throw error;
+  } finally {
+    await runPageOperation(tabId, "unmarkUploadTarget", { nonce }, options).catch(() => {});
+  }
+  const dispatchedAt = Date.now();
+  await new Promise(resolve => setTimeout(resolve, 250));
+  let readback = null;
+  try {
+    readback = await runPageOperation(tabId, "verifyUpload", { locator: payload.locator, expectedFiles }, options);
+  } catch {
+    readback = null;
+  }
+  const retained = readback?.retained === true;
+  return {
+    uploaded: retained,
+    count: 1,
+    visualized: true,
+    nativeFileInput: true,
+    fileInputAssignmentVerified: true,
+    expectedFiles,
+    uploadReadbackVerified: retained,
+    uploadReadbackMethod: retained ? "file_input" : "site_confirmation_pending",
+    requiresSiteConfirmation: !retained,
+    uploadTiming: { pageInjectionMs: dispatchedAt - startedAt, settledReadbackMs: Date.now() - dispatchedAt },
+    element: readback?.element ?? marked.element,
+    file: { name: file.name, mimeType: file.mimeType, size: file.size, sha256: file.sha256 },
+    files: expectedFiles,
+    readback: readback ?? { files: [], inputFileCount: 0 },
+    url: marked.url,
+    pageInstanceId: marked.pageInstanceId,
+  };
 }
 
 async function runPageOperation(tabId, action, payload, { allowedOrigins } = {}) {
@@ -2670,7 +3200,24 @@ async function injectedPageOperation(action, payload) {
     }
     return regexCache.get(key).test(String(value ?? ""));
   };
+  const validateLocatorTree = (locator, nested = false, depth = 0) => {
+    if (!locator || typeof locator !== "object" || Array.isArray(locator) || depth > 8)
+      throw operationError("semantic_locator_index_invalid", "Provide one locator object with at most 8 nested filter levels");
+    const positions = ["nth", "ordinal", "last"].filter(key => locator[key] !== undefined);
+    if (positions.length > 1 || nested && positions.length)
+      throw operationError("semantic_locator_index_invalid", "Use only one of nth, ordinal, or last on the outer locator after filtering");
+    for (const [key, max] of [["nth", 4999], ["ordinal", 99]]) if (locator[key] !== undefined
+      && (!Number.isSafeInteger(locator[key]) || locator[key] < 0 || locator[key] > max))
+      throw operationError("semantic_locator_index_invalid", `${key} must be an integer from 0 to ${max}`);
+    if (locator.last !== undefined && locator.last !== true) throw operationError("semantic_locator_index_invalid", "last must be true or omitted");
+    for (const key of ["has", "hasNot", "ancestor", "within"]) if (locator[key] !== undefined) validateLocatorTree(locator[key], true, depth + 1);
+    for (const key of ["allOf", "anyOf"]) if (locator[key] !== undefined) {
+      if (!Array.isArray(locator[key]) || !locator[key].length || locator[key].length > 8) throw operationError("semantic_locator_index_invalid", `${key} requires 1 to 8 locator filters`);
+      for (const part of locator[key]) validateLocatorTree(part, true, depth + 1);
+    }
+  };
   const locateAll = (locator, { allowHiddenFile = false, fileInputOnly = false, includeHidden = false, scanLimit = 5_000 } = {}) => {
+    validateLocatorTree(locator);
     if (!locator || typeof locator !== "object") {
       throw new Error("locator must be an object");
     }
@@ -3147,6 +3694,97 @@ async function injectedPageOperation(action, payload) {
       controls,
     };
   }
+  // Explicit full-body reads use deterministic UTF-16 offsets, without the
+  // whitespace normalization and preview truncation of ordinary queries.
+  const exactEditorState = async () => {
+    if (payload.locator?.css !== "div.ProseMirror") throw operationError("exact_editor_locator_required", "Exact editor reads require div.ProseMirror");
+    const editors = document.querySelectorAll("div.ProseMirror");
+    if (editors.length !== 1 || !editors[0].isContentEditable || !visible(editors[0])) throw operationError("exact_editor_not_unique", "Require one visible contenteditable ProseMirror editor");
+    const editor = editors[0];
+    const maximum = payload.maxEditorChars ?? 100_000;
+    if (!Number.isSafeInteger(maximum) || maximum < 1 || maximum > 100_000) throw operationError("exact_editor_bound_invalid", "Editor bound must be 1 to 100000 UTF-16 units");
+    const boundaries = new Map(), points = [];
+    let body = "", nodes = 0;
+    const append = text => {
+      body += text;
+      if (body.length > maximum) throw operationError("exact_editor_oversize", "Exact editor body exceeds the requested bound");
+    };
+    const visit = node => {
+      if (++nodes > 20_000) throw operationError("exact_editor_structure_oversize", "Editor structure exceeds the bounded scan");
+      if (node.nodeType === 3) {
+        const text = node.nodeValue ?? "", start = body.length;
+        boundaries.set(node, { start, length: text.length });
+        points.push({ node, start, end: start + text.length });
+        append(text); return;
+      }
+      if (node.nodeType !== 1) throw operationError("exact_editor_structure_unsupported", "Unsupported editor node");
+      const tag = node.tagName.toLowerCase();
+      if (tag === "br") { boundaries.set(node, [body.length]); append("\n"); return; }
+      if (node !== editor && !/^(p|h[1-6]|span|strong|b|em|i|u|s|a|code)$/u.test(tag)) throw operationError("exact_editor_structure_unsupported", "Unsupported editor structure");
+      const offsets = [body.length];
+      [...node.childNodes].forEach((child, index) => {
+        if (node === editor && index > 0) append("\n");
+        visit(child); offsets.push(body.length);
+      });
+      boundaries.set(node, offsets);
+    };
+    visit(editor);
+    const offset = (node, position) => {
+      const bound = boundaries.get(node);
+      if (!bound || !Number.isSafeInteger(position) || position < 0) return null;
+      return Array.isArray(bound) ? bound[position] ?? null : position <= bound.length ? bound.start + position : null;
+    };
+    const selection = getSelection();
+    const range = selection?.rangeCount === 1 ? selection.getRangeAt(0) : null;
+    const start = range ? offset(range.startContainer, range.startOffset) : null;
+    const end = range ? offset(range.endContainer, range.endOffset) : null;
+    let splitBinding;
+    if (payload.splitBinding === true) {
+      if (!range?.collapsed || start === null || end === null)
+        throw operationError("rich_text_caret_required", "Split binding requires a current collapsed caret inside the exact editor");
+      const path = []; let node = range.startContainer;
+      while (node !== editor) {
+        const parent = node.parentNode;
+        if (!parent || path.length >= 32) throw operationError("rich_text_split_structure_unsupported", "Caret path exceeds the exact editor scope");
+        path.unshift([...parent.childNodes].indexOf(node)); node = parent;
+      }
+      const prefix = document.createRange(); prefix.selectNodeContents(editor); prefix.setEnd(range.startContainer, range.startOffset);
+      const expectedBody = String(editor.textContent ?? ""), expectedEditorHtml = editor.innerHTML;
+      if (expectedBody.length > maximum || expectedEditorHtml.length > maximum)
+        throw operationError("exact_editor_oversize", "Split binding body or HTML exceeds the requested bound");
+      splitBinding = { expectedBody, expectedFullBody: expectedBody, expectedEditorHtml,
+        expectedCaret: { path, offset: range.startOffset }, expectedSelection: { start: prefix.toString().length, end: prefix.toString().length } };
+    }
+    const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(body));
+    return { editor, points, body, ...(splitBinding ? { splitBinding } : {}), bodySha256: [...new Uint8Array(hash)].map(byte => byte.toString(16).padStart(2, "0")).join(""),
+      selection: { withinEditor: start !== null && end !== null, collapsed: Boolean(range?.collapsed), start, end, offsetUnit: "utf16" },
+      articleIdentity: { url: location.href, title: document.title, editorId: editor.id || null },
+      url: location.href, pageInstanceId, chars: body.length, truncated: false, serialization: "prosemirror-text-br-block-v1" };
+  };
+  if (action === "verifyExactEditor" || action === "prepareExactEditor") {
+    let state = await exactEditorState();
+    if (state.body !== payload.expectedBody) throw operationError("exact_editor_body_changed", "Exact editor body changed", { operationEffectState: "none", mutationDispatchAttempted: false });
+    if (action === "prepareExactEditor" && payload.establishSelection === true) {
+      if (!Number.isSafeInteger(payload.offset) || payload.offset < 0 || payload.offset > state.body.length) throw operationError("exact_editor_offset_invalid", "Invalid collapsed UTF-16 offset");
+      // Focus can decorate the editor. Rebuild positions from a fresh body.
+      state.editor.focus({ preventScroll: true });
+      state = await exactEditorState();
+      if (state.body !== payload.expectedBody) throw operationError("exact_editor_body_changed", "Editor changed on focus", { operationEffectState: "none", mutationDispatchAttempted: false });
+      const point = state.points.find(item => payload.offset >= item.start && payload.offset <= item.end);
+      if (!point) throw operationError("exact_editor_offset_unavailable", "Offset does not identify an exact text-node boundary");
+      const range = document.createRange(); range.setStart(point.node, payload.offset - point.start); range.collapse(true);
+      const selection = getSelection(); selection.removeAllRanges(); selection.addRange(range);
+      state = await exactEditorState();
+    }
+    if (state.body !== payload.expectedBody || (payload.requireSelection === true && (!state.selection.withinEditor || !state.selection.collapsed
+      || state.selection.start !== payload.offset || state.selection.end !== payload.offset || document.activeElement !== state.editor))) {
+      throw operationError("exact_editor_selection_changed", "Exact focused collapsed selection changed", { operationEffectState: "none", mutationDispatchAttempted: false });
+    }
+    const { editor, points, ...result } = state; return result;
+  }
+  if (action === "query" && payload.exactEditor === true) {
+    const { editor, points, ...result } = await exactEditorState(); return { exactEditor: true, ...result };
+  }
   if (action === "query") {
     const needle = lower(payload.query);
     if ((!needle && !payload.locator) || needle.length > 500) throw operationError("page_query_invalid", "page.query requires a locator or a query between 1 and 500 characters");
@@ -3185,8 +3823,11 @@ async function injectedPageOperation(action, payload) {
     const candidates = matching.slice(offset, offset + limit)
       .map(({ element, text }) => {
         const rect = element.getBoundingClientRect();
+        const identities = globalThis.__aosCompanionQueryNodeIdentitiesV1 ??= new WeakMap();
+        if (!identities.has(element)) identities.set(element, crypto.randomUUID());
         return {
           ...describe(element),
+          nodeIdentity: identities.get(element),
           text: text.slice(0, 500),
           rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
           ...(attributes.length ? readAttributes(element) : {}),
@@ -3543,6 +4184,19 @@ async function injectedPageOperation(action, payload) {
         mutation_dispatch_attempted: false,
       };
     }
+    if (payload.requireHitOwner === true) {
+      let hit = document.elementFromPoint(point.x, point.y);
+      while (hit?.shadowRoot) {
+        const child = hit.shadowRoot.elementFromPoint?.(point.x, point.y);
+        if (!child || child === hit) break;
+        hit = child;
+      }
+      let owner = hit;
+      while (owner && owner !== element) owner = owner.parentNode || owner.getRootNode?.().host;
+      if (owner !== element) {
+        throw operationError("visual_target_not_at_point", "The inspected point is covered by another element");
+      }
+    }
     // This token remains in the isolated world and identifies this exact DOM
     // object, not a selector that could silently resolve to a replacement.
     const semanticGuards = globalThis.__aosCompanionSemanticGuardsV1
@@ -3774,25 +4428,50 @@ async function injectedPageOperation(action, payload) {
     if ([prefix, suffix].some(value => value !== null && (!value || value.length > 1_000))) {
       throw operationError("selection_context_invalid", "Selection prefix and suffix must contain 1 to 1000 exact characters");
     }
-    const originalHtml = element.innerHTML;
+    // Compare only text-only highlight decoration as transparent. Every
+    // semantic element retains its identity, attributes and child order.
+    const semanticIds = new WeakMap();
+    let nextSemanticId = 0;
+    const isHighlight = (node) => node.nodeType === 1 && node.tagName === "SPAN"
+      && node.attributes.length === 1 && node.getAttribute("class") === "highlight"
+      && [...node.childNodes].every(child => child.nodeType === 3 || isHighlight(child));
+    const structure = (node) => {
+      const children = [];
+      const append = (child) => {
+        if (isHighlight(child)) { for (const nested of child.childNodes) append(nested); }
+        else if (child.nodeType === 3) {
+          const value = String(child.nodeValue ?? "");
+          if (typeof children.at(-1) === "string") children[children.length - 1] += value;
+          else if (value) children.push(value);
+        } else children.push(structure(child));
+      };
+      for (const child of node.childNodes) append(child);
+      if (!semanticIds.has(node)) semanticIds.set(node, ++nextSemanticId);
+      return [semanticIds.get(node), node.nodeName, [...(node.attributes ?? [])].map(attribute => [attribute.name, attribute.value]), node.nodeType === 1 ? null : node.nodeValue, children];
+    };
+    const originalStructure = JSON.stringify(structure(element));
     const originalText = String(element.textContent ?? "");
     // innerText is Chromium's rendered text, including BR and paragraph
     // separators. Map its characters to actual editor nodes before touching
     // focus or selection. Never invent a newline-to-node correspondence.
     const fullText = String(element.innerText ?? "");
-    const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
-    const nodes = [];
-    let rawText = "";
-    while (walker.nextNode()) {
-      const node = walker.currentNode;
-      const style = getComputedStyle(node.parentElement);
-      const probe = document.createRange();
-      probe.selectNodeContents(node);
-      if (style.display === "none" || ["hidden", "collapse"].includes(style.visibility) || probe.getClientRects().length === 0) continue;
-      const start = rawText.length;
-      rawText += String(node.nodeValue ?? "");
-      nodes.push({ node, start, end: rawText.length });
-    }
+    const readTextNodes = () => {
+      const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
+      const nodes = [];
+      let rawText = "";
+      while (walker.nextNode()) {
+        const node = walker.currentNode;
+        const style = getComputedStyle(node.parentElement);
+        const probe = document.createRange();
+        probe.selectNodeContents(node);
+        if (style.display === "none" || ["hidden", "collapse"].includes(style.visibility) || probe.getClientRects().length === 0) continue;
+        const start = rawText.length;
+        rawText += String(node.nodeValue ?? "");
+        nodes.push({ node, start, end: rawText.length });
+      }
+      return { nodes, rawText };
+    };
+    const { nodes, rawText } = readTextNodes();
     const starts = [];
     for (let index = fullText.indexOf(requested); index >= 0; index = fullText.indexOf(requested, index + 1)) {
       if (prefix !== null && !fullText.slice(0, index).endsWith(prefix)) continue;
@@ -3846,31 +4525,61 @@ async function injectedPageOperation(action, payload) {
     }
     const startPoint = startPoints.get(startOffset), endPoint = endPoints.get(endOffset);
     if (!startPoint || !endPoint) throw operationError("selection_range_unavailable", "The exact selection boundary could not be bound to rendered editor text");
-    const range = document.createRange();
-    range.setStart(startPoint.node, startPoint.offset);
-    range.setEnd(endPoint.node, endPoint.offset);
+    const rawStartOffset = nodes.find(entry => entry.node === startPoint.node).start + startPoint.offset;
+    const rawEndOffset = nodes.find(entry => entry.node === endPoint.node).start + endPoint.offset;
     const selection = globalThis.getSelection();
     if (!selection) throw operationError("selection_api_unavailable", "The page did not expose a document selection");
     element.scrollIntoView({ block: "center", inline: "center" });
     element.focus();
     await visualize(element, "select text");
-    if (!element.isConnected || element.innerHTML !== originalHtml || element.innerText !== fullText) {
+    if (!element.isConnected || JSON.stringify(structure(element)) !== originalStructure
+      || element.textContent !== originalText || element.innerText !== fullText) {
       selectionObservedChange = true;
       throw operationError("selection_editor_changed_before_dispatch", "The editor changed while preparing the selection; read the current editor before another operation");
     }
+    // Focus handlers can split text into highlight spans. Rebind against the
+    // current text nodes while keeping the original logical UTF-16 offsets.
+    const prepared = readTextNodes();
+    const reboundStart = prepared.nodes.find(entry => rawStartOffset >= entry.start && rawStartOffset < entry.end);
+    const reboundEnd = prepared.nodes.find(entry => rawEndOffset > entry.start && rawEndOffset <= entry.end);
+    if (prepared.rawText !== rawText || !reboundStart || !reboundEnd) throw operationError("selection_range_unavailable", "The exact selection could not be rebound after focus");
+    const range = document.createRange();
+    range.setStart(reboundStart.node, rawStartOffset - reboundStart.start);
+    range.setEnd(reboundEnd.node, rawEndOffset - reboundEnd.start);
     selectionMutationAttempted = true;
     selection.removeAllRanges();
     selection.addRange(range);
     await wait(50);
-    if (!element.isConnected || element.innerHTML !== originalHtml || element.textContent !== originalText) {
+    if (!element.isConnected || JSON.stringify(structure(element)) !== originalStructure
+      || element.textContent !== originalText || element.innerText !== fullText) {
       selectionObservedChange = true;
       throw operationError("selection_editor_content_changed", "The editor changed after selection; do not format or retry without fresh readback");
     }
     const selected = String(selection.toString());
     const committedRange = selection.rangeCount === 1 ? selection.getRangeAt(0) : null;
+    const current = readTextNodes();
+    const logicalOffset = (container, offset) => {
+      let total = 0, found = null;
+      const visibleNodes = new Set(current.nodes.map(entry => entry.node));
+      const visit = (node) => {
+        if (node.nodeType === 3) {
+          if (!visibleNodes.has(node)) return;
+          if (node === container && offset >= 0 && offset <= node.nodeValue.length) found = total + offset;
+          total += node.nodeValue.length;
+        } else {
+          for (let index = 0; index <= node.childNodes.length; index++) {
+            if (node === container && index === offset) found = total;
+            if (index < node.childNodes.length) visit(node.childNodes[index]);
+          }
+        }
+      };
+      visit(element);
+      return found;
+    };
     if (selected !== requested || !committedRange
-      || committedRange.startContainer !== startPoint.node || committedRange.startOffset !== startPoint.offset
-      || committedRange.endContainer !== endPoint.node || committedRange.endOffset !== endPoint.offset) {
+      || current.rawText !== rawText
+      || logicalOffset(committedRange.startContainer, committedRange.startOffset) !== rawStartOffset
+      || logicalOffset(committedRange.endContainer, committedRange.endOffset) !== rawEndOffset) {
       throw operationError("selection_not_committed", "The editor did not retain the requested exact text selection");
     }
     return {
@@ -3936,6 +4645,132 @@ async function injectedPageOperation(action, payload) {
   if (action === "richText") {
     let element = find(payload.locator);
     if (!element.isContentEditable) throw operationError("contenteditable_required", "page.richText requires one visible contenteditable editor");
+    if (payload.operation === "splitParagraph") {
+      // Small native editor operation, independent of clipboard and framework
+      // DOM replacement. The exact current caret and whole body are preconditions.
+      const body = String(element.textContent ?? "");
+      const originalEditor = element;
+      const selection = globalThis.getSelection?.();
+      const expected = payload.expectedSelection;
+      if (typeof payload.expectedBody !== "string" || payload.expectedBody !== body
+        || payload.expectedFullBody !== body || !expected || expected.start !== expected.end
+        || !Number.isSafeInteger(expected.start) || expected.start < 0 || expected.start > body.length
+        || selection?.rangeCount !== 1) throw operationError("rich_text_split_guard_required", "Paragraph split requires the exact full textContent body and collapsed UTF-16 selection");
+      const range = selection.getRangeAt(0).cloneRange();
+      if (!range.collapsed || !element.contains(range.startContainer)) throw operationError("rich_text_caret_required", "Paragraph split requires a caret inside the exact editor");
+      const prefix = document.createRange(); prefix.selectNodeContents(element); prefix.setEnd(range.startContainer, range.startOffset);
+      if (prefix.toString().length !== expected.start) throw operationError("rich_text_selection_changed", "Paragraph split caret no longer matches its expected UTF-16 offset");
+      const caretBinding = payload.expectedCaret;
+      let boundNode = element;
+      if (!caretBinding || !Array.isArray(caretBinding.path) || caretBinding.path.length > 32
+        || !Number.isSafeInteger(caretBinding.offset) || caretBinding.offset < 0)
+        throw operationError("rich_text_split_caret_guard_required", "Split requires a signed editor-relative childNodes path and DOM offset");
+      for (const index of caretBinding.path) {
+        if (!Number.isSafeInteger(index) || index < 0 || !boundNode?.childNodes?.[index])
+          throw operationError("rich_text_split_caret_changed", "Signed caret path does not resolve in the current editor");
+        boundNode = boundNode.childNodes[index];
+      }
+      if (boundNode !== range.startContainer || caretBinding.offset !== range.startOffset)
+        throw operationError("rich_text_split_caret_changed", "Current DOM caret differs from its signed exact path and offset");
+      if ([...element.childNodes].some(node => node.nodeType !== 1))
+        throw operationError("rich_text_split_structure_unsupported", "Direct text nodes outside paragraphs are not supported");
+      const parent = range.startContainer.nodeType === 3 ? range.startContainer.parentElement : range.startContainer;
+      const paragraph = parent.closest?.("p");
+      let inspectedNodes = 0;
+      const supportedInline = (node, depth = 0) => {
+        if (++inspectedNodes > 5000 || depth > 8) return false;
+        if (node.nodeType === 3) return true;
+        if (node.nodeType !== 1) return false;
+        if (node.tagName === "BR") return node.childNodes.length === 0 && (node.attributes.length === 0
+          // ProseMirror's empty terminal decoration is allowed only in this
+          // direct paragraph. Its exact node/attribute signature is preserved.
+          || node.parentElement === paragraph && node === paragraph.lastChild
+            && node.attributes.length === 1 && node.attributes[0].name === "class"
+            && node.attributes[0].value === "ProseMirror-trailingBreak");
+        if (node.attributes.length !== 0) return false;
+        return ["B", "STRONG", "I", "EM", "U"].includes(node.tagName)
+          && node.childNodes.length > 0 && [...node.childNodes].every(child => supportedInline(child, depth + 1));
+      };
+      if (!paragraph || !paragraph.isContentEditable || paragraph.parentElement !== element || ![...paragraph.childNodes].every(node => supportedInline(node))) {
+        throw operationError("rich_text_split_structure_unsupported", "Split supports one direct paragraph with text, BR, and attribute-free B/STRONG/I/EM/U marks only");
+      }
+      // Native Chrome insertParagraph at a P/BR boundary can insert a BR
+      // instead of splitting or add a trailing placeholder. Only the tested
+      // text-node boundary is eligible; no caret establishment or DOM writes.
+      if (range.startContainer.nodeType !== 3 || range.startOffset === 0)
+        throw operationError("rich_text_split_dom_boundary_unsupported", "Split requires an exact text-node caret after at least one UTF-16 unit");
+      const paragraphs = [...element.children];
+      const index = paragraphs.indexOf(paragraph);
+      const outside = paragraphs.filter(node => node !== paragraph).map(node => node.outerHTML);
+      const localPrefix = document.createRange(); localPrefix.selectNodeContents(paragraph); localPrefix.setEnd(range.startContainer, range.startOffset);
+      const leftText = localPrefix.toString(), rightText = String(paragraph.textContent).slice(leftText.length);
+      if (!leftText || !rightText || /[\uD800-\uDBFF]$/u.test(leftText)) throw operationError("rich_text_split_boundary_unsupported", "Split requires an interior caret at a complete Unicode code point");
+      // A textContent offset alone cannot distinguish positions between BRs.
+      // Bind the complete current HTML as well as the exact live DOM caret.
+      if (paragraph.children.length && payload.expectedEditorHtml !== element.innerHTML)
+        throw operationError("rich_text_split_html_guard_required", "Line-break or inline-mark paragraphs require exact current editor HTML");
+      const nodeSignature = node => node.nodeType === 3 ? ["text", node.nodeValue] :
+        [({ B: "STRONG", I: "EM" })[node.tagName] ?? node.tagName, [...node.attributes].map(a => [a.name, a.value]).sort(), [...node.childNodes].map(nodeSignature)];
+      const fragmentSignature = fragment => {
+        const runs = [];
+        for (const node of fragment.childNodes) {
+          const signature = nodeSignature(node);
+          if (signature[0] === "text") {
+            if (!signature[1]) continue;
+            if (runs.at(-1)?.[0] === "text") { runs.at(-1)[1] += signature[1]; continue; }
+          }
+          runs.push(signature);
+        }
+        return JSON.stringify(runs);
+      };
+      const leftRange = document.createRange(); leftRange.selectNodeContents(paragraph); leftRange.setEnd(range.startContainer, range.startOffset);
+      const rightRange = document.createRange(); rightRange.selectNodeContents(paragraph); rightRange.setStart(range.startContainer, range.startOffset);
+      const leftContent = fragmentSignature(leftRange.cloneContents()), rightContent = fragmentSignature(rightRange.cloneContents());
+      const paragraphAttributes = JSON.stringify([...paragraph.attributes].map(a => [a.name, a.value]).sort());
+      const html = element.innerHTML;
+      element.focus(); await visualize(element, "split paragraph");
+      if (!element.isConnected || element.innerHTML !== html || selection.rangeCount !== 1
+        || !selection.getRangeAt(0).collapsed || selection.getRangeAt(0).startContainer !== range.startContainer
+        || selection.getRangeAt(0).startOffset !== range.startOffset) throw operationError("rich_text_editor_changed_before_dispatch", "Body or selection changed before paragraph split");
+      if (typeof document.execCommand !== "function") throw operationError("rich_text_command_unavailable", "This editor does not expose native paragraph insertion");
+      richTextMutationAttempted = true;
+      const executed = document.execCommand("insertParagraph", false, null);
+      // Frameworks may commit after the browser event. Observe the one dispatch
+      // for a bounded interval; never send insertParagraph again.
+      for (let read = 0; read < 10; read++) {
+        await wait(read === 0 ? 75 : 50);
+        element = find(payload.locator);
+        if (element !== originalEditor || String(element.textContent ?? "") !== body)
+          throw operationError("rich_text_split_not_committed", "Paragraph split changed the exact editor or full body; do not repeat it");
+        if (element.children.length === paragraphs.length + 1) break;
+        if (element.innerHTML !== html)
+          throw operationError("rich_text_split_not_committed", "Paragraph split produced an unexpected intermediate structure; do not repeat it");
+      }
+      const after = [...element.children];
+      if (element !== originalEditor || [...element.childNodes].some(node => node.nodeType !== 1) || String(element.textContent ?? "") !== body || after.length !== paragraphs.length + 1
+        || after[index]?.tagName !== "P" || after[index + 1]?.tagName !== "P"
+        || after[index].textContent !== leftText || after[index + 1].textContent !== rightText
+        || fragmentSignature(after[index]) !== leftContent || fragmentSignature(after[index + 1]) !== rightContent
+        || JSON.stringify([...after[index].attributes].map(a => [a.name, a.value]).sort()) !== paragraphAttributes
+        || JSON.stringify([...after[index + 1].attributes].map(a => [a.name, a.value]).sort()) !== paragraphAttributes
+        || JSON.stringify(after.filter((_, at) => at !== index && at !== index + 1).map(node => node.outerHTML)) !== JSON.stringify(outside)) {
+        throw operationError("rich_text_split_not_committed", "Paragraph split readback did not preserve the full body and outside blocks; do not repeat it", { commandReturned: Boolean(executed) });
+      }
+      const committedSelection = globalThis.getSelection?.();
+      const committedRange = committedSelection?.rangeCount === 1 ? committedSelection.getRangeAt(0) : null;
+      if (!committedRange?.collapsed || !after[index + 1].contains(committedRange.startContainer))
+        throw operationError("rich_text_split_selection_not_committed", "Paragraph split caret did not move into the right paragraph; do not repeat");
+      const committedPrefix = document.createRange(); committedPrefix.selectNodeContents(after[index + 1]);
+      committedPrefix.setEnd(committedRange.startContainer, committedRange.startOffset);
+      const emptyCaretPrefix = node => node.nodeType === 3 ? node.nodeValue.length === 0 :
+        node.nodeType === 1 && ["B", "STRONG", "I", "EM", "U"].includes(node.tagName) && node.attributes.length === 0
+          && [...node.childNodes].every(emptyCaretPrefix);
+      if (committedPrefix.toString().length !== 0 || ![...committedPrefix.cloneContents().childNodes].every(emptyCaretPrefix))
+        throw operationError("rich_text_split_selection_not_committed", "Paragraph split caret is not at the exact right paragraph start; do not repeat");
+      return { edited: true, command: "insertParagraph", paragraphSplitVerified: true, fullBodyVerified: true,
+        contentPreserved: true, outsideSelectionPreserved: true, clipboardUsed: false, offsetUnit: "utf16",
+        mutationDispatchAttempted: true, structure: richTextStructure(element), url: location.href };
+    }
     const before = richTextStructure(element);
     if (payload.operation === "inspect") return { inspected: true, structure: before, selectedText: String(globalThis.getSelection?.()?.toString?.() ?? ""), element: describe(element), url: location.href };
     const { command, value } = richTextCommand(payload.operation, payload.blockTag);
@@ -3971,14 +4806,14 @@ async function injectedPageOperation(action, payload) {
           // Chromium may move a BR into an adjacent anchor while preserving
           // every linked character and the same break position.
           const semanticPath = run.empty && path.at(-1)?.tag === "br" ? [path.at(-1)] : path;
-          const signature = JSON.stringify(semanticPath.map(({ tag, attributes }) => [tag, attributes]));
+          const signature = JSON.stringify(semanticPath.map(({ tag, attributes }) => [({ b: "strong", i: "em" })[tag] ?? tag, attributes]));
           const previous = tokens.at(-1);
           if (!run.empty && previous && !previous.empty && previous.signature === signature) previous.text += run.text;
           else tokens.push({ text: run.text, signature, empty: Boolean(run.empty) });
         }
         record.content = JSON.stringify(tokens);
       }
-      return { text, records, runs, html: editor.innerHTML, offset };
+      return { element: editor, text, records, runs, html: editor.innerHTML, offset };
     };
     const original = snapshot(element);
     const selection = globalThis.getSelection?.();
@@ -4089,11 +4924,14 @@ async function injectedPageOperation(action, payload) {
       // Read after native/synthetic events and framework handlers, not before.
       await wait(75);
     } finally { document.removeEventListener("input", onInput, true); }
+    let final, after, committed = false;
+    for (let read = 0; read < 10; read++) {
+    if (read > 0) await wait(50);
     element = find(payload.locator);
-    const final = snapshot(element), after = richTextStructure(element);
+    if (element !== original.element) throw operationError("rich_text_editor_changed_after_dispatch", "The exact editor was replaced; do not repeat the formatting");
+    final = snapshot(element); after = richTextStructure(element);
     if (final.text !== original.text) throw operationError("rich_text_content_changed", "The editor text changed during formatting; do not retry this operation", { command, before, after });
     if (outside(final) !== beforeOutside) throw operationError("rich_text_outside_selection_changed", "Content or structure outside the selected blocks changed; do not retry this operation", { command, before, after });
-    let committed = false;
     if (command === "formatBlock") committed = requestedTagPresent(final)
       && selectedIndices.every(index => final.records[index]?.start === original.records[index].start && final.records[index]?.end === original.records[index].end && final.records[index]?.content === original.records[index].content);
     else if (["bold", "italic", "underline"].includes(command)) {
@@ -4109,8 +4947,10 @@ async function injectedPageOperation(action, payload) {
       const old = original.records[index], current = final.records[index];
       return old && current && (command === "indent" ? current.quoteDepth > old.quoteDepth : current.quoteDepth < old.quoteDepth);
     });
+    if (committed) break;
+    }
     if (!committed) throw operationError("rich_text_command_not_committed", "The final editor DOM does not contain the requested formatting", { command, before, after, commandReturned: Boolean(executed) });
-    return { edited: true, command, selectedText, structureCommitted: true, contentPreserved: true, outsideSelectionPreserved: true, verification: "post_event_dom", structure: after, before, visualized: true, trustedInput: false, mutationDispatchAttempted: true, element: describe(element), url: location.href };
+    return { edited: true, command, selectedText, structureCommitted: true, fullBodyVerified: true, contentPreserved: true, outsideSelectionPreserved: true, verification: "post_event_dom", structure: after, before, visualized: true, trustedInput: false, mutationDispatchAttempted: true, element: describe(element), url: location.href };
   }
   if (action === "scroll") {
     const direction = String(payload.direction ?? "down").toLowerCase();
@@ -4680,6 +5520,28 @@ async function injectedPageOperation(action, payload) {
     return { retained, state: retained ? "retained" : files.length === 0 ? "cleared" : "different",
       files, inputFileCount: files.length, element: describe(element), url: location.href, pageInstanceId };
   }
+  if (action === "markUploadTarget") {
+    // Native (CDP) uploads: tag the exact file input so the worker can resolve
+    // the same node through DOM.querySelector. Never assigns files itself.
+    const element = find(payload.locator, { allowHiddenFile: true, fileInputOnly: true });
+    if (!(element instanceof HTMLInputElement) || element.type !== "file") {
+      throw operationError("file_input_required", "Matched element is not a file input");
+    }
+    if (typeof payload.nonce !== "string" || !/^[0-9a-f-]{36}$/u.test(payload.nonce)) {
+      throw operationError("upload_payload_invalid", "Native upload target nonce is invalid");
+    }
+    element.setAttribute("data-aos-upload-target", payload.nonce);
+    const visualTarget = [...(element.labels ?? [])].find(visible) ?? element;
+    visualTarget.scrollIntoView({ block: "center", inline: "center" });
+    await visualize(visualTarget, "upload");
+    return { marked: true, element: describe(element), url: location.href, pageInstanceId };
+  }
+  if (action === "unmarkUploadTarget") {
+    for (const element of document.querySelectorAll("input[type=file][data-aos-upload-target]")) {
+      if (element.getAttribute("data-aos-upload-target") === payload.nonce) element.removeAttribute("data-aos-upload-target");
+    }
+    return { unmarked: true, url: location.href, pageInstanceId };
+  }
   if (action === "upload" || action === "uploadMultiple") {
     const uploadStartedAt = Date.now();
     const element = find(payload.locator, { allowHiddenFile: true, fileInputOnly: true });
@@ -4811,6 +5673,11 @@ async function injectedPageOperation(action, payload) {
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message?.kind === "clipboard.source.storage") {
+    handleClipboardSourceStorage(message, _sender).then(value => sendResponse({ ok: true, value }))
+      .catch(error => sendResponse({ ok: false, code: error.code ?? "clipboard_source_storage_unavailable" }));
+    return true;
+  }
   if (message?.kind?.startsWith("controls.")) {
     userControls.handle(message, _sender).then(sendResponse).catch(error => sendResponse({ error: error.message, code: error.code }));
     return true;
@@ -4820,6 +5687,22 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     Promise.all([hasDebuggerPermission(), hasPhysicalInputOptIn(), hasPeripheralPermissions()])
       .then(() => sendResponse(publicState()))
       .catch(() => sendResponse(publicState()));
+  } else if (message?.kind === "recording.start") {
+    startCompanionTabRecording({ tabId: message.tabId, streamId: message.streamId, taskId: message.taskId ?? "companion-popup-recording", userGesture: true })
+      .then(result => sendResponse({ ok: true, ...result }))
+      .catch(error => sendResponse({ ok: false, code: error?.code ?? "recording_start_failed", error: error?.message ?? String(error), details: error?.details }));
+    return true;
+  } else if (message?.kind === "recording.stop") {
+    stopCompanionTabRecording({ filename: message.filename })
+      .then(result => sendResponse({ ok: true, ...result }))
+      .catch(error => sendResponse({ ok: false, code: error?.code ?? "recording_stop_failed", error: error?.message ?? String(error), details: error?.details }));
+    return true;
+  } else if (message?.kind === "recording.status") {
+    ensureOffscreenClipboard()
+      .then(() => chrome.runtime.sendMessage({ kind: "offscreen.recording.status" }))
+      .then(result => sendResponse(result ?? { ok: true, active: false }))
+      .catch(error => sendResponse({ ok: false, code: error?.code ?? "recording_status_failed", error: error?.message ?? String(error) }));
+    return true;
   } else if (message?.kind === "connection.retry") {
     detachNativePort();
     runtimeState.connected = false;
@@ -4869,6 +5752,18 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 chrome.runtime.onInstalled.addListener(() => {
   ensureWatchdogAlarm();
   requestReconnect({ force: true });
+});
+chrome.commands.onCommand.addListener((command) => {
+  if (command === "recording-start") {
+    const armedTabId = pendingAutoRecordingTabId;
+    pendingAutoRecordingTabId = null;
+    void (armedTabId ? Promise.resolve([{ id: armedTabId }]) : chrome.tabs.query({ active: true, currentWindow: true })).then(([tab]) =>
+      startCompanionTabRecording({ tabId: tab?.id, taskId: "companion-command-recording", userGesture: true }))
+      .catch(error => { runtimeState.lastError = error instanceof Error ? error.message : String(error); });
+  } else if (command === "recording-stop") {
+    void stopCompanionTabRecording({ filename: `companion-${Date.now()}.webm` })
+      .catch(error => { runtimeState.lastError = error instanceof Error ? error.message : String(error); });
+  }
 });
 chrome.runtime.onStartup.addListener(() => {
   ensureWatchdogAlarm();

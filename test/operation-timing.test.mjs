@@ -121,6 +121,15 @@ test('an operation error keeps its timing and ignores invalid or unrecognized ex
   const f = await fixture(t, { failQuery: true });
   const result = await f.run('timing-error');
   assert.equal(result.result, 'blocked');
+  assert.equal(result.effect_state, 'no_dispatch');
+  assert.equal(result.external_action_executed, false);
+  assert.equal(result.failed_step.effect_state, 'no_dispatch');
+  assert.deepEqual(result.action_progress.uncertain_action_indices, []);
+  assert.equal(result.capsule.state, 'failed');
+  const setup = f.broker.taskLedger.listOperations().find(entry => entry.binding?.method === 'tabs.create');
+  assert.equal(setup.state, 'applied');
+  assert.equal(setup.effectState, 'known_effect');
+  assert.equal(setup.createdTabId, result.tab.id);
   const failed = result.operation_timing.operations.find(row => row.method === 'page.query');
   assert.equal(failed.outcome, 'error');
   assert.equal(failed.error_code, 'semantic_locator_not_found');

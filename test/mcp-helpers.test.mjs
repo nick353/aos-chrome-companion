@@ -103,6 +103,17 @@ test("MCP task bindings reject cross-task session and lease use", () => {
   assert.throws(() => bindings.assertLease("lease-a", "session-a", "task-a"), (error) => error.code === "mcp_session_task_binding_missing");
 });
 
+test("MCP bindings cannot be overwritten across tasks or sessions", () => {
+  const bindings = new McpTaskBindingRegistry();
+  bindings.bindSession("session-a", "task-a");
+  assert.throws(() => bindings.bindSession("session-a", "task-b"), (error) => error.code === "mcp_session_task_mismatch");
+  bindings.bindSession("session-b", "task-a");
+  bindings.bindLease("lease-a", "session-a", "task-a");
+  assert.throws(() => bindings.bindLease("lease-a", "session-b", "task-a"), (error) => error.code === "mcp_lease_task_mismatch");
+  assert.equal(bindings.assertSession("session-a", "task-a"), "session-a");
+  assert.equal(bindings.sessionForLease("lease-a"), "session-a");
+});
+
 test("upload materialization accepts bounded regular files and rejects symlinks and oversize files", async () => {
   const directory = await mkdtemp(join(tmpdir(), "aos-upload-test-"));
   const filePath = join(directory, "resume.pdf");

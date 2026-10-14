@@ -59,7 +59,7 @@ function connectionHarness() {
   const ctx = { Date, runtimeState: { port: null, connected: false, connecting: false, profileInstanceId: "p", extensionRuntimeId: "r", generation: "g", disconnectHistory: [], reloadScheduled: false },
     commandAssembler: { clear() {} }, accessibilityHistory:{clear(){}}, pageObservations:{stopAll:async()=>{}}, viewportControls:{stopAll:async()=>{}}, javaScriptDialogs:{stopAll:async reason=>dialogStops.push(reason)}, scheduleReconnect: () => { retries++; },
     setTimeout: (fn, delay) => { const id = ++nextTimer; timers.set(id, fn); timerDelays.set(id, delay); return id; }, clearTimeout: id => { timers.delete(id); timerDelays.delete(id); },
-    NATIVE_HOST_NAME: "test", PROTOCOL_VERSION: "1", INSTALL_BUILD_ID: "b", OPERATION_SCHEMA: "schema", OPERATION_SCHEMA_DIGEST: "digest", OPERATION_SCHEMA_VERSION: 1, CAPABILITIES_DIGEST: "caps", CAPABILITIES: [], MAX_DISCONNECT_HISTORY: 20, DISCONNECT_HISTORY_KEY: "disconnectHistory",
+    NATIVE_HOST_NAME: "test", PROTOCOL_VERSION: "1", INSTALL_BUILD_ID: "b", BUNDLE_TREE_SHA256: null, EXTENSION_TREE_SHA256: null, NATIVE_RECORDER_SHA256: null, OPERATION_SCHEMA: "schema", OPERATION_SCHEMA_DIGEST: "digest", OPERATION_SCHEMA_VERSION: 1, CAPABILITIES_DIGEST: "caps", CAPABILITIES: [], MAX_DISCONNECT_HISTORY: 20, DISCONNECT_HISTORY_KEY: "disconnectHistory",
     chrome: { storage: { local: { set(value) { persisted.push(value); return Promise.resolve(); } } }, runtime: { connectNative() {
       const port = { disconnected: false, onMessage: { addListener(fn) { port.message = fn; } }, onDisconnect: { addListener(fn) { port.remoteDisconnect = fn; } }, postMessage() {}, disconnect() { this.disconnected = true; } };
       ports.push(port); return port;

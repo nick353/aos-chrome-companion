@@ -3,6 +3,7 @@ import { constants } from "node:fs";
 import { lstat, open } from "node:fs/promises";
 import { basename, extname, isAbsolute } from "node:path";
 import { CompanionError } from "../shared/errors.mjs";
+import { validateLocatorTree } from "./locator-validation.mjs";
 import { MAX_CLIPBOARD_BINARY_BYTES, MAX_UPLOAD_FILE_BYTES, MAX_UPLOAD_FILES } from "../shared/peripheral-policy.mjs";
 
 export const MAX_UPLOAD_BYTES = MAX_UPLOAD_FILE_BYTES;
@@ -13,6 +14,8 @@ const MIME_BY_EXTENSION = Object.freeze({
   ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
   ".jpeg": "image/jpeg",
   ".jpg": "image/jpeg",
+  ".mov": "video/quicktime",
+  ".mp4": "video/mp4",
   ".pdf": "application/pdf",
   ".png": "image/png",
   ".txt": "text/plain",
@@ -29,7 +32,26 @@ function uploadConfirmationOptions(params) {
     if (!params.confirmationLocator || typeof params.confirmationLocator !== "object" || Array.isArray(params.confirmationLocator)) {
       throw uploadError("upload_confirmation_locator_invalid", "Upload confirmation requires one explicit visible locator");
     }
-    options.confirmationLocator = params.confirmationLocator;
+    options.confirmationLocator = validateLocatorTree(params.confirmationLocator);
+  }
+  if (params.confirmationFiles !== undefined) {
+    if (!Array.isArray(params.confirmationFiles) || params.confirmationFiles.length < 1 || params.confirmationFiles.length > MAX_UPLOAD_FILES)
+      throw uploadError("upload_confirmation_files_invalid", "confirmationFiles requires 1-10 filename and attachment-ready locator pairs");
+    options.confirmationFiles = params.confirmationFiles.map(item => {
+      if (typeof item?.filename !== "string" || !item.filename.length || item.filename.length > 255)
+        throw uploadError("upload_confirmation_files_invalid", "Each confirmationFiles item requires its exact filename and locator");
+      return { filename: item.filename, locator: validateLocatorTree(item.locator) };
+    });
+  }
+  if (params.confirmationCountLocator !== undefined) {
+    if (!params.confirmationCountLocator || typeof params.confirmationCountLocator !== "object" || Array.isArray(params.confirmationCountLocator))
+      throw uploadError("upload_confirmation_locator_invalid", "confirmationCountLocator must be one locator object matching every uploaded item");
+    options.confirmationCountLocator = validateLocatorTree(params.confirmationCountLocator);
+  }
+  if (params.confirmationPreviewOnly !== undefined) {
+    if (typeof params.confirmationPreviewOnly !== "boolean" || (params.confirmationPreviewOnly && !options.confirmationLocator))
+      throw uploadError("upload_confirmation_preview_invalid", "confirmationPreviewOnly is a boolean and requires confirmationLocator");
+    if (params.confirmationPreviewOnly) options.confirmationPreviewOnly = true;
   }
   if (params.confirmationTimeoutMs !== undefined) {
     if (!Number.isSafeInteger(params.confirmationTimeoutMs) || params.confirmationTimeoutMs < 100 || params.confirmationTimeoutMs > 15_000) {
@@ -92,6 +114,8 @@ export async function materializeUploadParams(params = {}) {
       size: data.byteLength,
       sha256: createHash("sha256").update(data).digest("hex"),
       dataBase64: data.toString("base64"),
+      // Videos are delivered by path through the browser's native file input.
+      ...(mimeType.startsWith("video/") ? { filePath } : {}),
     },
   };
 }
@@ -153,6 +177,9 @@ export async function materializeClipboardParams(params = {}) {
 }
 
 export async function materializeTransactionActions(actions = []) {
+  for (const action of actions) for (const key of ["locator", "confirmationLocator"]) {
+    if (action?.params?.[key] !== undefined) validateLocatorTree(action.params[key]);
+  }
   return Promise.all(actions.map(async (action) => ({
     ...action,
     params: action?.method === "page.upload"

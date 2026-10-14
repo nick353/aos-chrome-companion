@@ -4,7 +4,8 @@ import { CompanionError } from "../shared/errors.mjs";
 import { DEFAULT_OPERATION_TIMEOUT_MS, DEFAULT_OPERATION_TIMEOUTS_MS, EXTENSION_METHODS, MUTATION_METHODS } from "../shared/constants.mjs";
 import { normalizeTimeout } from "../shared/validation.mjs";
 import { createId } from "../shared/ids.mjs";
-import { archiveReconciliationPayload, authorizedTransactionPayload, createAuthorityEnvelope, ensureIssuerSecret, extensionReloadPayload, prepareResumePayload, repairPreDispatchReadonlyPayload } from "../shared/task-runtime.mjs";
+import { archiveReconciliationPayload, authorizedTransactionPayload, createAuthorityEnvelope, ensureIssuerSecret, extensionReloadPayload, localEditorReconciliationPayload, localSelectionReconciliationPayload, prepareResumePayload, repairPreDispatchReadonlyPayload, targetRecoveryPayload } from "../shared/task-runtime.mjs";
+import { uploadReconciliationPayload } from "../shared/task-runtime.mjs";
 import { planExtensionRefreshBoundary, verifyFreshExtensionGeneration, EXTENSION_REFRESH_BOUNDARY_SCHEMA } from "../shared/extension-refresh.mjs";
 import { taskStatusPayload } from "../shared/operation-audit.mjs";
 
@@ -70,21 +71,50 @@ export class BrokerClient {
     }
     const deadlineAt = Date.now() + timeoutMs;
     const reconnectable = RECONNECTABLE_READ_METHODS.has(method);
+    let recoveredSessionCreation = false;
     if (signal?.aborted) throw new CompanionError("broker_request_cancelled", `Broker request cancelled before ${method}`);
     if (!this.connected) {
-      if (!reconnectable) {
+      if (method === "session.open") {
+        // This invocation has not been sent. Recover transport with an
+        // allowlisted read, then bind exactly one profile before its sole
+        // session dispatch. A failure after that dispatch never enters here.
+        if (typeof params.taskId !== "string" || !params.taskId.trim()) {
+          throw new CompanionError("session_recovery_binding_missing", "Disconnected session creation requires an explicit task binding");
+        }
+        const status = await this.request("status.get", { taskId: params.taskId }, {
+          timeoutMs: Math.max(1, deadlineAt - Date.now()), signal,
+        });
+        const profiles = (Array.isArray(status.profiles) ? status.profiles : []).filter(profile =>
+          profile.connected === true && typeof profile.profileInstanceId === "string"
+          && (!params.profileInstanceId || profile.profileInstanceId === params.profileInstanceId));
+        if (profiles.length !== 1) {
+          throw new CompanionError(params.profileInstanceId && profiles.length === 0 ? "profile_not_connected" : "session_recovery_profile_ambiguous",
+            "Fresh status must identify one connected Companion profile before session creation", {
+              taskId: params.taskId, profileInstanceId: params.profileInstanceId ?? null,
+              connectedProfileCount: profiles.length, dispatchCount: 0, mutationDispatchAttempted: false,
+            });
+        }
+        params = { ...params, profileInstanceId: profiles[0].profileInstanceId };
+        recoveredSessionCreation = true;
+      } else if (!reconnectable) {
         throw new CompanionError(
           "broker_reconnect_required",
           `Broker connection changed before ${method}; obtain fresh status and create a new logical session`,
         );
+      } else {
+        await this.#reconnect();
       }
-      await this.#reconnect();
     }
     try {
       // A status/profile probe may reconnect once. Reserve part of the same
       // caller budget for that recovery instead of extending the deadline.
       const firstDeadlineAt = reconnectable ? Date.now() + Math.max(1, Math.floor((deadlineAt - Date.now()) / 2)) : deadlineAt;
       const result = await this.#requestOnce(method, params, { deadlineAt: Math.min(deadlineAt, firstDeadlineAt), signal });
+      if (recoveredSessionCreation && (result?.taskId !== params.taskId || result?.profileInstanceId !== params.profileInstanceId || !result?.sessionId)) {
+        throw new CompanionError("session_recovery_owner_readback_mismatch", "Session creation did not return its fresh task/profile binding; do not repeat it", {
+          taskId: params.taskId, profileInstanceId: params.profileInstanceId, dispatchCount: 1, replayAllowed: false,
+        });
+      }
       if (method === "session.open" && result?.taskId === params.taskId && result?.profileInstanceId) {
         this.openedSessions.set(result.sessionId, { ...result });
       }
@@ -386,8 +416,68 @@ export class BrokerClient {
     return this.request("task.prepare_resume", { ...payload, sessionId: params.sessionId, authority }, { timeoutMs });
   }
 
+  /** One separately signed local recovery operation; never reconnect or replay. */
+  async requestNavigationRecovery(params, { timeoutMs = 30_000, signal } = {}) {
+    const { method, sessionId, leaseId, runId, taskId, idempotencyKey, ...payload } = params;
+    if (!["tabs.navigationDiagnostics", "tabs.stopLoading"].includes(method)) {
+      throw new CompanionError("local_navigation_recovery_required", "Only exact-target navigation diagnostics and opt-in stop loading use this route");
+    }
+    if (payload.sourceOperationId !== undefined && method !== "tabs.navigationDiagnostics") {
+      throw new CompanionError("navigation_cleanup_source_not_found", "Cleanup source readback is available only through signed diagnostics");
+    }
+    const authority = createAuthorityEnvelope({ issuer: this.issuer, secret: await this.#issuerSecret(),
+      runId, taskId, ownerKey: sessionId, method, intent: "local_navigation_recovery",
+      targetOrigin: new URL(payload.expectedUrl).origin, idempotencyKey, payload, approved: true });
+    return this.request("operation.execute", { sessionId, leaseId, method, params: payload,
+      authority, intent: "local_navigation_recovery", taskOwnedRequired: true,
+      allowedOrigins: payload.allowedOrigins, targetOrigin: authority.targetOrigin }, { timeoutMs, signal });
+  }
+
+  /** Create only the signed replacement; neither reconnect nor replay on failure. */
+  async requestRecoverTarget(params, { timeoutMs = 120_000, signal } = {}) {
+    const payload = targetRecoveryPayload(params);
+    const authority = createAuthorityEnvelope({
+      issuer: this.issuer, secret: await this.#issuerSecret(),
+      runId: payload.runId, taskId: payload.taskId, ownerKey: payload.sessionId,
+      method: "task.recover_target", intent: "recover_missing_target",
+      targetOrigin: new URL(payload.intendedUrl).origin,
+      idempotencyKey: payload.idempotencyKey, payload, approved: true,
+    });
+    return this.request("task.recover_target", { ...payload, authority }, { timeoutMs, signal });
+  }
+
   async requestInspectReconciliation(params, { timeoutMs = 30_000 } = {}) {
+    if (params.originalUploadPayload !== undefined) {
+      const payload = uploadReconciliationPayload(params);
+      const authority = createAuthorityEnvelope({ issuer: this.issuer, secret: await this.#issuerSecret(),
+        runId: params.runId, taskId: params.taskId, ownerKey: params.sessionId,
+        method: "task.reconciliation.inspect", intent: "inspect_original_upload_confirmation_only", targetOrigin: "*",
+        idempotencyKey: `upload-confirmation:${params.idempotencyKey}:${createId("inspection")}`, payload, approved: true });
+      return this.request("task.reconciliation.inspect", { ...params, authority }, { timeoutMs });
+    }
     return this.request("task.reconciliation.inspect", params, { timeoutMs });
+  }
+
+  async requestResolveLocalEditor(params, { timeoutMs = 30_000 } = {}) {
+    const payload = localEditorReconciliationPayload(params);
+    const authority = createAuthorityEnvelope({ issuer: this.issuer, secret: await this.#issuerSecret(),
+      runId: params.runId, taskId: params.taskId, ownerKey: params.sessionId,
+      method: "task.reconciliation.resolve_local_editor", intent: "resolve_local_editor_from_exact_readback",
+      targetOrigin: new URL(params.url).origin,
+      idempotencyKey: `local-editor-resolution:${params.originalOperationKey}:${createId("resolution")}`,
+      payload, approved: true });
+    return this.request("task.reconciliation.resolve_local_editor", { ...payload, sessionId: params.sessionId, authority }, { timeoutMs });
+  }
+
+  async requestResolveLocalSelection(params, { timeoutMs = 30_000 } = {}) {
+    const payload = localSelectionReconciliationPayload(params);
+    const authority = createAuthorityEnvelope({ issuer: this.issuer, secret: await this.#issuerSecret(),
+      runId: params.runId, taskId: params.taskId, ownerKey: params.sessionId,
+      method: "task.reconciliation.resolve_local_selection", intent: "resolve_local_selection_from_exact_readback",
+      targetOrigin: new URL(params.url).origin,
+      idempotencyKey: `local-selection-resolution:${params.originalOperationKey}:${createId("resolution")}`,
+      payload, approved: true });
+    return this.request("task.reconciliation.resolve_local_selection", { ...payload, sessionId: params.sessionId, authority }, { timeoutMs });
   }
 
   async requestRebindReconciliation(params, { timeoutMs = 30_000 } = {}) {
