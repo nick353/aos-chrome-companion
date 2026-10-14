@@ -1,11 +1,17 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, lstat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, lstat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
+import { OPERATION_SCHEMA_DIGEST } from "../src/shared/constants.mjs";
+import { createRuntimeAttestation } from "../src/shared/runtime-attestation.mjs";
 import {
   AUTO_SETUP_SCHEMA,
   resolveCodexCommand,
+  resolveCompanionCodexSelection,
+  acquireCompanionLock,
+  releaseCompanionLock,
+  controlPlaneSyncReadiness,
   DEFAULT_COMPANION_EXTENSION_ID,
   OFFICIAL_CHROME_EXTENSION_IDS,
   compareControlPlaneArtifacts,
@@ -20,6 +26,180 @@ async function writeJson(path, value) {
   await mkdir(dirname(path), { recursive: true });
   await writeFile(path, `${JSON.stringify(value, null, 2)}\n`);
 }
+
+test("Companion managed CLI discovery is explicit, child-only, and preserves authoritative overrides", async () => {
+  const environment = { PATH: "/usr/bin:/bin", CODEX_CLI_PATH: "/stale/ChatGPT/codex" };
+  const original = { ...environment };
+  const executableExists = async (path) => path === "/usr/local/bin/codex" || path === "/custom/codex";
+  for (const options of [{}, { managedChild: true }, { managedChild: true, provenance: "caller" }]) {
+    const result = await resolveCompanionCodexSelection(environment, { ...options, executableExists });
+    assert.equal(result.command, environment.CODEX_CLI_PATH);
+    assert.equal(result.managedChild, false);
+  }
+  const managed = await resolveCompanionCodexSelection(environment, { managedChild: true,
+    provenance: "companion_autosetup_wrapper", executableExists });
+  assert.equal(managed.command, "/usr/local/bin/codex");
+  assert.equal(managed.discardedInheritedPin, environment.CODEX_CLI_PATH);
+  assert.equal(managed.provenance, "companion_autosetup_wrapper");
+  for (const override of ["/custom/codex", "/invalid/user/codex"]) {
+    assert.equal(await resolveCodexCommand({ ...environment, CODEX_CLI_PATH: override }, executableExists), override);
+    const result = await resolveCompanionCodexSelection({ ...environment, AOS_CHROME_COMPANION_CODEX_CLI_PATH: override },
+      { managedChild: true, provenance: "companion_installer_default", executableExists });
+    assert.equal(result.command, override);
+    assert.equal(result.explicitOverride, true);
+  }
+  const custom = await resolveCompanionCodexSelection({ ...environment, CODEX_CLI_PATH: "/custom/codex" },
+    { managedChild: true, provenance: "companion_autosetup_wrapper", executableExists });
+  assert.equal(custom.command, "/custom/codex");
+  assert.equal(custom.discardedInheritedPin, null);
+  assert.deepEqual(environment, original);
+});
+
+test("pending refresh preserves its primary blocker and requires fresh activation provenance", () => {
+  const pending = { result: "applied_pending_refresh", artifactsStaged: true, exactBlockers: [],
+    restartBoundary: { blockers: [] }, extensionRefresh: { result: "deferred", exactBlocker: "extension_reload_logical_sessions_active" } };
+  assert.deepEqual(controlPlaneSyncReadiness(pending), { pendingRefresh: true, artifactStaged: true,
+    runtimeLoaded: false, exactBlockers: ["extension_reload_logical_sessions_active"], exactBlocker: "extension_reload_logical_sessions_active" });
+  for (const receipt of [{ result: "restarted" }, { result: "applied", statusAfter: { connectedProfileCount: 1 } },
+    { result: "restarted", statusAfter: { connectedProfileCount: 1 }, extensionRefresh: { postRestartReadback: { ready: true } } }]) {
+    assert.equal(controlPlaneSyncReadiness(receipt).runtimeLoaded, false);
+    assert.equal(controlPlaneSyncReadiness(receipt).exactBlocker, "control_plane_activation_not_verified");
+  }
+  const reflected = { result: "restarted", artifactsStaged: true, exactBlockers: [], statusAfter: { connectedProfileCount: 1 },
+    extensionRefresh: { result: "reflected", postRestartReadback: { ready: true, provenanceVerified: true } } };
+  assert.equal(controlPlaneSyncReadiness(reflected).runtimeLoaded, true);
+  assert.equal(controlPlaneSyncReadiness(reflected).pendingRefresh, false);
+  assert.equal(controlPlaneSyncReadiness({ ...reflected, extensionRefresh: pending.extensionRefresh }).runtimeLoaded, false);
+});
+
+const deadOwner = () => { throw Object.assign(new Error("dead"), { code: "ESRCH" }); };
+
+test("fresh matching artifacts and verified runtime resolve only a dated refresh boundary", () => {
+  const pending = { result: "applied_pending_refresh", artifactsStaged: true, exactBlockers: ["extension_reload_logical_sessions_active"],
+    extensionRefresh: { result: "deferred", exactBlocker: "extension_reload_logical_sessions_active" } };
+  const profile = { connected: true, buildId: "installed", operationSchemaDigest: OPERATION_SCHEMA_DIGEST, generation: "fresh", buildProvenanceMismatches: [] };
+  const liveStatus = { expectedBuildId: "installed", profiles: [profile],
+    runtimeAttestation: createRuntimeAttestation({ buildId: "installed", operationSchemaDigest: OPERATION_SCHEMA_DIGEST }) };
+  const proof = { liveStatus, expectedBuildId: "installed", artifactsMatch: true };
+  const current = controlPlaneSyncReadiness(pending, proof);
+  assert.equal(current.staleRefreshReconciled, true); assert.equal(current.pendingRefresh, false); assert.equal(current.runtimeLoaded, true);
+  for (const missing of [{ artifactsMatch: false }, { expectedBuildId: "wrong" }, { liveStatus: undefined },
+    { liveStatus: { ...liveStatus, profiles: [{ ...profile, buildProvenanceMismatches: ["extension_tree_sha256"] }] } },
+    { liveStatus: { ...liveStatus, profiles: [{ ...profile, generation: null }] } },
+    { liveStatus: { ...liveStatus, profiles: [profile, profile] } },
+    { liveStatus: { ...liveStatus, runtimeAttestation: { ...liveStatus.runtimeAttestation, attestationDigest: "forged" } } }])
+    assert.equal(controlPlaneSyncReadiness(pending, { ...proof, ...missing }).pendingRefresh, true);
+  for (const blocker of ["broker_auth_failed", "native_host_invalid", "codex_plugin_list_failed", "profile_binding_mismatch", "integration_not_ready"])
+    assert.ok(controlPlaneSyncReadiness({ ...pending, exactBlockers: [blocker] }, proof).exactBlockers.includes(blocker));
+  assert.equal(controlPlaneSyncReadiness({ ...pending, result: "failed" }, proof).pendingRefresh, true);
+});
+
+test("Companion lock preserves old live, EPERM and malformed owners regardless of mtime", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "aos-companion-lock-live-")));
+  const path = join(root, "setup.lock");
+  try {
+    for (const [text, probeOwner, blocker] of [[`${process.pid}\n`, () => {}, "companion_lock_owner_live_or_unverifiable"],
+      ["1\n", () => { throw Object.assign(new Error("permission"), { code: "EPERM" }); }, "companion_lock_owner_live_or_unverifiable"],
+      ["unknown owner\n", deadOwner, "companion_lock_owner_uncertain"]]) {
+      await writeFile(path, text);
+      await utimes(path, 1, 1);
+      const result = await acquireCompanionLock(path, { probeOwner, legacyRolloutConfirmed: true });
+      assert.equal(result.acquired, false);
+      assert.equal(result.exactBlocker, blocker);
+      assert.equal(await readFile(path, "utf8"), text);
+    }
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("dead legacy and v1 token locks require exclusion-bound maintenance even with old rollout flag", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "aos-companion-lock-dead-")));
+  const path = join(root, "setup.lock");
+  try {
+    for (const text of ["2147483647\n", JSON.stringify({ schema: "companion_lock.v1", pid: 2147483647, token: "12345678-1234-1234-1234-123456789abc" })]) {
+      await writeFile(path, text);
+      const blocked = await acquireCompanionLock(path, { probeOwner: deadOwner });
+      assert.equal(blocked.acquired, false);
+      assert.equal(blocked.exactBlocker, "companion_legacy_lock_maintenance_required");
+      assert.equal(await readFile(path, "utf8"), text);
+      const lease = await acquireCompanionLock(path, { probeOwner: deadOwner, legacyRolloutConfirmed: true });
+      assert.equal(lease.acquired, false);
+      assert.equal(lease.exactBlocker, "companion_legacy_lock_maintenance_required");
+      assert.equal(await readFile(path, "utf8"), text);
+    }
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("cooperative lock serializes concurrent owners and preserves replacement tokens", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "aos-companion-lock-concurrent-")));
+  const path = join(root, "setup.lock");
+  try {
+    const leases = await Promise.all(Array.from({ length: 8 }, () => acquireCompanionLock(path)));
+    assert.equal(leases.filter((lease) => lease.acquired).length, 1);
+    const first = leases.find((lease) => lease.acquired);
+    assert.equal((await releaseCompanionLock(first)).released, true);
+    const second = await acquireCompanionLock(path);
+    assert.equal(second.acquired, true);
+    assert.notEqual(second.token, first.token);
+    assert.equal((await releaseCompanionLock(first)).released, false);
+    assert.equal(JSON.parse(await readFile(path, "utf8")).token, second.token);
+    assert.equal((await releaseCompanionLock(second)).released, true);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("ordinary lock write failure cleans owned guard; abandoned guard is bounded and preserved", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "aos-companion-lock-guard-")));
+  const path = join(root, "setup.lock");
+  try {
+    assert.equal((await acquireCompanionLock(path, { testFaultAt: "after_guard" })).exactBlocker, "companion_lock_fixture_write_failed");
+    await assert.rejects(stat(`${path}.guard.v2`), { code: "ENOENT" });
+    await assert.rejects(stat(path), { code: "ENOENT" });
+    await mkdir(`${path}.guard`);
+    const started = Date.now();
+    const blocked = await acquireCompanionLock(path, { guardWaitMs: 30 });
+    assert.equal(blocked.acquired, false);
+    assert.equal(blocked.exactBlocker, "companion_lock_guard_legacy_or_uncertain");
+    assert.ok(Date.now() - started < 1_000);
+    assert.equal((await stat(`${path}.guard`)).isDirectory(), true);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("guard prepublication failure leaves no final guard; replaced owner token is preserved", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "aos-companion-lock-owner-")));
+  const path = join(root, "setup.lock");
+  try {
+    assert.equal((await acquireCompanionLock(path, { testFaultAt: "guard_stage_partial" })).exactBlocker, "companion_lock_fixture_write_failed");
+    await assert.rejects(stat(`${path}.guard.v2`), { code: "ENOENT" });
+    const replacement = { pid: process.pid, token: "replacement-guard-owner" };
+    const blocked = await acquireCompanionLock(path, { testPauseAt: "after_work", onPhase: async () => {
+      await writeJson(`${path}.guard.v2`, replacement);
+    } });
+    assert.equal(blocked.exactBlocker, "companion_lock_marker_identity_changed");
+    assert.deepEqual(JSON.parse(await readFile(`${path}.guard.v2`, "utf8")), replacement);
+    assert.equal((await stat(path)).isFile(), true);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("busy setup returns current nonready and labels prior ready receipt without overwriting it", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "aos-companion-lock-busy-")));
+  const path = join(root, "setup.lock");
+  const statePath = join(root, "setup-state.json");
+  try {
+    const previous = { schema: AUTO_SETUP_SCHEMA, setup_complete: true, companion_ready: true, integration_ready: true };
+    await writeJson(statePath, previous);
+    const lease = await acquireCompanionLock(path);
+    let calls = 0;
+    const result = await convergeCompanionSetup({ platform: "darwin", lockPath: path, statePath,
+      environment: {}, runCommand: async () => { calls += 1; throw new Error("must not dispatch"); } });
+    assert.equal(result.integration_ready, false);
+    assert.equal(result.setup_complete, false);
+    assert.equal(result.companion_ready, false);
+    assert.ok(result.exact_blockers.includes("auto_setup_convergence_in_progress"));
+    assert.deepEqual(result.prior_receipt_evidence, { current: false, receipt: previous });
+    assert.deepEqual(JSON.parse(await readFile(statePath, "utf8")), previous);
+    assert.equal(calls, 0);
+    await releaseCompanionLock(lease);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
 
 async function fixture() {
   const root = await realpath(await mkdtemp(join(tmpdir(), "aos-companion-auto-setup-")));
@@ -67,6 +247,133 @@ function installedPluginList() {
     exactBlocker: null,
   };
 }
+
+test("fresh onboarding with a missing profile returns nonready without plugin invocation", async () => {
+  const item = await fixture();
+  try {
+    const result = await convergeCompanionSetup({ platform: "darwin", homePath: item.homePath, sourceRoot: item.sourceRoot,
+      chromeUserDataDir: join(item.root, "missing-chrome"), environment: { AOS_CHROME_COMPANION_DATA_DIR: join(item.root, "support") },
+      runCommand: async () => { throw new Error("no plugin call permitted without a selected profile"); } });
+    assert.equal(result.setup_complete, false);
+    assert.equal(result.companion_ready, false);
+    assert.equal(result.integration_ready, false);
+    assert.ok(result.exact_blockers.includes("companion_chrome_extension_not_installed_in_profile"));
+    assert.equal(result.profile_directory, null);
+  } finally { await rm(item.root, { recursive: true, force: true }); }
+});
+
+test("onboarding plugin permission failure keeps exact blocker and never reports integrated readiness", async () => {
+  const item = await fixture();
+  try {
+    const result = await convergeCompanionSetup({ platform: "darwin", homePath: item.homePath, sourceRoot: item.sourceRoot,
+      chromeUserDataDir: item.chromeUserDataDir, environment: { AOS_CHROME_COMPANION_DATA_DIR: join(item.root, "support"), AOS_WEB_OPERATION_BACKEND_CONFIG: join(item.root, "selector.json") },
+      runCommand: async () => ({ code: 1, stdout: "", stderr: "EACCES: plugin directory permission denied", exactBlocker: "EACCES: plugin directory permission denied" }) });
+    assert.equal(result.integration_ready, false);
+    assert.equal(result.setup_complete, false);
+    assert.ok(result.exact_blockers.some((entry) => entry.includes("EACCES")));
+    assert.match(result.next_action, /Codex plugin setup failed/u);
+  } finally { await rm(item.root, { recursive: true, force: true }); }
+});
+
+test("managed convergence selects once in its child environment without changing parent pins", async () => {
+  const item = await fixture();
+  try {
+    const bin = join(item.root, "bin");
+    await mkdir(bin);
+    const cli = join(bin, "codex");
+    await writeFile(cli, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+    const environment = { PATH: bin, CODEX_CLI_PATH: "/stale/ChatGPT/codex", AOS_CHROME_COMPANION_DATA_DIR: join(item.root, "support"),
+      AOS_WEB_OPERATION_BACKEND_CONFIG: join(item.root, "selector.json") };
+    const original = { ...environment };
+    let calls = 0;
+    const result = await convergeCompanionSetup({ platform: "darwin", homePath: item.homePath, sourceRoot: item.sourceRoot,
+      chromeUserDataDir: item.chromeUserDataDir, environment, managedChild: true, managedChildProvenance: "companion_autosetup_wrapper",
+      runCommand: async (command, args, options) => { calls += 1; assert.equal(command, cli);
+        assert.equal(options.env.CODEX_CLI_PATH, cli); assert.equal(args[1], "list"); return installedPluginList(); } });
+    assert.equal(result.integration_ready, true);
+    assert.equal(result.components.codex_cli_selection.discardedInheritedPin, original.CODEX_CLI_PATH);
+    assert.equal(calls, 1);
+    assert.deepEqual(environment, original);
+    calls = 0;
+    const failed = await convergeCompanionSetup({ platform: "darwin", homePath: item.homePath, sourceRoot: item.sourceRoot,
+      chromeUserDataDir: item.chromeUserDataDir, environment: { ...environment, AOS_CHROME_COMPANION_CODEX_CLI_PATH: "/invalid/user/codex" },
+      managedChild: true, managedChildProvenance: "companion_autosetup_wrapper", runCommand: async (command) => {
+        calls += 1; assert.equal(command, "/invalid/user/codex"); return { code: 1, stdout: "", stderr: "", exactBlocker: "spawn ENOENT" }; } });
+    assert.equal(failed.integration_ready, false);
+    assert.equal(calls, 1);
+  } finally { await rm(item.root, { recursive: true, force: true }); }
+});
+
+test("native-host convergence preserves direct and custom authority without command fallback", async () => {
+  const item = await fixture();
+  try {
+    const bin = join(item.root, "bin");
+    await mkdir(bin);
+    const cli = join(bin, "codex");
+    await writeFile(cli, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+    const environment = { PATH: bin, CODEX_CLI_PATH: "/stale/ChatGPT/codex",
+      AOS_CHROME_COMPANION_DATA_DIR: join(item.root, "support"), AOS_WEB_OPERATION_BACKEND_CONFIG: join(item.root, "selector.json") };
+    const cases = [
+      { options: {}, command: environment.CODEX_CLI_PATH, managed: false, fail: true },
+      { options: { managedChild: true }, command: environment.CODEX_CLI_PATH, managed: false, fail: true },
+      { options: { managedChild: true, managedChildProvenance: "custom" }, command: environment.CODEX_CLI_PATH, managed: false, fail: true },
+      { options: { managedChild: true, managedChildProvenance: "companion_native_host_wrapper" }, command: cli, managed: true },
+      { options: { managedChild: true, managedChildProvenance: "companion_native_host_wrapper" },
+        environment: { CODEX_CLI_PATH: cli }, command: cli, managed: true, fail: true },
+      ...[cli, "/invalid/companion/codex"].map((override) => ({
+        options: { managedChild: true, managedChildProvenance: "companion_native_host_wrapper" },
+        environment: { AOS_CHROME_COMPANION_CODEX_CLI_PATH: override }, command: override, managed: true, fail: true,
+      })),
+    ];
+    for (const scenario of cases) {
+      const scopedEnvironment = { ...environment, ...scenario.environment };
+      const original = { ...scopedEnvironment };
+      let calls = 0;
+      const result = await convergeCompanionSetup({ platform: "darwin", trigger: "native_host",
+        homePath: item.homePath, sourceRoot: item.sourceRoot, chromeUserDataDir: item.chromeUserDataDir,
+        environment: scopedEnvironment, ...scenario.options, runCommand: async (command, args, options) => {
+          calls += 1;
+          assert.equal(command, scenario.command);
+          assert.deepEqual(args, ["plugin", "list", "--json"]);
+          assert.equal(options.env.CODEX_CLI_PATH, scenario.managed ? scenario.command : original.CODEX_CLI_PATH);
+          return scenario.fail ? { code: 1, stdout: "", stderr: "fixture command failed", exactBlocker: "fixture_command_failed" } : installedPluginList();
+        } });
+      assert.equal(calls, 1);
+      assert.equal(result.integration_ready, !scenario.fail);
+      assert.equal(result.components.codex_cli_selection.managedChild, scenario.managed);
+      if (scenario.fail) assert.ok(result.exact_blockers.includes("fixture_command_failed"));
+      assert.deepEqual(scopedEnvironment, original);
+      const wrapper = await readFile(result.components.companion_native_host.wrapperPath, "utf8");
+      assert.match(wrapper, /AOS_CHROME_COMPANION_MANAGED_CHILD=1 AOS_CHROME_COMPANION_MANAGED_CHILD_PROVENANCE=companion_native_host_wrapper /u);
+      assert.doesNotMatch(wrapper, /CODEX_CLI_PATH=/u);
+    }
+  } finally { await rm(item.root, { recursive: true, force: true }); }
+});
+
+test("staged pending refresh makes setup nonready and retains the signed refresh blocker", async () => {
+  const item = await fixture();
+  try {
+    const syncSource = join(item.root, "source");
+    await mkdir(join(syncSource, "scripts"), { recursive: true });
+    await writeFile(join(syncSource, "scripts", "sync-control-plane-macos.mjs"), "// mock only\n");
+    const options = { platform: "darwin", homePath: item.homePath, sourceRoot: item.sourceRoot, syncSourceRoot: syncSource,
+      chromeUserDataDir: item.chromeUserDataDir, environment: { AOS_CHROME_COMPANION_DATA_DIR: join(item.root, "support"),
+        AOS_WEB_OPERATION_BACKEND_CONFIG: join(item.root, "selector.json") } };
+    const pending = await convergeCompanionSetup({ ...options, runCommand: async (_command, args) => args[0] === "plugin"
+      ? installedPluginList() : { code: 3, stdout: JSON.stringify({ result: "applied_pending_refresh", artifactsStaged: true,
+        exactBlockers: [], restartBoundary: { blockers: [] }, extensionRefresh: { result: "deferred", exactBlocker: "extension_reload_logical_sessions_active" } }) } });
+    assert.equal(pending.integration_ready, false);
+    assert.equal(pending.companion_ready, false);
+    assert.ok(pending.exact_blockers.includes("extension_reload_logical_sessions_active"));
+    assert.equal(pending.components.control_plane_sync.artifactStaged, true);
+    assert.equal(pending.components.control_plane_sync.runtimeLoaded, false);
+    const ready = await convergeCompanionSetup({ ...options, runCommand: async (_command, args) => args[0] === "plugin"
+      ? installedPluginList() : { code: 0, stdout: JSON.stringify({ result: "restarted", statusAfter: { connectedProfileCount: 1 },
+        extensionRefresh: { result: "reflected", postRestartReadback: { ready: true, provenanceVerified: true } }, exactBlockers: [] }) } });
+    assert.equal(ready.integration_ready, true);
+    assert.equal(ready.components.control_plane_sync.runtimeLoaded, true);
+  } finally { await rm(item.root, { recursive: true, force: true }); }
+});
 
 test("auto setup detects both Profile 2 Extensions and converges every local support component", async () => {
   const item = await fixture();
@@ -172,7 +479,7 @@ test("automatic control-plane sync detects source drift and delegates one signed
           code: 0,
           stdout: JSON.stringify({
             result: "restarted",
-            extensionRefresh: { result: "reflected" },
+            extensionRefresh: { result: "reflected", postRestartReadback: { ready: true, provenanceVerified: true } },
             statusAfter: { connectedProfileCount: 1 },
           }),
           stderr: "",
@@ -229,13 +536,13 @@ test("a deferred sync receipt retries a resident-broker restart even after app h
         calls += 1;
         return {
           code: 0,
-          stdout: JSON.stringify({ result: "restarted", extensionRefresh: { result: "reflected" }, statusAfter: { connectedProfileCount: 1 } }),
+          stdout: JSON.stringify({ result: "restarted", extensionRefresh: { result: "reflected", postRestartReadback: { ready: true, provenanceVerified: true } }, statusAfter: { connectedProfileCount: 1 } }),
           stderr: "",
         };
       },
     });
     assert.equal(result.comparison.match, true);
-    assert.equal(result.pendingRefresh, true);
+    assert.equal(result.pendingRefresh, false);
     assert.equal(result.forced, true);
     assert.equal(result.reflected, true);
     assert.equal(calls, 1);

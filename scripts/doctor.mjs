@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Compatibility entrypoint. Keep diagnosis read-only and broker-independent.
-import { collectDoctorDiagnostics } from '../src/shared/doctor-diagnostics.mjs';
+import { collectDoctorDiagnostics, evaluateDoctorReadiness } from '../src/shared/doctor-diagnostics.mjs';
 import { writeFile } from 'node:fs/promises';
 
 const argv = process.argv.slice(2);
@@ -20,15 +20,13 @@ for (let index = 0; index < argv.length; index += 1) {
 }
 try {
   const report = await collectDoctorDiagnostics(options);
-  const strictMaintenance = (report.maintenance ?? []).filter(item => item.severity === 'high');
-  if (options.strict) {
-    report.strict_ready = report.result === 'ok' && strictMaintenance.length === 0;
-    report.strict_blockers = strictMaintenance.map(item => item.code);
-  }
+  const readiness = evaluateDoctorReadiness(report, options);
+  report.strict_ready = readiness.strict_ready;
+  report.strict_blockers = readiness.strict_blockers;
   const text = `${JSON.stringify(report, null, 2)}\n`;
   if (output) await writeFile(output, text, { mode: 0o600 });
   process.stdout.write(text);
-  process.exitCode = report.result === 'ok' && (!options.strict || strictMaintenance.length === 0) ? 0 : 1;
+  process.exitCode = readiness.exitCode;
 } catch (error) {
   process.stdout.write(`${JSON.stringify({ schema: 'aos.chrome_companion.doctor_diagnostics.v1', result: 'unavailable', readOnly: true, error: error instanceof Error ? error.message : String(error) }, null, 2)}\n`);
   process.exitCode = 1;

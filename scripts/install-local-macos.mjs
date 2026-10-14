@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   access,
   chmod,
@@ -17,10 +17,14 @@ import {
   readdir,
 } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { delimiter, dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { NATIVE_HOST_NAME } from "../src/shared/constants.mjs";
-import { pruneApplicationBackups } from "../src/setup/auto-setup.mjs";
+import { INSTALL_BUILD_ID as SOURCE_BUILD_ID } from "../src/shared/build-info.mjs";
+import { controlPlaneSyncReadiness, pruneApplicationBackups, resolveCompanionCodexSelection } from "../src/setup/auto-setup.mjs";
+import { verifyInstalledRefreshContract, saveRefreshContractHistory } from "../src/shared/refresh-contract-history.mjs";
+import { resolveBrokerSocketPath } from "../src/shared/paths.mjs";
+import { aosRunActive } from "../src/shared/aos-run-active.mjs";
 
 function parseArgs(argv) {
   const output = { installCodexPlugin: true };
@@ -91,8 +95,36 @@ async function assertTreeNoSymlinks(root) {
   }
 }
 
-function buildInfoSource(buildId) {
-  return `export const INSTALL_BUILD_ID = ${JSON.stringify(buildId)};\n`;
+function buildInfoSource(buildId, provenance = {}) {
+  return [
+    `export const INSTALL_BUILD_ID = ${JSON.stringify(buildId)};`,
+    `export const BUNDLE_TREE_SHA256 = ${JSON.stringify(provenance.bundleTreeSha256 ?? null)};`,
+    `export const EXTENSION_TREE_SHA256 = ${JSON.stringify(provenance.extensionTreeSha256 ?? null)};`,
+    `export const NATIVE_RECORDER_SHA256 = ${JSON.stringify(provenance.nativeRecorderSha256 ?? null)};`,
+    "",
+  ].join("\n");
+}
+
+async function hashTree(root, excludedPaths = new Set()) {
+  const files = [];
+  async function visit(directory) {
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name);
+      const relativePath = relative(root, path).split(sep).join("/");
+      if (relativePath.split("/").includes("node_modules") || excludedPaths.has(relativePath)) continue;
+      if (entry.isSymbolicLink()) throw new Error(`Refusing symlink while hashing build provenance: ${path}`);
+      if (entry.isDirectory()) await visit(path);
+      else if (entry.isFile()) files.push({ path, relativePath });
+    }
+  }
+  await visit(root);
+  files.sort((left, right) => left.relativePath.localeCompare(right.relativePath));
+  const manifest = createHash("sha256");
+  for (const file of files) {
+    const contentHash = createHash("sha256").update(await readFile(file.path)).digest("hex");
+    manifest.update(`${file.relativePath}\0${contentHash}\n`, "utf8");
+  }
+  return manifest.digest("hex");
 }
 
 async function readInstalledBuildId(appDir) {
@@ -100,7 +132,7 @@ async function readInstalledBuildId(appDir) {
   try {
     const source = await readFile(buildInfoPath, "utf8");
     const match = /INSTALL_BUILD_ID\s*=\s*["']([^"']+)["']/u.exec(source);
-    return match?.[1] && /^install-[0-9a-f-]{36}$/u.test(match[1]) ? match[1] : null;
+    return match?.[1] && (match[1] === "dev-local" || /^install-[0-9a-f-]{36}$/u.test(match[1])) ? match[1] : null;
   } catch {
     return null;
   }
@@ -112,7 +144,7 @@ async function readInstalledBuildId(appDir) {
  * build ID that the staged Node broker will enforce.  The write is atomic and
  * refuses symlinked path components or a symlink target.
  */
-async function stampSourceExtensionBuildId(extensionRoot, buildId) {
+async function stampSourceExtensionBuildId(extensionRoot, buildId, provenance) {
   await assertNoSymlinkComponents(extensionRoot);
   const target = join(extensionRoot, "build-info.js");
   await assertNoSymlinkComponents(target);
@@ -121,7 +153,7 @@ async function stampSourceExtensionBuildId(extensionRoot, buildId) {
     throw new Error("source_extension_build_info_not_regular_file");
   }
   const previousContent = await readFile(target, "utf8");
-  const nextContent = buildInfoSource(buildId);
+  const nextContent = buildInfoSource(buildId, provenance);
   const temporary = `${target}.${process.pid}-${randomUUID()}.tmp`;
   try {
     await writeFile(temporary, nextContent, { flag: "wx", mode: targetStat.mode & 0o777 });
@@ -132,7 +164,7 @@ async function stampSourceExtensionBuildId(extensionRoot, buildId) {
     await rm(temporary, { force: true }).catch(() => {});
     throw error;
   }
-  return { path: target, buildId, previousContent, nextContent };
+  return { path: target, buildId, provenance, previousContent, nextContent };
 }
 
 async function rollbackSourceExtensionBuildId(stamp) {
@@ -169,6 +201,11 @@ if (!/^[a-p]{32}$/.test(extensionId ?? "")) {
 if (process.platform !== "darwin") {
   throw new Error("The local product installer currently supports macOS only");
 }
+const activeAosRun = aosRunActive();
+if (activeAosRun) {
+  process.stderr.write(`AOS run ${activeAosRun} is under way; reinstalling Companion now would take its tools away from that run. Try again after it ends (scripts/ops.sh active in ~/Projects/aos-v2).\n`);
+  process.exit(75);
+}
 
 const sourceRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const supportDir = join(homedir(), "Library", "Application Support", "AOS Chrome Companion");
@@ -186,20 +223,19 @@ const marketplaceName = "aos-chrome-companion-local";
 const sourceExtensionRoot = join(sourceRoot, "extension");
 const sourceExtensionBuildInfoPath = join(sourceExtensionRoot, "build-info.js");
 const previousInstallBuildId = await readInstalledBuildId(appDir);
-// Keep the install build stable across local updates.  The explicit
-// extension.reload boundary rotates the runtime identity and generation, so
-// rotating the build id here only creates a temporary mismatch window where
-// the old resident broker cannot accept the still-loaded Extension.  A first
-// install still receives a unique id; subsequent updates reuse that id while
-// the signed refresh loads the new source.
-const installBuildId = previousInstallBuildId ?? `install-${randomUUID()}`;
+// Keep the install build stable across local updates.  A fresh source install
+// starts with the shared dev-local id so an already-loaded unpacked Extension
+// can connect and request the signed refresh; artifact hashes, not a random
+// first-install ID, distinguish the installed bundle. Later updates preserve
+// the installed ID while the explicit refresh rotates runtime generation.
+const installBuildId = previousInstallBuildId ?? SOURCE_BUILD_ID;
 const installBuildIdReused = Boolean(previousInstallBuildId);
 
 await assertNoSymlinkComponents(supportDir);
 await assertNoSymlinkComponents(stagingDir);
 await assertNoSymlinkComponents(appDir);
 await assertNoSymlinkComponents(manifestDir);
-for (const entry of ["src", "extension", "plugins", "scripts", "package.json", "package-lock.json", "README.md", "PROJECT_DESIGN.md"]) {
+for (const entry of ["src", "extension", "native-recording", "plugins", "scripts", "package.json", "package-lock.json", "README.md", "PROJECT_DESIGN.md"]) {
   await assertTreeNoSymlinks(join(sourceRoot, entry));
 }
 await mkdir(supportDir, { recursive: true, mode: 0o700 });
@@ -207,22 +243,18 @@ await rm(stagingDir, { recursive: true, force: true });
 await mkdir(stagingDir, { recursive: true, mode: 0o700 });
 
 let sourceBuildInfoStamp = null;
+let buildProvenance = null;
+const refreshContractHistory = { captured: false, exactBlocker: null,
+  path: join(dirname(resolveBrokerSocketPath()), "refresh-contract-history.json") };
 const appSwap = { previousMoved: false, newInstalled: false };
 try {
-  for (const entry of ["src", "extension", "plugins", "scripts", "package.json", "package-lock.json", "README.md", "PROJECT_DESIGN.md"] ) {
+  for (const entry of ["src", "extension", "native-recording", "plugins", "scripts", "package.json", "package-lock.json", "README.md", "PROJECT_DESIGN.md"] ) {
     await cp(join(sourceRoot, entry), join(stagingDir, entry), {
       recursive: true,
       force: false,
       errorOnExist: true,
     });
   }
-
-  // Bind the staged Node broker and unpacked Extension to one install. The
-  // source tree keeps a safe dev-local default; the local install value is
-  // stable across updates and the signed Extension refresh rotates the
-  // runtime identity at the safe boundary.
-  await writeFile(join(stagingDir, "src", "shared", "build-info.mjs"), buildInfoSource(installBuildId), { mode: 0o600 });
-  await writeFile(join(stagingDir, "extension", "build-info.js"), buildInfoSource(installBuildId), { mode: 0o600 });
 
   const packageJsonPath = join(stagingDir, "package.json");
   const packageJson = JSON.parse(await readFile(packageJsonPath, "utf8"));
@@ -239,7 +271,7 @@ try {
         cwd: ".",
         env: { AOS_CHROME_COMPANION_ROOT: appDir },
         enabled: true,
-        startup_timeout_sec: 15,
+        startup_timeout_sec: 60,
         tool_timeout_sec: 90,
       },
     },
@@ -259,12 +291,56 @@ try {
   }, null, 2)}\n`, { mode: 0o600 });
 
   await run("npm", ["ci", "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund"], { cwd: stagingDir });
+  await run("xcrun", ["swiftc", "-parse-as-library", "-o", join(stagingDir, "native-recording-bin"), join(stagingDir, "native-recording", "CompanionScreenRecorder.swift")], { cwd: stagingDir });
+
+  const provenance = {
+    schema: "aos_chrome_companion_build_manifest.v1",
+    buildId: installBuildId,
+    bundleTreeSha256: await hashTree(stagingDir, new Set([
+      "src/shared/build-info.mjs",
+      "extension/build-info.js",
+      "build-manifest.json",
+    ])),
+    extensionTreeSha256: await hashTree(join(stagingDir, "extension"), new Set(["build-info.js"])),
+    nativeRecorderSha256: createHash("sha256")
+      .update(await readFile(join(stagingDir, "native-recording-bin")))
+      .digest("hex"),
+  };
+  buildProvenance = provenance;
+  const buildInfo = buildInfoSource(installBuildId, provenance);
+  await writeFile(join(stagingDir, "src", "shared", "build-info.mjs"), buildInfo, { mode: 0o600 });
+  await writeFile(join(stagingDir, "extension", "build-info.js"), buildInfo, { mode: 0o600 });
+  await writeFile(join(stagingDir, "build-manifest.json"), `${JSON.stringify(provenance, null, 2)}\n`, { mode: 0o600 });
+  const stagedBundleTreeSha256 = await hashTree(stagingDir, new Set([
+    "src/shared/build-info.mjs",
+    "extension/build-info.js",
+    "build-manifest.json",
+  ]));
+  const stagedExtensionTreeSha256 = await hashTree(join(stagingDir, "extension"), new Set(["build-info.js"]));
+  if (stagedBundleTreeSha256 !== provenance.bundleTreeSha256
+    || stagedExtensionTreeSha256 !== provenance.extensionTreeSha256) {
+    throw new Error("build_provenance_staging_integrity_mismatch");
+  }
 
   // Chrome reloads the unpacked Extension from the source tree, not from the
   // staged app. Stamp it before the app swap so a source failure leaves the
   // currently running broker/application untouched.
-  sourceBuildInfoStamp = await stampSourceExtensionBuildId(sourceExtensionRoot, installBuildId);
+  sourceBuildInfoStamp = await stampSourceExtensionBuildId(sourceExtensionRoot, installBuildId, provenance);
+  if (await hashTree(sourceExtensionRoot, new Set(["build-info.js"])) !== provenance.extensionTreeSha256) {
+    throw new Error("build_provenance_source_extension_mismatch");
+  }
 
+  // Retain only a verified complete old contract before replacing its app.
+  // An invalid/missing old tree does not become a trusted registration exception.
+  if (previousInstallBuildId && await exists(appDir)) {
+    try {
+      const previousContract = await verifyInstalledRefreshContract(appDir, { expectedBuildId: previousInstallBuildId });
+      await saveRefreshContractHistory(refreshContractHistory.path, previousContract);
+      refreshContractHistory.captured = true;
+    } catch (error) {
+      refreshContractHistory.exactBlocker = error?.code ?? error.message;
+    }
+  }
   if (await exists(appDir)) {
     await rename(appDir, backupDir);
     appSwap.previousMoved = true;
@@ -315,10 +391,14 @@ const backupRetention = await pruneApplicationBackups({
 await mkdir(binDir, { recursive: true, mode: 0o700 });
 await mkdir(manifestDir, { recursive: true, mode: 0o700 });
 await assertNoSymlinkComponents(wrapperPath);
+const recorderPath = join(binDir, "aos-chrome-companion-recorder");
+await assertNoSymlinkComponents(recorderPath);
+await copyFile(join(appDir, "native-recording-bin"), recorderPath);
+await chmod(recorderPath, 0o700);
 await assertNoSymlinkComponents(manifestPath);
 const wrapper = [
   "#!/bin/sh",
-  `AOS_CHROME_COMPANION_EXTENSION_ORIGIN=${JSON.stringify(extensionOrigin)} exec ${JSON.stringify(process.execPath)} ${JSON.stringify(join(appDir, "src", "native-host", "main.mjs"))} "$@"`,
+  `AOS_CHROME_COMPANION_MANAGED_CHILD=1 AOS_CHROME_COMPANION_MANAGED_CHILD_PROVENANCE=companion_native_host_wrapper AOS_CHROME_COMPANION_EXTENSION_ORIGIN=${JSON.stringify(extensionOrigin)} exec ${JSON.stringify(process.execPath)} ${JSON.stringify(join(appDir, "src", "native-host", "main.mjs"))} "$@"`,
   "",
 ].join("\n");
 await writeFile(wrapperPath, wrapper, { mode: 0o700 });
@@ -355,7 +435,13 @@ for (const logPath of [autoSetupStdoutPath, autoSetupStderrPath]) {
 }
 await writeFile(autoSetupWrapperPath, [
   "#!/bin/sh",
-  `AOS_CHROME_COMPANION_SETUP_TRIGGER=launch_agent AOS_CHROME_COMPANION_SOURCE_ROOT=${JSON.stringify(sourceRoot)} AOS_CHROME_COMPANION_INSTALL_ROOT=${JSON.stringify(appDir)} exec ${JSON.stringify(process.execPath)} ${JSON.stringify(join(appDir, "scripts", "auto-setup-macos.mjs"))}`,
+  "# Leave Companion alone while an AOS run is under way (~/.config/aos/run-active holds the AOS agent's pid).",
+  `marker="$HOME/.config/aos/run-active"`,
+  `if [ -f "$marker" ] && kill -0 "$(cut -d' ' -f1 "$marker")" 2>/dev/null; then exit 0; fi`,
+  "# Keep the autosetup log under 20 MB (it can grow by tens of KB a minute): keep its last 2 MB.",
+  `log=${JSON.stringify(autoSetupStdoutPath)}`,
+  `if [ "$(stat -f%z "$log" 2>/dev/null || echo 0)" -gt 20000000 ]; then tail -c 2000000 "$log" > "$log.trim" && cat "$log.trim" > "$log"; rm -f "$log.trim"; fi`,
+  `AOS_CHROME_COMPANION_MANAGED_CHILD=1 AOS_CHROME_COMPANION_MANAGED_CHILD_PROVENANCE=companion_autosetup_wrapper AOS_CHROME_COMPANION_SETUP_TRIGGER=launch_agent AOS_CHROME_COMPANION_SOURCE_ROOT=${JSON.stringify(sourceRoot)} AOS_CHROME_COMPANION_INSTALL_ROOT=${JSON.stringify(appDir)} exec ${JSON.stringify(process.execPath)} ${JSON.stringify(join(appDir, "scripts", "auto-setup-macos.mjs"))}`,
   "",
 ].join("\n"), { mode: 0o700 });
 await chmod(autoSetupWrapperPath, 0o700);
@@ -387,18 +473,22 @@ let codexPlugin = {
   staleCleanupBlockers: [],
 };
 if (installCodexPlugin) {
-  const marketplace = await run("codex", ["plugin", "marketplace", "add", appDir], { allowFailure: true });
+  const selection = await resolveCompanionCodexSelection(process.env, { managedChild: true, provenance: "companion_installer_default" });
+  codexPlugin.cliSelection = selection;
+  const cliOptions = { allowFailure: true, env: { ...process.env, CODEX_CLI_PATH: selection.command,
+    PATH: [dirname(process.execPath), process.env.PATH || "/usr/bin:/bin"].join(delimiter) } };
+  const marketplace = await run(selection.command, ["plugin", "marketplace", "add", appDir], cliOptions);
   codexPlugin.marketplaceAdded = marketplace.code === 0
     || /already|exists|configured/iu.test(`${marketplace.stdout} ${marketplace.stderr}`);
   if (codexPlugin.marketplaceAdded) {
-    const installed = await run("codex", ["plugin", "add", `aos-chrome-companion@${marketplaceName}`], { allowFailure: true });
+    const installed = await run(selection.command, ["plugin", "add", `aos-chrome-companion@${marketplaceName}`], cliOptions);
     codexPlugin.installed = installed.code === 0;
     if (!codexPlugin.installed) codexPlugin.exactBlocker = installed.stderr || installed.stdout || "codex_plugin_install_failed";
     if (codexPlugin.installed) {
       // Keep the app-local marketplace as the single source of truth.  Older
       // installers could leave the same plugin installed from another local
       // marketplace, which makes new tasks pick a stale MCP bundle.
-      const listed = await run("codex", ["plugin", "list", "--json"], { allowFailure: true });
+      const listed = await run(selection.command, ["plugin", "list", "--json"], cliOptions);
       if (listed.code !== 0) {
         codexPlugin.staleCleanupBlockers.push(listed.stderr || listed.stdout || "codex_plugin_list_failed");
       } else {
@@ -414,7 +504,7 @@ if (installCodexPlugin) {
               codexPlugin.staleCleanupBlockers.push("codex_plugin_id_missing");
               continue;
             }
-            const removed = await run("codex", ["plugin", "remove", entry.pluginId, "--json"], { allowFailure: true });
+            const removed = await run(selection.command, ["plugin", "remove", entry.pluginId, "--json"], cliOptions);
             if (removed.code === 0) codexPlugin.staleRemoved.push(entry.pluginId);
             else codexPlugin.staleCleanupBlockers.push(removed.stderr || removed.stdout || `codex_plugin_remove_failed:${entry.pluginId}`);
           }
@@ -466,17 +556,23 @@ if (!runtimeSyncReceipt && runtimeSyncRun.code !== 0) {
   };
 }
 
+const runtimeReadiness = controlPlaneSyncReadiness(runtimeSyncReceipt);
 process.stdout.write(`${JSON.stringify({
   schema: "aos_chrome_companion_local_install.v1",
   installed: true,
+  artifactsStaged: true,
+  runtimeLoaded: runtimeReadiness.runtimeLoaded,
   releaseReady: false,
   extensionId,
   installBuildId,
   installBuildIdReused,
+  refreshContractHistory,
+  buildProvenance,
   extensionDirectory: join(appDir, "extension"),
   sourceExtensionBuildInfo: {
     path: sourceExtensionBuildInfoPath,
     buildId: installBuildId,
+    ...buildProvenance,
     stamped: true,
     atomic: true,
     symlinkSafe: true,
@@ -492,9 +588,9 @@ process.stdout.write(`${JSON.stringify({
     launchAgentPath,
     wrapperPath: autoSetupWrapperPath,
     launchAgentLoaded: launchAgentBootstrap.code === 0,
-    setupComplete: autoSetupReceipt?.setup_complete === true,
-    exactBlockers: autoSetupReceipt?.exact_blockers
-      ?? (autoSetupRun.code === 0 ? [] : [autoSetupRun.stderr || "auto_setup_initial_convergence_failed"]),
+    setupComplete: autoSetupReceipt?.setup_complete === true && runtimeReadiness.runtimeLoaded,
+    exactBlockers: [...new Set([...(autoSetupReceipt?.exact_blockers
+      ?? (autoSetupRun.code === 0 ? [] : [autoSetupRun.stderr || "auto_setup_initial_convergence_failed"])), ...runtimeReadiness.exactBlockers])],
   },
   controlPlaneSync: runtimeSyncReceipt,
   codexPlugin,
@@ -504,9 +600,9 @@ process.stdout.write(`${JSON.stringify({
     "notarization_missing",
     "bundled_node_runtime_missing",
   ],
-  next: autoSetupReceipt?.setup_complete === true && ["restarted", "applied"].includes(runtimeSyncReceipt?.result)
+  next: autoSetupReceipt?.setup_complete === true && runtimeReadiness.runtimeLoaded
     ? "No manual Extension reload is required. The signed refresh and broker restart completed at an idle boundary."
     : autoSetupReceipt?.setup_complete === true
-      ? `Runtime refresh is deferred: ${runtimeSyncReceipt?.exactBlockers?.[0] ?? "wait for an idle connected Companion profile; the next install or scheduler tick retries automatically"}.`
+      ? `Runtime refresh is deferred: ${runtimeReadiness.exactBlocker ?? "wait for an idle connected Companion profile; the next install or scheduler tick retries automatically"}.`
     : "Keep both Extensions enabled in Profile 2. The background setup retries automatically; inspect setup-state.json for any permission or policy blocker.",
 }, null, 2)}\n`);

@@ -4,7 +4,6 @@ import {
   chmod,
   lstat,
   mkdir,
-  open,
   readFile,
   readdir,
   realpath,
@@ -18,8 +17,10 @@ import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { NATIVE_HOST_NAME } from "../shared/constants.mjs";
+import { NATIVE_HOST_NAME, OPERATION_SCHEMA_DIGEST } from "../shared/constants.mjs";
 import { controlPlaneFiles } from "../shared/control-plane-files.mjs";
+import { companionLockTransaction } from "./lock-transaction.mjs";
+import { verifyRuntimeAttestation } from "../shared/runtime-attestation.mjs";
 
 export const AUTO_SETUP_SCHEMA = "aos_chrome_companion_auto_setup.v1";
 export const DEFAULT_COMPANION_EXTENSION_ID = "pmoolbkcamcemmfonlaenelcbdlcngmb";
@@ -32,7 +33,6 @@ const APPLICATION_BACKUP_NAME = /^app-backup-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}
 
 const OFFICIAL_NATIVE_HOST_NAME = "com.openai.codexextension";
 const MARKETPLACE_NAME = "aos-chrome-companion-local";
-const SETUP_LOCK_STALE_MS = 120_000;
 const COMMAND_TIMEOUT_MS = 20_000;
 const PLUGIN_RECHECK_MS = 10 * 60_000;
 const CONTROL_PLANE_SYNC_TIMEOUT_MS = 90_000;
@@ -308,6 +308,44 @@ function parseCommandJson(result) {
  * a busy profile is returned as a precise deferred receipt and is retried by
  * the next launch-agent tick.
  */
+export function controlPlaneSyncReadiness(receipt, { liveStatus, expectedBuildId, artifactsMatch = false,
+  expectedSchemaDigest = OPERATION_SCHEMA_DIGEST } = {}) {
+  const pending = ["deferred", "applied_pending_refresh", "failed"].includes(receipt?.result)
+    || receipt?.extensionRefresh?.result === "deferred";
+  const blockers = [...new Set([
+    pending ? receipt?.extensionRefresh?.exactBlocker : null,
+    ...(Array.isArray(receipt?.exactBlockers) ? receipt.exactBlockers : []),
+    pending ? receipt?.exactBlocker : null,
+  ].filter(Boolean))];
+  const refreshOnly = new Set(["extension_reload_logical_sessions_active", "logical_sessions_active", "exact_tab_leases_active",
+    "pending_operations_active", "timed_out_operations_active", "profile_queue_active", "active_task_tabs_present",
+    "companion_profile_not_connected_after_broker_restart", "extension_refresh_not_reflected", "extension_reload_profile_not_connected"]);
+  const connected = Array.isArray(liveStatus?.profiles) ? liveStatus.profiles.filter(profile => profile.connected === true) : [];
+  const matchingRuntime = artifactsMatch === true && typeof expectedBuildId === "string" && expectedBuildId.length > 0
+    && liveStatus?.expectedBuildId === expectedBuildId && liveStatus?.runtimeAttestation?.buildId === expectedBuildId
+    && connected.length === 1 && connected[0].buildId === expectedBuildId
+    && connected[0].operationSchemaDigest === expectedSchemaDigest
+    && verifyRuntimeAttestation(liveStatus?.runtimeAttestation, { buildId: expectedBuildId, operationSchemaDigest: expectedSchemaDigest })
+    && typeof connected[0].generation === "string" && connected[0].generation.length > 0
+    && Array.isArray(connected[0].buildProvenanceMismatches) && connected[0].buildProvenanceMismatches.length === 0;
+  if (pending && ["deferred", "applied_pending_refresh"].includes(receipt?.result)
+    && receipt?.artifactsStaged === true && blockers.every(blocker => refreshOnly.has(blocker)) && matchingRuntime) {
+    return { pendingRefresh: false, artifactStaged: true, runtimeLoaded: true, exactBlockers: [], exactBlocker: null,
+      staleRefreshReconciled: true, reconciledBlockers: blockers, verificationSource: "fresh_matching_runtime_and_artifact_provenance" };
+  }
+  if (pending && blockers.length === 0) blockers.push("extension_refresh_not_reflected");
+  const runtimeLoaded = !pending && (["applied", "restarted"].includes(receipt?.result)
+    || receipt?.result === "already_current" && receipt.staleRefreshReconciled === true)
+    && receipt?.statusAfter?.connectedProfileCount === 1
+    && receipt?.extensionRefresh?.postRestartReadback?.ready === true
+    && receipt?.extensionRefresh?.postRestartReadback?.provenanceVerified === true;
+  if (["applied", "restarted"].includes(receipt?.result) && !runtimeLoaded && blockers.length === 0) {
+    blockers.push("control_plane_activation_not_verified");
+  }
+  return { pendingRefresh: pending || blockers.length > 0, artifactStaged: receipt?.artifactsStaged === true,
+    runtimeLoaded, exactBlockers: blockers, exactBlocker: blockers[0] ?? null };
+}
+
 export async function requestAutomaticControlPlaneSync({
   sourceRoot,
   installedRoot,
@@ -341,9 +379,7 @@ export async function requestAutomaticControlPlaneSync({
   const pendingReceiptPath = join(dirname(installed), "control-plane-sync-receipt.json");
   const pendingReceipt = await readJson(pendingReceiptPath).catch(() => null);
   const pendingRefresh = pendingReceipt?.sourceRoot === source
-    && (pendingReceipt?.result === "deferred"
-      || pendingReceipt?.result === "applied_pending_refresh"
-      || pendingReceipt?.extensionRefresh?.result === "deferred");
+    && controlPlaneSyncReadiness(pendingReceipt).pendingRefresh;
   if (comparison.match && !force && !pendingRefresh) {
     return {
       schema: "aos.chrome_companion.control_plane_auto_sync.v1",
@@ -383,11 +419,8 @@ export async function requestAutomaticControlPlaneSync({
   );
   const receipt = parseCommandJson(commandResult);
   const result = receipt?.result || (commandResult?.code === 0 ? "restarted" : "deferred");
-  const exactBlockers = Array.isArray(receipt?.exactBlockers)
-    ? receipt.exactBlockers
-    : commandResult?.exactBlocker
-      ? [commandResult.exactBlocker]
-      : commandResult?.code === 0 ? [] : ["control_plane_sync_failed"];
+  const readiness = controlPlaneSyncReadiness(receipt ?? { result, exactBlockers: [commandResult?.exactBlocker || "control_plane_sync_receipt_missing"] });
+  const exactBlockers = readiness.exactBlockers;
   return {
     schema: "aos.chrome_companion.control_plane_auto_sync.v1",
     attempted: true,
@@ -400,11 +433,11 @@ export async function requestAutomaticControlPlaneSync({
     noReplay: true,
     exactBlocker: exactBlockers[0] ?? null,
     exactBlockers,
-    pendingRefresh,
+    pendingRefresh: readiness.pendingRefresh,
     forced: force || pendingRefresh,
-    reflected: ["applied", "restarted"].includes(result)
-      && receipt?.extensionRefresh?.result !== "deferred"
-      && receipt?.statusAfter?.connectedProfileCount !== 0,
+    artifactStaged: readiness.artifactStaged,
+    runtimeLoaded: readiness.runtimeLoaded,
+    reflected: readiness.runtimeLoaded,
   };
 }
 
@@ -498,7 +531,7 @@ async function ensureCompanionNativeHost({ homePath, sourceRoot, extensionId, no
   await mkdir(binDir, { recursive: true, mode: 0o700 });
   const wrapper = [
     "#!/bin/sh",
-    `AOS_CHROME_COMPANION_EXTENSION_ORIGIN=${JSON.stringify(extensionOrigin)} exec ${JSON.stringify(nodeExecutable)} ${JSON.stringify(join(sourceRoot, "src", "native-host", "main.mjs"))} "$@"`,
+    `AOS_CHROME_COMPANION_MANAGED_CHILD=1 AOS_CHROME_COMPANION_MANAGED_CHILD_PROVENANCE=companion_native_host_wrapper AOS_CHROME_COMPANION_EXTENSION_ORIGIN=${JSON.stringify(extensionOrigin)} exec ${JSON.stringify(nodeExecutable)} ${JSON.stringify(join(sourceRoot, "src", "native-host", "main.mjs"))} "$@"`,
     "",
   ].join("\n");
   const currentWrapper = await readFile(wrapperPath, "utf8").catch(() => null);
@@ -557,13 +590,32 @@ export async function resolveCodexCommand(environment, executableExists = async 
   return "codex";
 }
 
-async function ensureCodexPlugins({ sourceRoot, environment, runCommand }) {
+export async function resolveCompanionCodexSelection(environment, { managedChild = false, provenance = null,
+  executableExists = async (path) => { try { await access(path, fsConstants.X_OK); return (await stat(path)).isFile(); } catch { return false; } },
+} = {}) {
+  const managed = managedChild === true && ["companion_autosetup_wrapper", "companion_installer_default", "companion_native_host_wrapper"].includes(provenance);
+  const explicit = String(environment.CODEX_CLI_PATH || "").trim();
+  const ownOverride = String(environment.AOS_CHROME_COMPANION_CODEX_CLI_PATH || "").trim();
+  const childEnvironment = { ...environment };
+  let discardedInheritedPin = null;
+  if (managed && ownOverride) childEnvironment.CODEX_CLI_PATH = ownOverride;
+  else if (managed && explicit && !await executableExists(explicit)) {
+    discardedInheritedPin = explicit;
+    delete childEnvironment.CODEX_CLI_PATH;
+  }
+  const command = await resolveCodexCommand(childEnvironment, executableExists);
+  return { command, managedChild: managed, provenance: managed ? provenance : "direct_authoritative_environment",
+    discardedInheritedPin, explicitOverride: Boolean(managed ? ownOverride || (explicit && !discardedInheritedPin) : explicit) };
+}
+
+async function ensureCodexPlugins({ sourceRoot, environment, runCommand, selection }) {
   // npm's Codex launcher uses /usr/bin/env node. Supply this already-running
   // Node runtime only to the child CLI, without changing Chrome/system PATH.
   const commandEnvironment = { ...environment, PATH: [dirname(process.execPath), environment.PATH || "/usr/bin:/bin"].join(delimiter) };
+  if (selection?.managedChild === true) commandEnvironment.CODEX_CLI_PATH = selection.command;
   const changes = [];
   const blockers = [];
-  const codexCommand = await resolveCodexCommand(environment);
+  const codexCommand = selection?.command ?? await resolveCodexCommand(environment);
   let listedResult = await runCommand(codexCommand, ["plugin", "list", "--json"], { env: commandEnvironment });
   let entries = parsePluginList(listedResult);
   if (!entries) {
@@ -605,9 +657,9 @@ async function ensureCodexPlugins({ sourceRoot, environment, runCommand }) {
 // The minute tick still checks Extensions, native hosts, routing, code drift
 // and deferred refresh. Only the expensive CLI inventory may reuse a recent
 // successful read, invalidated immediately by local configuration changes.
-async function pluginVerificationFingerprint({ environment, homePath, sourceRoot }) {
+async function pluginVerificationFingerprint({ environment, homePath, sourceRoot, selection }) {
   const codexHome = environment.CODEX_HOME || join(homePath, ".codex");
-  const codexCommand = await resolveCodexCommand(environment);
+  const codexCommand = selection?.command ?? await resolveCodexCommand(environment);
   const paths = [join(codexHome, "config.toml"), join(codexHome, "plugins", "cache", "openai-bundled", "chrome"),
     join(codexHome, "plugins", "cache", MARKETPLACE_NAME, "aos-chrome-companion"),
     join(sourceRoot, ".agents", "plugins", "marketplace.json"), codexCommand];
@@ -666,22 +718,15 @@ async function ensureAdaptiveSelector({ environment, homePath, profileDirectory 
   return { ok: true, changed, path, backend: payload.backend, revision: payload.revision };
 }
 
-async function acquireSetupLock(lockPath) {
-  await mkdir(dirname(lockPath), { recursive: true, mode: 0o700 });
-  try {
-    const handle = await open(lockPath, "wx", 0o600);
-    await handle.writeFile(`${process.pid}\n`);
-    await handle.close();
-    return true;
-  } catch (error) {
-    if (error?.code !== "EEXIST") throw error;
-    const value = await stat(lockPath).catch(() => null);
-    if (value && Date.now() - value.mtimeMs > SETUP_LOCK_STALE_MS) {
-      await rm(lockPath, { force: true });
-      return acquireSetupLock(lockPath);
-    }
-    return false;
-  }
+export async function acquireCompanionLock(lockPath, options = {}) {
+  return companionLockTransaction("acquire", lockPath, options);
+}
+
+export async function releaseCompanionLock(lease, options = {}) {
+  if (lease?.acquired !== true || !lease.lockPath || !lease.token) return { released: false };
+  if (lease.pid !== process.pid) return { released: false, exactBlocker: "companion_lock_ownership_changed" };
+  return companionLockTransaction("release", lease.lockPath, { ...options, token: lease.token, acquireId:lease.acquireId,
+    coordinator: lease.coordinator,workIdentity:lease.workIdentity,workBytes:lease.workBytes });
 }
 
 export async function convergeCompanionSetup(options = {}) {
@@ -721,18 +766,26 @@ export async function convergeCompanionSetup(options = {}) {
     if (options.writeState !== false) await atomicJson(statePath, unsupported);
     return unsupported;
   }
-  if (!await acquireSetupLock(lockPath)) {
-    return await readJson(statePath) || {
+  const lockLease = await acquireCompanionLock(lockPath, { ...options.lockOptions,
+    legacyRolloutConfirmed: options.legacyLockRolloutConfirmed === true
+      || environment.AOS_CHROME_COMPANION_LEGACY_LOCK_ROLLOUT_CONFIRMED === "1" });
+  if (!lockLease.acquired) {
+    return {
       schema: AUTO_SETUP_SCHEMA,
       setup_complete: false,
       companion_ready: false,
       integration_ready: false,
       checked_at: new Date().toISOString(),
       trigger: options.trigger || "unknown",
-      exact_blockers: ["auto_setup_convergence_in_progress"],
-      next_action: "Wait for the current setup convergence to finish.",
+      exact_blockers: [lockLease.exactBlocker === "companion_lock_owner_live_or_unverifiable" || lockLease.exactBlocker === "companion_lock_coordinator_busy"
+        ? "auto_setup_convergence_in_progress" : "auto_setup_lock_reconciliation_required", lockLease.exactBlocker].filter(Boolean),
+      prior_receipt_evidence: { current: false, receipt: await readJson(statePath) },
+      next_action: lockLease.exactBlocker === "companion_lock_owner_live_or_unverifiable" || lockLease.exactBlocker === "companion_lock_coordinator_busy"
+        ? "Wait for the current setup convergence to finish."
+        : `Resolve the exact setup lock boundary (${lockLease.exactBlocker}); legacy or uncertain markers require exclusion-bound maintenance, not repeated convergence.`,
     };
   }
+  let resultState = null;
   try {
     const companionExtensionId = options.companionExtensionId || environment.AOS_CHROME_COMPANION_EXTENSION_ID || DEFAULT_COMPANION_EXTENSION_ID;
     const chromeUserDataDir = options.chromeUserDataDir
@@ -769,6 +822,9 @@ export async function convergeCompanionSetup(options = {}) {
 
     let plugins = { ok: false, changes: [], exactBlockers: ["two_extension_profile_not_ready"], official: false, companion: false };
     let selector = { ok: false, changed: false, path: null, backend: null, revision: null };
+    const codexSelection = await resolveCompanionCodexSelection(environment, {
+      managedChild: options.managedChild, provenance: options.managedChildProvenance,
+    });
     let controlPlaneSync = {
       schema: "aos.chrome_companion.control_plane_auto_sync.v1",
       attempted: false,
@@ -780,7 +836,7 @@ export async function convergeCompanionSetup(options = {}) {
     };
     if (companionSelected?.directory === "Profile 2") {
       const now = options.now?.() ?? Date.now();
-      const fingerprint = await pluginVerificationFingerprint({ environment, homePath, sourceRoot });
+      const fingerprint = await pluginVerificationFingerprint({ environment, homePath, sourceRoot, selection: codexSelection });
       const previous = await readJson(statePath);
       const cached = previous?.components?.plugin_verification;
       const age = now - Date.parse(cached?.verified_at ?? "");
@@ -793,7 +849,7 @@ export async function convergeCompanionSetup(options = {}) {
         plugins = { ok: true, changes: [], exactBlockers: [], official: true, companion: true,
           verification: { ...cached, reused: true } };
       } else {
-        plugins = await ensureCodexPlugins({ sourceRoot, environment, runCommand: options.runCommand || runSetupCommand });
+        plugins = await ensureCodexPlugins({ sourceRoot, environment, runCommand: options.runCommand || runSetupCommand, selection: codexSelection });
         plugins.verification = { ok: plugins.ok, fingerprint, verified_at: new Date(now).toISOString(), reused: false };
       }
       changes.push(...plugins.changes);
@@ -810,10 +866,10 @@ export async function convergeCompanionSetup(options = {}) {
           trigger: options.trigger || "manual",
           nodeExecutable: options.nodeExecutable || process.execPath,
         });
-        if (controlPlaneSync.result === "applied" || controlPlaneSync.result === "restarted") {
+        if (controlPlaneSync.reflected === true) {
           changes.push("companion_control_plane_reflected");
-        } else if (controlPlaneSync.attempted && controlPlaneSync.exactBlockers?.length) {
-          exactBlockers.push(...controlPlaneSync.exactBlockers);
+        } else if (controlPlaneSync.exactBlocker || controlPlaneSync.exactBlockers?.length) {
+          exactBlockers.push(...(controlPlaneSync.exactBlockers ?? [controlPlaneSync.exactBlocker]));
         }
       }
     }
@@ -828,7 +884,8 @@ export async function convergeCompanionSetup(options = {}) {
       && companionSelected.directory === "Profile 2"
       && companionNativeHost.ok
       && plugins.companion === true
-      && selector.ok;
+      && selector.ok
+      && !controlPlaneSync.exactBlocker;
     const controlPlaneBlocker = controlPlaneSync.exactBlocker || controlPlaneSync.exactBlockers?.[0] || null;
     const nextAction = setupComplete
       ? "No manual setup is required. Keep both Chrome Extensions enabled; new browser stages resolve the Extension automatically."
@@ -859,6 +916,7 @@ export async function convergeCompanionSetup(options = {}) {
         official_native_host: officialNativeHost,
         companion_native_host: companionNativeHost,
         plugin_verification: plugins.verification ?? null,
+        codex_cli_selection: codexSelection,
         official_codex_plugin: { installed: plugins.official },
         companion_codex_plugin: { installed: plugins.companion },
         adaptive_selector: selector,
@@ -869,6 +927,7 @@ export async function convergeCompanionSetup(options = {}) {
       activation_boundary: "new_codex_tasks_load_newly_installed_plugin_tools",
       next_action: nextAction,
     };
+    resultState = state;
     if (options.writeState !== false) await atomicJson(statePath, state);
     return state;
   } catch (error) {
@@ -882,9 +941,22 @@ export async function convergeCompanionSetup(options = {}) {
       exact_blockers: [`auto_setup_failed:${errorText(error)}`],
       next_action: "Keep both Extensions enabled and inspect the setup-state receipt before retrying.",
     };
+    resultState = state;
     if (options.writeState !== false) await atomicJson(statePath, state).catch(() => {});
     return state;
   } finally {
-    await rm(lockPath, { force: true }).catch(() => {});
+    const release = await releaseCompanionLock(lockLease).catch((error) => ({ released: false,
+      exactBlocker: `companion_lock_release_failed:${errorText(error)}` }));
+    if (resultState) {
+      resultState.lock_release = release;
+      if (release.released !== true) {
+        resultState.setup_complete = false;
+        resultState.companion_ready = false;
+        resultState.integration_ready = false;
+        resultState.exact_blockers = [...new Set([...resultState.exact_blockers, release.exactBlocker || "companion_lock_release_pending"])];
+        // Do not overwrite a new owner's state after a failed release. This
+        // invocation's returned receipt carries the current release boundary.
+      }
+    }
   }
 }

@@ -9,6 +9,7 @@ export function transactionTextSummary(value) {
     'completed_mutation_count', 'browser_mutation_executed', 'external_action_executed',
     'external_action_dispatched', 'potential_external_effect', 'external_effect_confirmation',
     'failed_step', 'action_progress', 'action_event', 'event_wait', 'trigger_continuation', 'exact_blocker', 'reconciliation', 'continuation', 'continuation_required',
+    'block_scope', 'affected_target', 'independent_work_allowed', 'next_action',
     'cleanup', 'lease_state', 'next_target_read', 'visual_readback', 'artifacts', 'completed_at']);
   for (const key of ['actions', 'applied_actions']) {
     if (Array.isArray(value[key])) summary[key] = value[key].map(action => fields(action,

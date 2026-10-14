@@ -71,6 +71,11 @@ for (const shutdown of ['close', 'SIGKILL']) {
         const reply = result => extension.send({ kind: 'command.result', operationId, result });
         const tab = tabs.get(params.tabId);
         if (method === 'tabs.list') return reply([...tabs.values()]);
+        if (method === 'tabs.navigationDiagnostics') return reply({ tabId: tab.id, windowId: tab.windowId,
+          url: tab.url, pendingUrl: null, readOnly: true, originalOperationUnchanged: true });
+        if (method === 'tabs.stopLoading') return reply({ tabId: tab.id, windowId: tab.windowId,
+          url: tab.url, pendingUrl: null, stopped: false, alreadySettled: true,
+          mutationDispatchAttempted: false, operationEffectState: 'none', originalOperationUnchanged: true });
         if (method === 'tabs.create') {
           const created = { id: 11001, windowId: 1, active: false, pinned: false, groupId: null,
             url: params.url, title: 'resume fixture', first: '', second: '' };
@@ -132,6 +137,23 @@ for (const shutdown of ['close', 'SIGKILL']) {
       for (const key of ['result', 'action_progress', 'effect_state', 'exact_blocker', 'cleanup']) assert.deepEqual(summaryText[key], original[key]);
       assert.equal(summaryText.capsule.capsuleId, original.capsule.capsuleId);
       assert.equal(original.result, isUnknown ? 'unknown_effect' : 'blocked');
+      if (shutdown === 'close' && effect === 'partial') {
+        const listed = await first.client.listTools();
+        assert.ok(listed.tools.some(tool => tool.name === 'companion_navigation_diagnostics'));
+        assert.ok(listed.tools.some(tool => tool.name === 'companion_stop_loading'));
+        const freshLease = success(await first.call('companion_reserve_tab', { sessionId: session.sessionId, tabId: original.tab.id }));
+        const boundRecovery = { sessionId: session.sessionId, leaseId: freshLease.leaseId, runId: transaction.runId,
+          tabId: original.tab.id, expectedUrl: tabs.get(original.tab.id).url, expectedWindowId: 1,
+          expectedPendingUrl: null, allowedOrigins: [origin] };
+        const noOptIn = await first.call('companion_stop_loading', { ...boundRecovery, idempotencyKey: 'stop-without-optin' });
+        assert.equal(noOptIn.isError, true);
+        const diagnostic = success(await first.call('companion_navigation_diagnostics', { ...boundRecovery, idempotencyKey: 'diagnostic' }));
+        assert.equal(diagnostic.readOnly, true);
+        const stopped = success(await first.call('companion_stop_loading', { ...boundRecovery, idempotencyKey: 'already-settled', optIn: true }));
+        assert.equal(stopped.alreadySettled, true);
+        assert.deepEqual(broker.taskLedger.getTaskCapsule(original.capsule.capsuleId).effect.actionProgress, original.action_progress);
+        await first.call('companion_release_tab', { leaseId: freshLease.leaseId });
+      }
       assert.deepEqual(original.action_progress.applied_action_indices, firstUncertain ? [] : [0], JSON.stringify({ blocker: original.exact_blocker, commands: commands.map(command => command.method) }));
       assert.deepEqual(original.action_progress.remaining_action_indices, effect === 'partial' || firstUncertain ? [1] : []);
       if (firstUncertain) {
@@ -154,10 +176,15 @@ for (const shutdown of ['close', 'SIGKILL']) {
       if (firstUncertain) assert.equal(broker.taskLedger.getTaskTab(profileInstanceId, original.tab.id).retentionPolicy, 'retain_until_resume');
       const second = await openProcess();
       assert.notEqual(second.pid, first.pid);
-      const oldSession = await second.call('companion_prepare_resume', { sessionId: session.sessionId, runId: transaction.runId });
-      assert.equal(oldSession.isError, true);
-      assert.match(oldSession.content[0].text, /mcp_session_task_binding_missing/u);
-      const fresh = success(await second.call('companion_open_session', { profileInstanceId }));
+      const commandCountBeforeRecovery = commands.length;
+      const initialResume = success(await second.call('companion_prepare_resume', { sessionId: session.sessionId, runId: transaction.runId }));
+      assert.equal(initialResume.session_recovery.reason, 'mcp_session_task_binding_missing');
+      assert.equal(initialResume.session_recovery.actions_replayed, 0);
+      assert.equal(initialResume.session_recovery.fresh_lease_required, true);
+      assert.notEqual(initialResume.session_id, session.sessionId);
+      assert.equal(initialResume.session_recovery.session_id, initialResume.session_id);
+      const fresh = { sessionId: initialResume.session_id };
+      assert.equal(commands.length, commandCountBeforeRecovery, 'binding recovery and resume preparation must not dispatch browser work');
       const commandCount = commands.length;
       const nextPage = success(await second.call('companion_transaction_status', { sessionId: fresh.sessionId, runId: transaction.runId,
         audit: { limit: 1, cursor: audited.audit.nextCursor } }));
@@ -173,6 +200,11 @@ for (const shutdown of ['close', 'SIGKILL']) {
       if (isUnknown) {
         assert.equal(resumed.resume_ready, false);
         assert.ok(resumed.blockers.some(blocker => blocker.code === 'reconciliation_required'));
+        assert.equal(resumed.block_scope, 'target');
+        assert.equal(resumed.independent_work_allowed, true);
+        const blocker = resumed.blockers.find(blocker => blocker.code === 'reconciliation_required');
+        assert.equal(blocker.affected_target.tab_id, original.tab.id);
+        assert.equal(blocker.next_action, 'perform_one_owner_signed_reconciliation_readback');
         assert.equal(broker.taskLedger.getTaskCapsule(original.capsule.capsuleId).effect.effectState, 'unknown_effect');
       } else {
         assert.equal(resumed.resume_ready, true, JSON.stringify(resumed.blockers));

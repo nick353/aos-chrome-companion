@@ -127,6 +127,10 @@ export class McpTaskBindingRegistry {
     const session = text(sessionId);
     const task = text(taskId);
     if (!session || !task) throw new TypeError("sessionId and taskId are required");
+    const existing = this.#sessions.get(session);
+    if (existing && existing !== task) {
+      throw new CompanionError("mcp_session_task_mismatch", "MCP session is already bound to another Codex task", { sessionId: session });
+    }
     this.#sessions.set(session, task);
   }
 
@@ -147,6 +151,10 @@ export class McpTaskBindingRegistry {
     const lease = text(leaseId);
     this.assertSession(sessionId, taskId);
     if (!lease) throw new TypeError("leaseId is required");
+    const existing = this.#leases.get(lease);
+    if (existing && (existing.sessionId !== text(sessionId) || existing.taskId !== text(taskId))) {
+      throw new CompanionError("mcp_lease_task_mismatch", "MCP lease is already bound to another Codex task or session", { leaseId: lease });
+    }
     this.#leases.set(lease, { sessionId: text(sessionId), taskId: text(taskId) });
   }
 
@@ -154,7 +162,7 @@ export class McpTaskBindingRegistry {
     this.assertSession(sessionId, taskId);
     const lease = this.#leases.get(text(leaseId));
     if (!lease) {
-      throw new CompanionError("mcp_lease_task_binding_missing", "MCP lease is not bound to a task in this process", { leaseId: text(leaseId) });
+      throw new CompanionError("mcp_lease_task_binding_missing", "MCP lease is not bound to a task in this process; reserve the tab again with companion_reserve_tab and use the returned leaseId", { leaseId: text(leaseId) });
     }
     if (lease.sessionId !== text(sessionId) || lease.taskId !== text(taskId)) {
       throw new CompanionError("mcp_lease_task_mismatch", "MCP lease belongs to another Codex task or session", { leaseId: text(leaseId) });
@@ -165,7 +173,7 @@ export class McpTaskBindingRegistry {
   sessionForLease(leaseId) {
     const lease = this.#leases.get(text(leaseId));
     if (!lease) {
-      throw new CompanionError("mcp_lease_task_binding_missing", "MCP lease is not bound to a task in this process", { leaseId: text(leaseId) });
+      throw new CompanionError("mcp_lease_task_binding_missing", "MCP lease is not bound to a task in this process; reserve the tab again with companion_reserve_tab and use the returned leaseId", { leaseId: text(leaseId) });
     }
     return lease.sessionId;
   }

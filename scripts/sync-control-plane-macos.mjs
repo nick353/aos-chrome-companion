@@ -19,6 +19,7 @@ import { BrokerClient } from "../src/client/broker-client.mjs";
 import { connectPeer } from "../src/client/connect.mjs";
 import { OPERATION_SCHEMA_DIGEST } from "../src/shared/operation-schema.mjs";
 import { controlPlaneFiles } from "../src/shared/control-plane-files.mjs";
+import { acquireCompanionLock, controlPlaneSyncReadiness, releaseCompanionLock } from "../src/setup/auto-setup.mjs";
 import {
   automaticRefreshPlan,
   canSyncControlPlaneArtifacts,
@@ -219,7 +220,11 @@ async function readInstalledLiveStatusUntilReady(appDir, { expectedBuildId = nul
       lastError = null;
       const profiles = Array.isArray(status?.profiles) ? status.profiles : [];
       const connected = profiles.filter((profile) => profile?.connected === true);
-      if (connected.length === 1 && (!expectedBuildId || connected[0].buildId === expectedBuildId)) {
+      if (connected.length === 1 && expectedBuildId && connected[0].buildId === expectedBuildId
+        && connected[0].operationSchemaDigest === OPERATION_SCHEMA_DIGEST
+        && status?.runtimeAttestation?.operationSchemaDigest === OPERATION_SCHEMA_DIGEST
+        && Array.isArray(connected[0].buildProvenanceMismatches) && connected[0].buildProvenanceMismatches.length === 0
+        && connected[0].generation != null) {
         return { ready: true, status, lastError: null };
       }
     } catch (error) {
@@ -413,7 +418,29 @@ async function updateAutoSetupWrapper({ supportDir, appDir, sourceRoot }) {
   await mkdir(binDir, { recursive: true, mode: 0o700 });
   const wrapper = [
     "#!/bin/sh",
-    `AOS_CHROME_COMPANION_SETUP_TRIGGER=launch_agent AOS_CHROME_COMPANION_SOURCE_ROOT=${JSON.stringify(sourceRoot)} AOS_CHROME_COMPANION_INSTALL_ROOT=${JSON.stringify(appDir)} exec ${JSON.stringify(process.execPath)} ${JSON.stringify(join(appDir, "scripts", "auto-setup-macos.mjs"))}`,
+    `AOS_CHROME_COMPANION_MANAGED_CHILD=1 AOS_CHROME_COMPANION_MANAGED_CHILD_PROVENANCE=companion_autosetup_wrapper AOS_CHROME_COMPANION_SETUP_TRIGGER=launch_agent AOS_CHROME_COMPANION_SOURCE_ROOT=${JSON.stringify(sourceRoot)} AOS_CHROME_COMPANION_INSTALL_ROOT=${JSON.stringify(appDir)} exec ${JSON.stringify(process.execPath)} ${JSON.stringify(join(appDir, "scripts", "auto-setup-macos.mjs"))}`,
+    "",
+  ].join("\n");
+  const current = await readFile(wrapperPath, "utf8").catch(() => null);
+  if (current === wrapper) return { path: wrapperPath, changed: false };
+  const temporary = `${wrapperPath}.${process.pid}.tmp`;
+  await assertNoSymlinkComponents(temporary);
+  await writeFile(temporary, wrapper, { mode: 0o700 });
+  await chmod(temporary, 0o700);
+  await rename(temporary, wrapperPath);
+  return { path: wrapperPath, changed: true };
+}
+
+async function updateNativeHostWrapper({ supportDir, appDir, extensionId }) {
+  const binDir = join(supportDir, "bin");
+  const wrapperPath = join(binDir, "aos-chrome-companion-host");
+  await assertNoSymlinkComponents(binDir);
+  await assertNoSymlinkComponents(wrapperPath);
+  await mkdir(binDir, { recursive: true, mode: 0o700 });
+  const extensionOrigin = `chrome-extension://${extensionId}/`;
+  const wrapper = [
+    "#!/bin/sh",
+    `AOS_CHROME_COMPANION_MANAGED_CHILD=1 AOS_CHROME_COMPANION_MANAGED_CHILD_PROVENANCE=companion_native_host_wrapper AOS_CHROME_COMPANION_EXTENSION_ORIGIN=${JSON.stringify(extensionOrigin)} exec ${JSON.stringify(process.execPath)} ${JSON.stringify(join(appDir, "src", "native-host", "main.mjs"))} "$@"`,
     "",
   ].join("\n");
   const current = await readFile(wrapperPath, "utf8").catch(() => null);
@@ -455,14 +482,42 @@ try {
 }
 await assertNoSymlinkComponents(supportDir);
 await mkdir(supportDir, { recursive: true, mode: 0o700 });
-let lockHandle;
-try {
-  lockHandle = await open(lockPath, "wx", 0o600);
-  await lockHandle.writeFile(`${process.pid}\n`);
-  await lockHandle.close();
-} catch (error) {
-  if (error?.code === "EEXIST") throw new Error("control_plane_sync_in_progress");
-  throw error;
+const lockLease = await acquireCompanionLock(lockPath, {
+  legacyRolloutConfirmed: process.env.AOS_CHROME_COMPANION_LEGACY_LOCK_ROLLOUT_CONFIRMED === "1",
+});
+if (!lockLease.acquired) {
+  process.stdout.write(`${JSON.stringify({ schema: CONTROL_PLANE_SCHEMA, result: "deferred", runtimeLoaded: false,
+    exactBlockers: [lockLease.exactBlocker === "companion_lock_owner_live_or_unverifiable" || lockLease.exactBlocker === "companion_lock_coordinator_busy"
+      ? "control_plane_sync_in_progress" : "control_plane_sync_lock_reconciliation_required", lockLease.exactBlocker].filter(Boolean),
+    priorReceiptEvidence: { current: false, receipt: previousReceipt }, externalActionExecuted: false, noReplay: true }, null, 2)}\n`);
+  process.exit(3);
+}
+
+// A timeout supervisor terminates this process with SIGTERM.  Without an
+// explicit signal boundary, the finally block below is skipped and the next
+// automatic tick sees a permanent-looking lock.  Remove only a lock whose
+// token matches this invocation under the shared guard.
+let lockReleased = false;
+let lockReleaseAttempted = false;
+let lockReleaseResult = null;
+async function releaseOwnedLock() {
+  if (lockReleased || lockReleaseAttempted) return;
+  lockReleaseAttempted = true;
+  try {
+    const release = await releaseCompanionLock(lockLease);
+    lockReleaseResult = release;
+    lockReleased = release.released === true;
+  } catch (error) {
+    lockReleaseResult = { released: false, exactBlocker: `companion_lock_release_failed:${errorText(error)}`, retainedLease: lockLease };
+    // The normal finally path remains best effort.  A lock with an unknown
+    // owner is intentionally preserved for explicit operator resolution.
+  }
+}
+for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
+  process.once(signal, async () => {
+    await releaseOwnedLock();
+    process.exit(128 + (signal === "SIGTERM" ? 15 : signal === "SIGINT" ? 2 : 1));
+  });
 }
 
 const receipt = {
@@ -482,12 +537,14 @@ const receipt = {
   installedHashesAfter: {},
   changed: false,
   autoSetupWrapper: null,
+  nativeHostWrapper: null,
   brokerProcess: null,
   result: "blocked",
   exactBlockers: [],
 };
 let exitCode = 0;
 try {
+  syncTransaction: {
   // Read through the installed runtime and allow it to start exactly one
   // broker when the previous process disappeared during an app swap.  Using
   // the source-tree connector here could launch a second broker from a
@@ -535,14 +592,29 @@ try {
     previousResult: previousReceipt?.result ?? null,
   });
   receipt.suppressRedundantOfflineRestart = suppressRedundantOfflineRestart;
+  const priorReadiness = controlPlaneSyncReadiness(previousReceipt, { liveStatus: status, expectedBuildId: INSTALL_BUILD_ID,
+    artifactsMatch: !receipt.changed });
+  if (priorReadiness.staleRefreshReconciled) {
+    receipt.result = "already_current";
+    receipt.runtimeLoaded = true;
+    receipt.staleRefreshReconciled = true;
+    receipt.extensionRefresh = { result: "reflected", postRestartReadback: { ready: true, provenanceVerified: true,
+      generation: status.profiles.find(profile => profile.connected === true)?.generation,
+      operationSchemaDigest: status.runtimeAttestation?.operationSchemaDigest } };
+    receipt.statusAfter = { connectedProfileCount: 1 };
+    receipt.exactBlockers = [];
+    // Fresh matching proof resolves this dated marker without another reload
+    // or broker restart. The common finally writes the new receipt and releases.
+    break syncTransaction;
+  }
   if (suppressRedundantOfflineRestart) {
     // The previous tick already converged the local files and left one
     // explicit pending-refresh boundary.  Keep that state visible without
     // restarting the resident broker on every LaunchAgent tick.
     receipt.result = "applied_pending_refresh";
-    receipt.exactBlockers = Array.isArray(previousReceipt?.exactBlockers)
-      && previousReceipt.exactBlockers.length > 0
-      ? previousReceipt.exactBlockers
+    receipt.extensionRefresh = previousReceipt?.extensionRefresh ?? null;
+    receipt.exactBlockers = controlPlaneSyncReadiness(previousReceipt).exactBlockers.length > 0
+      ? controlPlaneSyncReadiness(previousReceipt).exactBlockers
       : ["companion_profile_not_connected_after_broker_restart"];
   }
   // An explicit restart request is meaningful even when the source and
@@ -561,6 +633,7 @@ try {
     for (const relative of criticalFiles) receipt.installedHashesAfter[relative] = await exists(join(appDir, relative)) ? await sha256(join(appDir, relative)) : null;
     const hashMismatch = criticalFiles.find((relative) => receipt.sourceHashes[relative] !== receipt.installedHashesAfter[relative]);
     if (hashMismatch) throw new Error(`control_plane_hash_mismatch:${hashMismatch}`);
+    receipt.artifactsStaged = true;
     for (const relative of criticalFiles) {
       if (!/\.(?:mjs|js)$/u.test(relative) || receipt.installedHashesAfter[relative] === null) continue;
       const check = execFileSync(process.execPath, ["--check", join(appDir, relative)], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
@@ -573,6 +646,7 @@ try {
     // Without this small local config convergence, the next tick would run an
     // installed auto-setup copy that cannot see future source drift.
     receipt.autoSetupWrapper = await updateAutoSetupWrapper({ supportDir, appDir, sourceRoot });
+    receipt.nativeHostWrapper = await updateNativeHostWrapper({ supportDir, appDir, extensionId: args.extensionId });
   }
 
   if (args.restartBroker && exitCode === 0 && !suppressRedundantOfflineRestart) {
@@ -618,7 +692,7 @@ try {
       receipt.restartBoundary = maintenanceBoundary(restartStatus);
       if (!receipt.restartBoundary.artifactSyncAllowed || !canRestartResidentBroker(restartStatus, installedRuntime)) {
         receipt.result = "applied_pending_refresh";
-        receipt.exactBlockers = receipt.restartBoundary.blockers;
+        receipt.exactBlockers = [...new Set([...controlPlaneSyncReadiness(receipt).exactBlockers, ...receipt.restartBoundary.blockers])];
         exitCode = 3;
       }
     }
@@ -640,15 +714,12 @@ try {
     // broker and the bounded poll waits for the Extension hello.  We never
     // dispatch a second reload when this readback remains disconnected.
     const ready = await readInstalledLiveStatusUntilReady(appDir, {
-      expectedBuildId: receipt.extensionRefresh?.verification?.buildIdAfter
-        ?? receipt.extensionRefresh?.freshStatus?.profiles?.[0]?.buildId
-        ?? status.profiles?.[0]?.buildId
-        ?? null,
+      expectedBuildId: installedRuntime.buildId,
       timeoutMs: 30_000,
     });
     const after = ready.status;
     if (!ready.ready) {
-      receipt.exactBlockers = ["companion_profile_not_connected_after_broker_restart"];
+      receipt.exactBlockers = [...new Set([...controlPlaneSyncReadiness(receipt).exactBlockers, "companion_profile_not_connected_after_broker_restart"])];
       // A broker restart with no live profile work is still a valid local
       // convergence step.  Do not report it as a failed swap; preserve the
       // pending profile-reflection boundary for the next tick.
@@ -689,10 +760,17 @@ try {
         profileGeneration: after.profiles?.[0]?.generation ?? null,
         connectedProfileCount: Array.isArray(after.profiles) ? after.profiles.filter((profile) => profile.connected === true).length : 0,
       };
-      receipt.result = receipt.changed ? "applied" : "restarted";
-      receipt.exactBlockers = [];
-      receipt.extensionRefresh = { ...(receipt.extensionRefresh ?? {}), postRestartReadback: { ready: true, operationSchemaDigest: after.runtimeAttestation?.operationSchemaDigest, generation: after.profiles?.[0]?.generation } };
+      // A connected old generation is not proof that a deferred signed reload
+      // reflected this update. Preserve that exact boundary until a permitted
+      // refresh plus fresh provenance readback completes.
+      const refreshDeferred = receipt.extensionRefresh?.result === "deferred";
+      receipt.result = refreshDeferred ? "applied_pending_refresh" : receipt.changed ? "applied" : "restarted";
+      receipt.exactBlockers = refreshDeferred ? controlPlaneSyncReadiness(receipt).exactBlockers : [];
+      receipt.runtimeLoaded = !refreshDeferred;
+      receipt.extensionRefresh = { ...(receipt.extensionRefresh ?? {}), postRestartReadback: { ready: true, provenanceVerified: true, operationSchemaDigest: after.runtimeAttestation?.operationSchemaDigest, generation: after.profiles?.[0]?.generation } };
+      if (refreshDeferred) exitCode = 3;
     }
+  }
   }
   }
 } catch (error) {
@@ -702,7 +780,14 @@ try {
   await rm(extensionStagingDir, { recursive: true, force: true }).catch(() => {});
   throw error;
 } finally {
-  await rm(lockPath, { force: true }).catch(() => {});
+  await releaseOwnedLock();
+  receipt.lockRelease = lockReleaseResult;
+  if (!lockReleased) {
+    receipt.result = "failed";
+    receipt.runtimeLoaded = false;
+    receipt.exactBlockers = [...new Set([...receipt.exactBlockers, lockReleaseResult?.exactBlocker || "companion_lock_release_pending"])];
+    exitCode = 3;
+  }
   await rm(stagingDir, { recursive: true, force: true }).catch(() => {});
   await rm(extensionStagingDir, { recursive: true, force: true }).catch(() => {});
   await writeReceipt(receiptPath, { ...receipt, finishedAt: new Date().toISOString() }).catch(() => {});

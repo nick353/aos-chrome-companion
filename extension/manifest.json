@@ -6,9 +6,11 @@
   "minimum_chrome_version": "120",
   "permissions": [
     "alarms",
+    "activeTab",
     "debugger",
     "nativeMessaging",
     "offscreen",
+    "tabCapture",
     "scripting",
     "storage",
     "tabs",
@@ -32,6 +34,16 @@
   "action": {
     "default_title": "AOS Chrome Companion",
     "default_popup": "popup.html"
+  },
+  "commands": {
+    "recording-start": {
+      "suggested_key": { "default": "Ctrl+Shift+9", "mac": "Command+Shift+9" },
+      "description": "Start audio-enabled tab recording"
+    },
+    "recording-stop": {
+      "suggested_key": { "default": "Ctrl+Shift+0", "mac": "Command+Shift+0" },
+      "description": "Stop audio-enabled tab recording"
+    }
   },
   "side_panel": {
     "default_path": "sidepanel.html"

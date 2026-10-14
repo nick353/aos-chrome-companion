@@ -41,13 +41,19 @@ export const SESSION_TTL_MS = 30 * 60_000;
 // the Extension enough time to observe navigation and grouping completion.
 export const DEFAULT_OPERATION_TIMEOUTS_MS = Object.freeze({
   "extension.reload": 30_000,
-  "tabs.create": 30_000,
+  // Creating a task tab includes Chrome tab creation, navigation commit,
+  // origin verification, and task-group assignment.  A 30s envelope was
+  // short enough to turn a slow but valid navigation into an ambiguous
+  // result.  Keep it bounded by the protocol maximum while leaving the
+  // ledger's no-replay rule authoritative if the deadline is still missed.
+  "tabs.create": 60_000,
   "tabs.close": 20_000,
   "tabs.activate": 20_000,
   "tabs.navigate": 30_000,
   "tabs.groupTask": 20_000,
   "page.snapshot": 30_000,
   "page.screenshot": 30_000,
+  "page.configureViewport": 30_000,
   "visual.inspectTarget": 30_000,
   // UI mutations include the visible Companion cursor/readback path and can
   // wait on Chrome's renderer under load. Keep them bounded, but do not

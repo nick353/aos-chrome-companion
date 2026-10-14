@@ -3,3 +3,6 @@
 // The local installer replaces this file in its staging tree with one unique
 // install-specific value in both the Node and Extension trees.
 export const INSTALL_BUILD_ID = "dev-local";
+export const BUNDLE_TREE_SHA256 = null;
+export const EXTENSION_TREE_SHA256 = null;
+export const NATIVE_RECORDER_SHA256 = null;

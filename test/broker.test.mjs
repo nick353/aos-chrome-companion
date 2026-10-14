@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { copyFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import * as z from "zod/v4";
 import { transactionActionSchema } from "../src/mcp/action-schema.mjs";
-import { CompanionBroker, deriveActiveReconciliationCounts, isAllowedTaskFrameOrigin, isSafePreEffectTaskTab, shouldRequestBrokerRestartForBuildMismatch } from "../src/broker/broker.mjs";
+import { CompanionBroker, deriveActiveReconciliationCounts, isAllowedTaskFrameOrigin, isSafePreEffectTaskTab, shouldRequestBrokerRestartForBuildMismatch, transactionFailureNoEffectEvidence } from "../src/broker/broker.mjs";
 import { BrokerClient } from "../src/client/broker-client.mjs";
+import { mergeSemanticSnapshotResults } from "../extension/semantic-snapshot.js";
 import { connectPeer } from "../src/client/connect.mjs";
 import { DEFAULT_CAPABILITIES, PROTOCOL_VERSION } from "../src/shared/constants.mjs";
 import { INSTALL_BUILD_ID } from "../src/shared/build-info.mjs";
@@ -16,9 +18,11 @@ import {
   createAuthorityEnvelope,
   deriveTaskTargetKey,
   normalizeTaskExecutionCapsule,
+  payloadDigest,
   taskTabIdentityConsistent,
   targetIdentityDigest,
   transitionTaskExecutionCapsule,
+  unresolvedLocalNavigationForTarget,
 } from "../src/shared/task-runtime.mjs";
 
 function onceMessage(peer, predicate) {
@@ -31,6 +35,60 @@ function onceMessage(peer, predicate) {
     });
   });
 }
+
+test("failure effect evidence accepts aliases only with current broker-owned proof", () => {
+  const operationKey = "current-action";
+  const zero = { idempotencyKey: operationKey, state: "blocked", binding: { method: "page.type" },
+    dispatchCount: 0, dispatchState: "not_dispatched", effectState: "no_dispatch",
+    mutationDispatchAttempted: false, externalActionExecuted: false };
+  for (const field of ["operationEffectState", "effectState", "operation_effect_state", "effect_state"]) {
+    for (const alias of ["none", "no_effect", "known_no_effect"]) {
+      const error = { code: "validation_failed", details: { [field]: alias, mutationDispatchAttempted: false } };
+      assert.deepEqual(transactionFailureNoEffectEvidence(error, { operation: zero, operationKey }), { knownNoEffect: true, contradictory: false, unprovenNoEffect: false });
+      const attested = { ...zero, dispatchCount: 1, dispatchState: "dispatched", effectState: "known_no_effect", brokerEvidence: true };
+      assert.equal(transactionFailureNoEffectEvidence(error, { operation: attested, operationKey }).knownNoEffect, true);
+      assert.equal(transactionFailureNoEffectEvidence(error, { preDispatch: true }).knownNoEffect, true);
+      assert.equal(transactionFailureNoEffectEvidence(error, { operation: zero, operationKey: "different-action" }).unprovenNoEffect, true);
+      assert.equal(transactionFailureNoEffectEvidence(error).unprovenNoEffect, true);
+      assert.equal(transactionFailureNoEffectEvidence({ ...error, details: { ...error.details, dispatchCount: 0 } }).knownNoEffect, false);
+    }
+  }
+  assert.deepEqual(transactionFailureNoEffectEvidence({ details: { operationEffectState: "no_dispatch" } }, { operation: zero, operationKey }), { knownNoEffect: false, contradictory: false, unprovenNoEffect: false });
+});
+
+test("failure no-effect proof rejects contradictory and unresolved mutation evidence", () => {
+  const operationKey = "current-action";
+  const operation = { idempotencyKey: operationKey, state: "blocked", binding: { method: "page.type" },
+    dispatchCount: 1, dispatchState: "dispatched", effectState: "known_no_effect", brokerEvidence: true, mutationDispatchAttempted: false };
+  const error = { code: "validation_failed", details: { operationEffectState: "no_effect", mutationDispatchAttempted: false } };
+  for (const changed of [
+    { mutationDispatchAttempted: true }, { externalActionExecuted: true }, { state: "unknown_effect" },
+    { state: "applied", effectState: "known_effect" }, { effectState: "unknown_effect" },
+    { effect_state: "known_effect" }, { operationEffectState: "unknown" },
+  ]) {
+    const evidence = transactionFailureNoEffectEvidence(error, { operation: { ...operation, ...changed }, operationKey });
+    assert.equal(evidence.knownNoEffect, false);
+    assert.equal(evidence.contradictory, true);
+  }
+  for (const changed of [
+    { code: "operation_effect_unknown" }, { code: "action_event_pending" },
+    { details: { ...error.details, mutationDispatchAttempted: true } },
+    { details: { ...error.details, createdTabId: 10 } },
+    { details: { ...error.details, effectState: "known_effect" } },
+    { details: { ...error.details, externalActionExecuted: true } },
+  ]) {
+    const evidence = transactionFailureNoEffectEvidence({ ...error, ...changed }, { operation, operationKey, preDispatch: true });
+    assert.equal(evidence.knownNoEffect, false);
+    assert.equal(evidence.contradictory, true);
+  }
+  assert.equal(transactionFailureNoEffectEvidence(error, { operation: { ...operation, brokerEvidence: false }, operationKey }).unprovenNoEffect, true);
+  assert.equal(transactionFailureNoEffectEvidence(error, { operation: { ...operation, effectState: "no_dispatch", brokerEvidence: false }, operationKey }).unprovenNoEffect, true);
+  const zero = { ...operation, dispatchCount: 0, dispatchState: "not_dispatched", effectState: "no_dispatch", externalActionExecuted: false };
+  assert.equal(transactionFailureNoEffectEvidence({ ...error, details: { ...error.details, createdTabId: 10 } }, { operation: zero, operationKey }).contradictory, true);
+  assert.deepEqual(transactionFailureNoEffectEvidence({ code: "action_event_timeout", details: { operationEffectState: "known_effect", mutationDispatchAttempted: true } }, {
+    operation: { ...operation, state: "applied", effectState: "known_effect", mutationDispatchAttempted: true }, operationKey,
+  }), { knownNoEffect: false, contradictory: false, unprovenNoEffect: false });
+});
 
 test("task frame origin checks require an allowlisted live frame URL", () => {
   assert.equal(isAllowedTaskFrameOrigin({ frameId: 2, url: "https://example.test/embed" }, ["https://example.test"]), true);
@@ -108,6 +166,91 @@ test("ownerless reconciliation evidence does not count as live profile work", ()
   assert.equal(result.activeTabCount, 0);
   assert.equal(result.activeCapsuleCount, 0);
   assert.equal(result.activeOperationCount, 0);
+});
+
+test("profile-global recording transactions verify the caller payload without opening a task tab", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "aos-rec-tx-"));
+  const issuerSecret = "recording-transaction-issuer-secret";
+  const env = {
+    ...process.env,
+    AOS_CHROME_COMPANION_DATA_DIR: dataDir,
+    AOS_CHROME_COMPANION_SOCKET: join(dataDir, "broker.sock"),
+    AOS_CHROME_COMPANION_SECRET_FILE: join(dataDir, "secret"),
+    AOS_CHROME_COMPANION_CODEX_MCP_ISSUER_SECRET_FILE: join(dataDir, "codex-issuer"),
+  };
+  await writeFile(env.AOS_CHROME_COMPANION_CODEX_MCP_ISSUER_SECRET_FILE, `${issuerSecret}\n`, { mode: 0o600 });
+  const secret = await ensureBrokerSecret(env);
+  const broker = new CompanionBroker({
+    socketPath: env.AOS_CHROME_COMPANION_SOCKET,
+    secret,
+    issuerSecrets: { codex_mcp: issuerSecret },
+  });
+  await broker.listen();
+  const extension = await connectPeer({ role: "extension-relay", autoStart: false, env });
+  const helloAck = onceMessage(extension, (message) => message.kind === "extension.hello_ack");
+  extension.send({
+    kind: "extension.hello",
+    protocolVersion: PROTOCOL_VERSION,
+    profileInstanceId: "profile_recording_transaction",
+    extensionRuntimeId: "runtime_recording_transaction",
+    buildId: INSTALL_BUILD_ID,
+    capabilities: DEFAULT_CAPABILITIES,
+  });
+  await helloAck;
+  const commands = [];
+  extension.onMessage((message) => {
+    if (message.kind !== "command.request") return;
+    commands.push(message);
+    extension.send({
+      kind: "command.result",
+      operationId: message.operationId,
+      result: { ok: true, method: message.method, filename: message.params?.filename ?? null },
+    });
+  });
+  const client = await BrokerClient.connect({ autoStart: false, env, issuer: "codex_mcp" });
+  const session = await client.request("session.open", { taskId: "task-recording-transaction" });
+  const recordingOrigin = "https://recording.test";
+  try {
+    const start = await client.requestAuthorizedTransaction({
+      sessionId: session.sessionId,
+      runId: "run-recording-start",
+      taskId: "task-recording-transaction",
+      idempotencyKey: "idem-recording-start",
+      startUrl: "about:blank",
+      allowedOrigins: [recordingOrigin],
+      targetOrigin: recordingOrigin,
+      actions: [{ method: "recording.startAuto", params: { filename: "recording-test.mov" } }],
+      keepTaskTab: false,
+    });
+    assert.equal(start.result, "verified");
+    assert.equal(start.tab, null);
+    assert.equal(start.actions.length, 1);
+    assert.equal(commands.some((command) => command.method === "tabs.create"), false);
+    assert.deepEqual(commands.map((command) => command.method), ["recording.startAuto"]);
+
+    const stop = await client.requestAuthorizedTransaction({
+      sessionId: session.sessionId,
+      runId: "run-recording-stop",
+      taskId: "task-recording-transaction",
+      idempotencyKey: "idem-recording-stop",
+      startUrl: "about:blank",
+      allowedOrigins: [recordingOrigin],
+      targetOrigin: recordingOrigin,
+      actions: [{ method: "recording.stopAuto", params: {} }],
+      reuseTaskTab: false,
+      keepTaskTab: false,
+    });
+    assert.equal(stop.result, "verified");
+    assert.equal(stop.tab, null);
+    assert.deepEqual(commands.map((command) => command.method), ["recording.startAuto", "recording.stopAuto"]);
+    assert.equal((await client.request("status.get")).taskTabCount, 0);
+  } finally {
+    await client.request("session.close", { sessionId: session.sessionId }).catch(() => {});
+    await client.close();
+    extension.close();
+    await broker.close();
+    await rm(dataDir, { recursive: true, force: true });
+  }
 });
 
 test("signed extension reload dispatches a profile-global command and returns a fresh-generation boundary", async () => {
@@ -1006,12 +1149,25 @@ async function createCapsuleHarness({ failVisualInspectionFor = null, failPostTy
         else extension.send({kind:"command.result",operationId:message.operationId,result:{written:true,binary:true,writeAcknowledged:true,pasteVerified:false,contentReturned:false,formats:message.params.formats.map(format=>({mimeType:format.mimeType,inputBytes:Buffer.from(format.dataBase64,"base64").length}))}});
       } else if (message.method === "page.query") {
         const tab = liveTabs.get(tabId);
-        const text = tab?.text ?? "ready";
-        const matched = message.params?.locator?.testId === "upload-ready"
-          ? uploadBehavior === "already-present" || tab?.attachmentReady === true
+        const text = uploadBehavior === "already-present" && message.params?.locator?.testId === "upload-ready" ? "test.txt received" : tab?.text ?? "ready";
+        const filename = message.params?.locator?.exact === true && message.params?.locator?.anyOf ? message.params.locator.text : null;
+        const matched = filename
+          ? tab?.attachmentReady === true && tab?.filenameHidden !== true && text.split(/\s+/u).includes(filename)
+          : message.params?.locator?.testId === "upload-ready"
+          ? (uploadBehavior === "already-present" || tab?.attachmentReady === true) && (message.params.locator.allOf ?? []).every(filter => !filter.hasText || text.includes(filter.hasText))
           : text.toLocaleLowerCase().includes(String(message.params?.query ?? "").toLocaleLowerCase());
+        if (message.params?.locator?.testId === "upload-list-item") {
+          const total = tab?.uploadListCount ?? 0;
+          const listed = Array.from({ length: Math.min(total, message.params?.limit ?? 10) }, (_, index) => ({ tag: "img", role: "img", name: `upload ${index}`, text: "", visible: true, nodeIdentity: `upload:${index}`, rect: { x: 0, y: 0, width: 50, height: 50 } }));
+          extension.send({ kind: "command.result", operationId: message.operationId, result: { matches: listed, count: listed.length,
+            totalCount: total, totalCountExact: true, truncated: listed.length < total, scanLimitReached: false, limit: message.params?.limit ?? 10,
+            url: tab?.url ?? "https://example.test/", pageInstanceId: `document-${tabId}-${tab?.url}` } });
+          return;
+        }
         const matches = matched
-          ? [{ tag: "h2", role: "heading", name: text, text, rect: { x: 20, y: 20, width: 320, height: 40 } }]
+          ? [{ tag: "h2", role: "heading", name: filename ?? text, text: filename ?? text, visible: true,
+            nodeIdentity: tab?.sharedAttachmentWitness ? "shared-parent" : `row:${message.params?.locator?.allOf?.find(filter => filter.hasText)?.hasText ?? "query"}`,
+            rect: { x: 20, y: 20, width: 320, height: 40 } }]
           : [];
         extension.send({
           kind: "command.result",
@@ -1020,6 +1176,7 @@ async function createCapsuleHarness({ failVisualInspectionFor = null, failPostTy
             query: message.params?.query,
             matches,
             count: matches.length,
+            totalCount: matches.length, totalCountExact: true, truncated: false, scanLimitReached: false,
             limit: message.params?.limit ?? 10,
             url: tab?.url ?? "https://example.test/",
             pageInstanceId: `document-${tabId}-${tab?.url}`,
@@ -1082,10 +1239,21 @@ async function createCapsuleHarness({ failVisualInspectionFor = null, failPostTy
       } else if (message.method === "page.upload" || message.method === "page.uploadMultiple") {
         if (uploadBehavior) {
           const tab = liveTabs.get(tabId);
-          liveTabs.set(tabId, { ...tab, attachmentReady: uploadBehavior === "accepted", text: uploadBehavior === "accepted" ? "test.txt received" : tab.text });
+          const expectedFiles = (message.params.files ?? [message.params.file]).map(file => ({ name: file.name, size: file.size, type: file.mimeType }));
+          if (uploadBehavior === "accepted-renamed") {
+            // The site stores the file under a generated name: only the list grows.
+            liveTabs.set(tabId, { ...tab, uploadListCount: (tab.uploadListCount ?? 0) + expectedFiles.length, text: "stored as AaEX9 renamed" });
+            extension.send({ kind: "command.result", operationId: message.operationId, result: {
+              uploaded: false, fileInputAssignmentVerified: true, uploadReadbackVerified: false, requiresSiteConfirmation: true,
+              expectedFiles, readback: { inputFileCount: 0, state: "cleared" } } });
+            return;
+          }
+          liveTabs.set(tabId, { ...tab, attachmentReady: uploadBehavior === "accepted" || uploadBehavior === "accepted-preview",
+            text: uploadBehavior === "accepted" ? expectedFiles.map(file => file.name).join(" ") + " received"
+              : uploadBehavior === "accepted-preview" ? "image preview ready" : tab.text });
           extension.send({ kind: "command.result", operationId: message.operationId, result: {
             uploaded: false, fileInputAssignmentVerified: true, uploadReadbackVerified: false, requiresSiteConfirmation: true,
-            expectedFiles: [{ name: "test.txt", size: 7, type: "text/plain" }], readback: { inputFileCount: 0, state: "cleared" },
+            expectedFiles, readback: { inputFileCount: 0, state: "cleared" },
           } });
         } else {
           extension.send({ kind: "command.error", operationId: message.operationId,
@@ -1161,6 +1329,426 @@ async function createCapsuleHarness({ failVisualInspectionFor = null, failPostTy
       await rm(dataDir, { recursive: true, force: true });
     },
   };
+}
+
+async function cleanupReceiptFixture() {
+  const harness = await createCapsuleHarness({ interceptCommand: ({ message, tab, extension }) => {
+    if (!["tabs.stopLoading", "tabs.navigationDiagnostics"].includes(message.method)) return false;
+    if (tab.windowId !== message.params.expectedWindowId || tab.url !== message.params.expectedUrl
+      || (tab.pendingUrl ?? null) !== message.params.expectedPendingUrl) {
+      extension.send({ kind: "command.error", operationId: message.operationId,
+        error: { code: "navigation_recovery_target_changed", message: "Exact tuple changed", details: { mutationDispatchAttempted: false } } });
+    } else {
+      if (message.method === "tabs.stopLoading") tab.pendingUrl = null;
+      extension.send({ kind: "command.result", operationId: message.operationId,
+        result: { tabId: tab.id, windowId: tab.windowId, url: tab.url, pendingUrl: tab.pendingUrl ?? null,
+          stopped: message.method === "tabs.stopLoading", mutationDispatchAttempted: message.method === "tabs.stopLoading" } });
+    }
+    return true;
+  } });
+  const { client, session, liveTabs } = harness;
+  const runId = "cleanup-receipt-run";
+  const setup = await client.requestAuthorizedTransaction({ sessionId: session.sessionId, taskId: session.taskId,
+    runId, idempotencyKey: "cleanup-receipt-setup", startUrl: "https://example.test/form",
+    allowedOrigins: ["https://example.test"], keepTaskTab: true,
+    actions: [{ method: "page.query", params: { locator: { css: "body" } } }] });
+  const tab = liveTabs.get(setup.tab.id);
+  tab.windowId = 1; tab.pendingUrl = "https://example.test/pending";
+  const lease = await client.request("lease.acquire", { sessionId: session.sessionId, tabId: tab.id });
+  const base = { sessionId: session.sessionId, taskId: session.taskId, leaseId: lease.leaseId, runId,
+    tabId: tab.id, expectedWindowId: 1, expectedUrl: tab.url, expectedPendingUrl: tab.pendingUrl,
+    allowedOrigins: ["https://example.test"] };
+  return { ...harness, tab, base, get extensionPeer() { return harness.extensionPeer; } };
+}
+
+async function waitCleanup(ledger, key, status) {
+  const deadline = Date.now() + 2000;
+  while (ledger.get(key)?.cleanupReceipt?.status !== status && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 5));
+  assert.equal(ledger.get(key)?.cleanupReceipt?.status, status);
+}
+
+test("navigation cleanup receipt accepts late authenticated metadata only and rejects foreign/stale/conflicting events", async () => {
+  const harness = await cleanupReceiptFixture();
+  const { client, broker, base, extensionPeer } = harness;
+  let unregistered;
+  try {
+    const key = "cleanup-original-stop";
+    await client.requestNavigationRecovery({ ...base, method: "tabs.stopLoading", optIn: true, idempotencyKey: key });
+    const original = structuredClone(broker.taskLedger.get(key));
+    assert.equal(original.cleanupReceipt.status, "pending");
+    assert.equal(broker.pendingOperations.has(original.operationId), false);
+    broker.timedOutOperations.delete(original.operationId);
+    const event = { kind: "extension.event", event: "debugger.cleanup", operationId: original.operationId,
+      ...Object.fromEntries(["taskId", "sessionId", "profileInstanceId", "generation", "tabId"].map(field => [field, original.binding[field]])),
+      status: "reconciliation_required", reason: "release_timeout" };
+    for (const field of ["taskId", "sessionId", "profileInstanceId", "generation", "tabId", "operationId"]) {
+      const error = onceMessage(extensionPeer, message => message.kind === "peer.error");
+      extensionPeer.send({ ...event, [field]: `foreign-${field}` });
+      assert.equal((await error).error.code, "debugger_cleanup_binding_mismatch");
+      assert.deepEqual(broker.taskLedger.get(key), original);
+    }
+    unregistered = await connectPeer({ role: "extension-relay", autoStart: false, env: harness.env });
+    const foreign = onceMessage(unregistered, message => message.kind === "peer.error");
+    unregistered.send(event);
+    assert.equal((await foreign).error.code, "debugger_cleanup_binding_mismatch");
+    extensionPeer.send(event);
+    await waitCleanup(broker.taskLedger, key, "reconciliation_required");
+    const terminal = structuredClone(broker.taskLedger.get(key));
+    const stripMetadata = entry => { const { cleanupReceipt, updatedAt, ...rest } = entry; return rest; };
+    assert.deepEqual(stripMetadata(terminal), stripMetadata(original));
+    extensionPeer.send(event);
+    // Serialize with the ledger queue after the event is observed.
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.deepEqual(broker.taskLedger.get(key), terminal);
+    const conflict = onceMessage(extensionPeer, message => message.kind === "peer.error");
+    extensionPeer.send({ ...event, status: "detached", reason: "detached" });
+    assert.equal((await conflict).error.code, "debugger_cleanup_terminal_conflict");
+    assert.deepEqual(broker.taskLedger.get(key), terminal);
+    const oldPeer = extensionPeer;
+    await harness.attachExtension();
+    const stale = onceMessage(harness.extensionPeer, message => message.kind === "peer.error");
+    harness.extensionPeer.send(event);
+    assert.equal((await stale).error.code, "debugger_cleanup_binding_mismatch");
+    oldPeer.close();
+    assert.deepEqual(broker.taskLedger.get(key), terminal);
+  } finally { unregistered?.close(); await harness.close(); }
+});
+
+test("navigation cleanup pending persistence failure prevents stop dispatch", async t => {
+  const harness = await cleanupReceiptFixture();
+  try {
+    t.mock.method(harness.broker.taskLedger, "annotateDebuggerCleanup", async () => {
+      throw Object.assign(new Error("Synthetic durable metadata failure"), { code: "ledger_persist_failed" });
+    });
+    const before = harness.commands.filter(command => command.method === "tabs.stopLoading").length;
+    await assert.rejects(harness.client.requestNavigationRecovery({ ...harness.base, method: "tabs.stopLoading",
+      optIn: true, idempotencyKey: "cleanup-save-failed" }), { code: "internal_error" });
+    assert.equal(harness.commands.filter(command => command.method === "tabs.stopLoading").length, before);
+    assert.equal(harness.broker.taskLedger.get("cleanup-save-failed").dispatchCount, 0);
+    assert.equal(harness.broker.taskLedger.get("cleanup-save-failed").effectState, "no_dispatch");
+  } finally { await harness.close(); }
+});
+
+test("navigation cleanup signed source readback preserves old identity and denies foreign/tampered/changed targets", async () => {
+  const harness = await cleanupReceiptFixture();
+  const { broker, client, session, base, tab } = harness;
+  try {
+    await client.requestNavigationRecovery({ ...base, method: "tabs.stopLoading", optIn: true, idempotencyKey: "cleanup-source-live" });
+    const sourceBinding = { ...broker.taskLedger.get("cleanup-source-live").binding,
+      sessionId: "closed-original-session", generation: "old-original-generation",
+      targetIdentity: { ...broker.taskLedger.get("cleanup-source-live").binding.targetIdentity, windowId: 1 } };
+    async function source(key, patch = {}) {
+      const binding = { ...sourceBinding, ...patch };
+      await broker.taskLedger.prepare({ idempotencyKey: key, fingerprint: key, binding });
+      await broker.taskLedger.transition(key, "dispatched", { operationId: key });
+      await broker.taskLedger.annotateDebuggerCleanup({ operationId: key, binding, status: "pending" });
+      await broker.taskLedger.transition(key, "unknown_effect");
+    }
+    await source("cleanup-old-own");
+    const original = structuredClone(broker.taskLedger.get("cleanup-old-own"));
+    const diagBase = { ...base, expectedPendingUrl: null, method: "tabs.navigationDiagnostics" };
+    const result = await client.requestNavigationRecovery({ ...diagBase, sourceOperationId: "cleanup-old-own", idempotencyKey: "cleanup-read-own" });
+    assert.deepEqual(result.cleanupReceipt, original.cleanupReceipt);
+    assert.equal(result.cleanupReceipt.sessionId, "closed-original-session");
+    assert.equal(result.cleanupReceipt.generation, "old-original-generation");
+    assert.deepEqual(broker.taskLedger.get("cleanup-old-own"), original);
+    await source("cleanup-foreign", { taskId: "foreign" });
+    await source("cleanup-window", { targetIdentity: { ...sourceBinding.targetIdentity, windowId: 2 } });
+    await source("cleanup-origin", { targetIdentity: { ...sourceBinding.targetIdentity, origin: "https://foreign.test" } });
+    for (const id of ["absent", "cleanup-foreign", "cleanup-window", "cleanup-origin"]) {
+      await assert.rejects(client.requestNavigationRecovery({ ...diagBase, sourceOperationId: id, idempotencyKey: `cleanup-deny-${id}` }),
+        error => error.code === "navigation_cleanup_source_not_found" && !JSON.stringify(error.details ?? {}).includes(id));
+    }
+    const payload = { ...Object.fromEntries(Object.entries(diagBase).filter(([key]) => !["method", "taskId", "runId", "sessionId", "leaseId"].includes(key))), sourceOperationId: "cleanup-old-own" };
+    const authority = createAuthorityEnvelope({ secret: "capsule-integration-issuer", issuer: "codex_mcp", runId: base.runId,
+      taskId: session.taskId, ownerKey: session.sessionId, method: "tabs.navigationDiagnostics", intent: "local_navigation_recovery",
+      targetOrigin: "https://example.test", idempotencyKey: "cleanup-tampered", approved: true, payload });
+    await assert.rejects(client.request("operation.execute", { sessionId: session.sessionId, leaseId: base.leaseId,
+      method: "tabs.navigationDiagnostics", intent: "local_navigation_recovery", authority,
+      allowedOrigins: base.allowedOrigins, targetOrigin: "https://example.test",
+      params: { ...payload, sourceOperationId: "cleanup-foreign" } }), { code: "authority_payload_tampered" });
+    tab.pendingUrl = "https://example.test/new-pending";
+    await assert.rejects(client.requestNavigationRecovery({ ...diagBase, sourceOperationId: "cleanup-old-own", idempotencyKey: "cleanup-live-changed" }), { code: "navigation_recovery_target_changed" });
+    assert.deepEqual(broker.taskLedger.get("cleanup-old-own"), original);
+  } finally { await harness.close(); }
+});
+
+test("resume target scope excludes unrelated tabs, includes foreign same-tab effects and keeps ambiguity blocked", async () => {
+  const h = await createCapsuleHarness();
+  try {
+    const setup = async (key, url) => h.client.requestAuthorizedTransaction({ sessionId: h.session.sessionId, taskId: h.session.taskId,
+      runId: "scope-regression", idempotencyKey: key, startUrl: url, allowedOrigins: ["https://example.test"], keepTaskTab: true,
+      actions: [{ method: "page.query", params: { locator: { css: "body" } } }] });
+    const first = await setup("scope-first", "https://example.test/first");
+    const addUnknown = async (key, tabId, extra = {}) => {
+      await h.broker.taskLedger.prepare({ idempotencyKey: key, fingerprint: key,
+        binding: { taskId: "foreign-task", runId: "foreign-run", profileInstanceId: h.session.profileInstanceId, tabId, method: "page.click", ...extra } });
+      await h.broker.taskLedger.transition(key, "dispatched", { dispatchCount: 1, mutationDispatchAttempted: true });
+      await h.broker.taskLedger.transition(key, "unknown_effect", { effectState: "unknown_effect" });
+    };
+    await addUnknown("unrelated-foreign", 999999);
+    const prepare = capsuleId => h.client.requestPrepareResume({ sessionId: h.session.sessionId, taskId: h.session.taskId,
+      runId: "scope-regression", capsuleId });
+    let resume = await prepare(first.capsule.capsuleId);
+    assert.equal(resume.target_unresolved_external_operation_count, 0);
+    await addUnknown("same-tab-foreign", first.tab.id);
+    const originals = ["unrelated-foreign", "same-tab-foreign"].map(key => structuredClone(h.broker.taskLedger.get(key)));
+    const before = h.commands.length;
+    resume = await prepare(first.capsule.capsuleId);
+    assert.equal(resume.target_unresolved_external_operation_count, 1);
+    assert.equal(resume.unresolved_operation_count, 0, "foreign task records are not inserted into the historical task/run count");
+    assert.equal(resume.mutation_resume_allowed, false);
+    assert.equal(h.commands.length, before);
+    assert.ok(resume.blockers.some(blocker => blocker.code === "reconciliation_required"));
+    const originalTab = h.broker.taskLedger.getTaskTab(h.session.profileInstanceId, first.tab.id);
+    const secondTab = await h.broker.taskLedger.recordTaskTab({ ...originalTab, tabId: 999998,
+      targetIdentity: { ...originalTab.targetIdentity, tabId: 999998 }, targetKey: "url:https://example.test/second" });
+    h.broker.taskTabs.set(`${h.session.profileInstanceId}:999998`, secondTab);
+    const ambiguous = structuredClone(h.broker.taskLedger.getTaskCapsule(first.capsule.capsuleId));
+    ambiguous.capsuleId = "ambiguous-scope"; ambiguous.resources.tabId = null;
+    ambiguous.target.tabId = null; ambiguous.target.targetKey = null;
+    await h.broker.taskLedger.putTaskCapsule(ambiguous);
+    const blocked = await prepare(ambiguous.capsuleId);
+    assert.equal(blocked.mutation_resume_allowed, false);
+    assert.equal(blocked.target_unresolved_external_operation_count_scope, "ambiguous_task_run");
+    assert.ok(blocked.blockers.some(blocker => blocker.code === "resume_target_ambiguous"));
+    assert.deepEqual(["unrelated-foreign", "same-tab-foreign"].map(key => h.broker.taskLedger.get(key)), originals);
+  } finally { await h.close(); }
+});
+
+test("signed local navigation recovery rejects foreign/no-opt-in and preserves the original unknown", async () => {
+  const harness = await createCapsuleHarness({ interceptCommand: ({ message, tab, extension }) => {
+    if (!["tabs.navigationDiagnostics", "tabs.stopLoading"].includes(message.method)) return false;
+    const expected = message.params;
+    if (message.method === "tabs.stopLoading" && expected.expectedPendingUrl?.endsWith("/unknown")) {
+      extension.send({ kind: "command.error", operationId: message.operationId,
+        error: { code: "operation_effect_unknown", message: "Stop acknowledgement lost", details: { mutationDispatchAttempted: true, operationEffectState: "unknown" } } });
+      return true;
+    }
+    if (tab.windowId !== expected.expectedWindowId || tab.url !== expected.expectedUrl || (tab.pendingUrl ?? null) !== expected.expectedPendingUrl) {
+      extension.send({ kind: "command.error", operationId: message.operationId,
+        error: { code: "navigation_recovery_target_changed", message: "Tuple changed", details: { mutationDispatchAttempted: false, operationEffectState: "none" } } });
+    } else {
+      if (message.method === "tabs.stopLoading") tab.pendingUrl = null;
+      extension.send({ kind: "command.result", operationId: message.operationId, result: {
+        tabId: tab.id, windowId: tab.windowId, url: tab.url, pendingUrl: tab.pendingUrl ?? null,
+        stopped: message.method === "tabs.stopLoading", originalOperationUnchanged: true,
+        mutationDispatchAttempted: message.method === "tabs.stopLoading", operationEffectState: "applied" } });
+    }
+    return true;
+  } });
+  const { client, session, broker, commands, liveTabs } = harness;
+  try {
+    const runId = "local-recovery-run";
+    const original = await client.requestAuthorizedTransaction({ sessionId: session.sessionId, taskId: session.taskId,
+      runId, idempotencyKey: "local-recovery-setup", startUrl: "https://example.test/form",
+      allowedOrigins: ["https://example.test"], keepTaskTab: true,
+      actions: [{ method: "page.query", params: { locator: { css: "body" } } }] });
+    const tab = liveTabs.get(original.tab.id);
+    tab.windowId = 1; tab.pendingUrl = "https://example.test/stalled";
+    const lease = await client.request("lease.acquire", { sessionId: session.sessionId, tabId: tab.id });
+    const unknownKey = "original-unknown-reload";
+    await broker.taskLedger.prepare({ idempotencyKey: unknownKey, fingerprint: "original-fingerprint",
+      binding: { taskId: session.taskId, runId, profileInstanceId: session.profileInstanceId, tabId: tab.id, method: "tabs.reload" } });
+    await broker.taskLedger.transition(unknownKey, "dispatched", { dispatchCount: 1, mutationDispatchAttempted: true });
+    await broker.taskLedger.transition(unknownKey, "unknown_effect", { effectState: "unknown_effect" });
+    const unknownBefore = structuredClone(broker.taskLedger.get(unknownKey));
+    await broker.taskLedger.prepare({ idempotencyKey: "other-target-unknown", fingerprint: "other-target",
+      binding: { taskId: session.taskId, runId, profileInstanceId: session.profileInstanceId, tabId: 999999, method: "page.click" } });
+    await broker.taskLedger.transition("other-target-unknown", "dispatched", { dispatchCount: 1, mutationDispatchAttempted: true });
+    await broker.taskLedger.transition("other-target-unknown", "unknown_effect", { effectState: "unknown_effect" });
+    const exactResume = await client.requestPrepareResume({ sessionId: session.sessionId, taskId: session.taskId,
+      runId, capsuleId: original.capsule.capsuleId });
+    assert.equal(exactResume.unresolved_operation_count, 2, "the historical task/run total remains unchanged");
+    assert.equal(exactResume.unresolved_operation_count_scope, "task_run");
+    assert.equal(exactResume.target_unresolved_external_operation_count, 0, "external unknown operations on a different exact target must not join this local target's resume");
+    assert.equal(exactResume.target_unresolved_navigation_operation_count, 1);
+    assert.equal(exactResume.block_scope, "target");
+    assert.equal(exactResume.independent_work_allowed, true);
+    assert.equal(exactResume.readback_ready, true);
+    assert.equal(exactResume.mutation_resume_allowed, false);
+    assert.equal(exactResume.target_reservation.arguments.tabId, tab.id);
+    const independentResume = await client.requestPrepareResume({ sessionId: session.sessionId, taskId: session.taskId, runId: "independent-run" });
+    assert.equal(independentResume.resume_ready, true, "historical reconciliation from a different run must not stop unrelated work");
+    const foreignSession = await client.request("session.open", { taskId: "independent-owner", profileInstanceId: session.profileInstanceId });
+    const independentOwner = await client.requestPrepareResume({ sessionId: foreignSession.sessionId, taskId: foreignSession.taskId, runId });
+    assert.equal(independentOwner.resume_ready, true, "another task's unknown ledger must not become this task's blocker");
+    const base = { sessionId: session.sessionId, leaseId: lease.leaseId, taskId: session.taskId, runId,
+      tabId: tab.id, expectedUrl: tab.url, expectedWindowId: 1, expectedPendingUrl: tab.pendingUrl,
+      allowedOrigins: ["https://example.test"] };
+    const before = commands.length;
+    await assert.rejects(client.requestNavigationRecovery({ ...base, method: "tabs.stopLoading", idempotencyKey: "stop-no-optin" }), { code: "navigation_stop_opt_in_required" });
+    await assert.rejects(client.requestNavigationRecovery({ ...base, taskId: "foreign", method: "tabs.navigationDiagnostics", idempotencyKey: "diag-foreign" }), { code: "authority_binding_mismatch" });
+    await assert.rejects(client.requestNavigationRecovery({ ...base, runId: "foreign-run", method: "tabs.navigationDiagnostics", idempotencyKey: "diag-foreign-run" }), { code: "task_tab_ownership_required" });
+    await assert.rejects(client.requestNavigationRecovery({ ...base, expectedPendingUrl: "https://foreign.test/stalled", method: "tabs.stopLoading", optIn: true, idempotencyKey: "stop-crossorigin" }), { code: "navigation_recovery_origin_not_allowed" });
+    for (const method of ["tabs.navigationDiagnostics", "tabs.stopLoading"]) {
+      for (const patch of [{ expectedUrl: "https://user:secret@example.test/form" },
+        { expectedPendingUrl: "https://user:secret@example.test/stalled" },
+        { allowedOrigins: ["https://example.test/"] }, { allowedOrigins: ["https://example.test/path"] },
+        { allowedOrigins: ["https://user:secret@example.test"] }]) {
+        await assert.rejects(client.requestNavigationRecovery({ ...base, ...patch, method, optIn: true,
+          idempotencyKey: `invalid-origin-${method}-${Object.keys(patch)[0]}` }), { code: "navigation_recovery_origin_not_allowed" });
+      }
+    }
+    assert.equal(commands.length, before);
+    const diagnostic = await client.requestNavigationRecovery({ ...base, method: "tabs.navigationDiagnostics", idempotencyKey: "diag-exact" });
+    assert.equal(diagnostic.pendingUrl, base.expectedPendingUrl);
+    tab.pendingUrl = "https://example.test/changed";
+    await assert.rejects(client.requestNavigationRecovery({ ...base, method: "tabs.stopLoading", optIn: true, idempotencyKey: "stop-changed" }), { code: "navigation_recovery_target_changed" });
+    assert.equal(tab.pendingUrl, "https://example.test/changed");
+    const stopped = await client.requestNavigationRecovery({ ...base, expectedPendingUrl: tab.pendingUrl,
+      method: "tabs.stopLoading", optIn: true, idempotencyKey: "stop-exact" });
+    assert.equal(stopped.stopped, true);
+    assert.equal(stopped.pendingUrl, null);
+    const afterStop = await client.requestPrepareResume({ sessionId: session.sessionId, taskId: session.taskId,
+      runId, capsuleId: original.capsule.capsuleId });
+    assert.equal(afterStop.readback_ready, true);
+    assert.equal(afterStop.mutation_resume_allowed, false, "diagnostics and a successful stop do not settle the original unknown");
+    assert.equal(broker.taskLedger.get("stop-exact").effectClass, "local_ui");
+    assert.equal(broker.taskLedger.get("stop-exact").reconciliationRequired, false);
+    assert.deepEqual(broker.taskLedger.get(unknownKey), unknownBefore);
+    await assert.rejects(client.requestNavigationRecovery({ ...base, expectedPendingUrl: null,
+      method: "tabs.stopLoading", optIn: true, idempotencyKey: "stop-exact" }), { code: "idempotency_fingerprint_conflict" });
+    assert.equal(commands.filter(command => command.method === "tabs.stopLoading").length, 2, "only changed-tuple rejection and the single successful stop were dispatched");
+    const uncertainStop = { ...base, expectedPendingUrl: "https://example.test/unknown",
+      method: "tabs.stopLoading", optIn: true, idempotencyKey: "stop-unknown" };
+    tab.pendingUrl = uncertainStop.expectedPendingUrl;
+    await assert.rejects(client.requestNavigationRecovery(uncertainStop), { code: "operation_effect_unknown" });
+    assert.equal(broker.taskLedger.get("stop-unknown").state, "unknown_effect");
+    await assert.rejects(client.requestNavigationRecovery(uncertainStop), { code: "idempotency_duplicate" });
+    assert.equal(commands.filter(command => command.method === "tabs.stopLoading" && command.params.expectedPendingUrl === uncertainStop.expectedPendingUrl).length, 1);
+    assert.deepEqual(broker.taskLedger.get(unknownKey), unknownBefore);
+    assert.equal(commands.filter(command => command.method === "tabs.reload").length, 0);
+  } finally { await harness.close(); }
+});
+
+for (const method of ["tabs.reload", "tabs.navigate"]) {
+  test(`unresolved ${method} blocks same-target external dispatch across run/task changes without blocking readback or independent targets`, async () => {
+    const harness = await createCapsuleHarness({ interceptCommand: ({ message, extension }) => {
+      if (message.method !== method) return false;
+      extension.send({ kind: "command.error", operationId: message.operationId, error: {
+        code: "operation_effect_unknown", message: "Original acknowledgement missing",
+        details: { operationEffectState: "unknown_effect", mutationDispatchAttempted: true } } });
+      return true;
+    } });
+    const { broker, client, session, commands } = harness;
+    try {
+      const runId = "unknown-navigation";
+      const original = await client.requestAuthorizedTransaction({ sessionId: session.sessionId, taskId: session.taskId, runId,
+        idempotencyKey: "original-navigation", startUrl: "https://example.test/original", allowedOrigins: ["https://example.test"],
+        keepTaskTab: true, actions: [{ method, params: method === "tabs.navigate" ? { url: "https://example.test/arrived" } : {} }] });
+      const tabId = original.tab.id;
+      const entry = broker.taskLedger.listOperations().find(operation => operation.binding?.method === method && operation.binding?.tabId === tabId);
+      assert.equal(entry.state, "unknown_effect");
+      const originalRecord = structuredClone(entry);
+      let lease = await client.request("lease.acquire", { sessionId: session.sessionId, tabId });
+      const resume = await client.requestPrepareResume({ sessionId: session.sessionId, taskId: session.taskId, runId, capsuleId: original.capsule.capsuleId });
+      assert.equal(resume.readback_ready, true);
+      assert.equal(resume.mutation_resume_allowed, false);
+      assert.equal(resume.resume_ready, false);
+      assert.ok(resume.blockers.some(blocker => blocker.code === "local_navigation_readback_required"));
+      const status = await client.requestTaskStatus({ sessionId: session.sessionId, taskId: session.taskId, runId, capsuleId: original.capsule.capsuleId });
+      assert.equal(status.remaining_action_dispatch_allowed, false);
+      const mutate = (ownerSession, ownerLease, ownerRun, key) => {
+        const payload = { tabId, locator: { testId: "submit" } };
+        const authority = createAuthorityEnvelope({ issuer: "codex_mcp", secret: "capsule-integration-issuer",
+          runId: ownerRun, taskId: ownerSession.taskId, ownerKey: ownerSession.sessionId,
+          method: "page.click", intent: "explicit_submit", targetOrigin: "https://example.test", idempotencyKey: key, payload, approved: true });
+        return client.request("operation.execute", { sessionId: ownerSession.sessionId, leaseId: ownerLease.leaseId,
+          method: "page.click", params: payload, authority, intent: "explicit_submit", allowedOrigins: ["https://example.test"] });
+      };
+      const before = commands.length;
+      await assert.rejects(mutate(session, lease, runId, "guard-original-run"), { code: "local_navigation_readback_required" });
+      await assert.rejects(mutate(session, lease, "new-run", "guard-new-run"), { code: "local_navigation_readback_required" });
+      assert.equal(commands.length, before);
+      assert.equal(broker.taskLedger.get("guard-original-run"), undefined);
+      const read = await client.request("operation.execute", { sessionId: session.sessionId, leaseId: lease.leaseId, method: "page.snapshot", params: { tabId } });
+      assert.ok(read.url);
+      assert.deepEqual(broker.taskLedger.get(entry.idempotencyKey), originalRecord);
+      await client.request("lease.release", { leaseId: lease.leaseId });
+      const foreignSession = await client.request("session.open", { taskId: "new-owner", profileInstanceId: session.profileInstanceId });
+      const foreignLease = await client.request("lease.acquire", { sessionId: foreignSession.sessionId, tabId });
+      await assert.rejects(mutate(foreignSession, foreignLease, "new-owner-run", "guard-new-owner"), { code: "local_navigation_readback_required" });
+      await client.request("lease.release", { leaseId: foreignLease.leaseId });
+      lease = await client.request("lease.acquire", { sessionId: session.sessionId, tabId });
+      const independent = await client.requestAuthorizedTransaction({ sessionId: session.sessionId, taskId: session.taskId,
+        runId: "independent-navigation-target", idempotencyKey: "independent-navigation-action",
+        startUrl: "https://example.test/independent", allowedOrigins: ["https://example.test"],
+        actions: [{ method: "page.click", params: { locator: { testId: "independent-click" } } }] });
+      assert.equal(independent.result, "verified", JSON.stringify(independent.exact_blocker));
+      assert.notEqual(independent.tab.id, tabId);
+      await assert.rejects(broker.taskLedger.reconcile(entry.idempotencyKey, { ...entry.binding, tabId: tabId + 1 }, { effectState: "known_effect" }, { brokerEvidence: true }), { code: "reconciliation_binding_mismatch" });
+      await assert.rejects(broker.taskLedger.reconcile(entry.idempotencyKey, entry.binding, { effectState: "known_effect" }), { code: "reconciliation_evidence_required" });
+      await broker.taskLedger.reconcile(entry.idempotencyKey, entry.binding, { effectState: "known_effect", mutationDispatchAttempted: true }, { brokerEvidence: true });
+      const completed = await mutate(session, lease, runId, "after-confirmed-reconciliation");
+      assert.equal(completed.found, true);
+      assert.equal(commands.filter(command => command.method === method).length, 1, "the original reload/navigation is never replayed");
+      assert.equal(commands.filter(command => command.method === "page.click" && command.params.tabId === tabId).length, 1);
+    } finally { await harness.close(); }
+  });
+}
+
+for (const late of [false, true]) {
+  test(`target recovery uses actual signed transaction setup and business progress (${late ? "late settlement" : "terminal no effect"})`, async () => {
+    let trigger;
+    let harness;
+    const businessMethod = late ? "page.click" : "page.type";
+    harness = await createCapsuleHarness({ interceptCommand: ({ message, extension }) => {
+      if (message.method !== businessMethod) return false;
+      trigger = message;
+      if (late) {
+        const pending = harness.broker.pendingOperations.get(message.operationId);
+        const timeout = pending.timer._onTimeout;
+        clearTimeout(pending.timer);
+        setTimeout(timeout, 5);
+      } else {
+        extension.send({ kind: "command.error", operationId: message.operationId,
+          error: { code: "validation_failed", message: "No mutation started", details: {
+            operationEffectState: "none", mutationDispatchAttempted: false, externalActionExecuted: false } } });
+      }
+      return true;
+    } });
+    const { broker, client, session, liveTabs, commands } = harness;
+    try {
+      const original = await client.requestAuthorizedTransaction({ sessionId: session.sessionId,
+        taskId: session.taskId, runId: "real-target-source", idempotencyKey: "real-target-source",
+        startUrl: "https://example.test/form", allowedOrigins: ["https://example.test"], keepTaskTab: true,
+        actions: [{ method: businessMethod, params: { locator: { testId: "editor" }, ...(late ? {} : { text: "never-replayed" }) } },
+          { method: "page.query", params: { query: "ready" } }] });
+      const source = structuredClone(broker.taskLedger.getTaskCapsule(original.capsule.capsuleId));
+      assert.equal(source.state, late ? "reconciliation_required" : "failed");
+      assert.equal(source.effect.actionProgress.failed_action_index, 0);
+      assert.equal(source.effect.failedOperationKey, "real-target-source:1");
+      assert.equal(broker.taskLedger.get("real-target-source:0").binding.method, "tabs.create");
+      assert.equal(broker.taskLedger.get("real-target-source:0").createdTabId, original.tab.id);
+      if (late) {
+        const operation = broker.timedOutOperations.get(trigger.operationId);
+        const barrier = onceMessage(harness.extensionPeer, reply => reply.kind === "peer.error"
+          && reply.error?.code === "extension_message_unknown");
+        harness.extensionPeer.send({ kind: "command.error", operationId: trigger.operationId,
+          binding: operation.binding, generation: session.generation, profileInstanceId: session.profileInstanceId,
+          error: { code: "validation_failed", message: "No mutation started", details: {
+            operationEffectState: "none", mutationDispatchAttempted: false, externalActionExecuted: false } } });
+        harness.extensionPeer.send({ kind: "test.barrier" });
+        await barrier;
+        assert.equal(broker.taskLedger.get("real-target-source:1").state, "reconciled");
+      }
+      liveTabs.delete(original.tab.id);
+      const before = commands.length;
+      const replacement = await client.requestRecoverTarget({ sessionId: session.sessionId,
+        taskId: session.taskId, runId: source.runId, sourceCapsuleId: source.capsuleId,
+        originalOperationKey: source.effect.failedOperationKey, originalOperationId: source.effect.failedOperationId,
+        oldTabId: original.tab.id, targetKey: source.target.targetKey, intendedUrl: source.target.intendedUrl,
+        idempotencyKey: "real-replacement" });
+      assert.equal(replacement.result, "verified");
+      assert.notEqual(replacement.tab_id, original.tab.id);
+      assert.equal(replacement.target.pageInstanceId, `document-${replacement.tab_id}-https://example.test/form`);
+      assert.deepEqual(commands.slice(before).map(command => command.method), ["tabs.list", "tabs.create", "page.snapshot"]);
+      assert.equal(commands.filter(command => command.method === businessMethod).length, 1);
+      assert.deepEqual(broker.taskLedger.getTaskCapsule(source.capsuleId), source);
+      assert.equal(broker.taskLedger.getTaskCapsule(replacement.capsule_id).execution.targetRecovery.sourceCapsuleId, source.capsuleId);
+    } finally { await harness.close(); }
+  });
 }
 
 function dialogEventFor(message, changes = {}) {
@@ -1301,6 +1889,48 @@ test("schema-valid drags bind both inspected targets and reject a moved destinat
   } finally { await harness.close(); }
 });
 
+test("visual target proofs bind settled postcapture geometry with bounded same-document reads", async () => {
+  for (const change of ['stable','height-once','moves-every-capture','document','url','frame']) {
+    let captures=0, armed=false;
+    const harness=await createCapsuleHarness({interceptCommand:({message,tab,extension})=>{
+      if(!armed)return false;
+      if(message.method==='page.screenshot'){captures++;return false;}
+      if(message.method!=='visual.inspectTarget')return false;
+      const n=change==='height-once'?Math.min(captures,1):change==='moves-every-capture'?captures:0;
+      const url=change==='url'&&captures?'https://example.test/other':tab.url;
+      extension.send({kind:'command.result',operationId:message.operationId,result:{supported:true,url,topLevelUrl:url,
+        pageInstanceId:change==='document'&&captures?'new-document':`document-${tab.id}-${tab.url}`,
+        frameId:change==='frame'&&captures?1:0,framePath:[],coordinateSpace:'top-level-viewport',
+        element:{tag:'button',role:'button',name:'Library'},rect:{x:238,y:391+n*56,width:108,height:17},
+        clippedRect:{x:238,y:391+n*56,width:108,height:17},point:{x:292,y:400+n*56},
+        viewport:{width:714,height:635+n*56,devicePixelRatio:2,scale:1},scroll:{x:0,y:0}}});
+      return true;
+    }});
+    try{
+      const {client,session,commands}=harness;
+      const opened=await client.requestAuthorizedTransaction({sessionId:session.sessionId,taskId:session.taskId,
+        runId:'settle-open',idempotencyKey:'settle-open',startUrl:'https://example.test/background',allowedOrigins:['https://example.test'],
+        actions:[{method:'page.query',params:{query:'ready'}}],keepTaskTab:true});
+      const tabId=opened.tab.id,lease=await client.request('lease.acquire',{sessionId:session.sessionId,tabId});
+      armed=true;const start=commands.length;
+      const inspect=()=>client.request('visual.target.inspect',{sessionId:session.sessionId,leaseId:lease.leaseId,tabId,locator:{role:'button',name:'Library'}});
+      if(['stable','height-once'].includes(change)){
+        const result=await inspect();assert.equal(result.visualProof.point.y,change==='stable'?400:456);
+        assert.equal(result.visualProof.rect.y,change==='stable'?391:447);
+        assert.equal(result.visualProof.viewport.height,change==='stable'?635:691);
+        assert.equal(captures,change==='stable'?1:2);
+        const reads=commands.slice(start).filter(c=>c.method==='visual.inspectTarget');
+        assert.equal(reads.length,change==='stable'?2:3);assert.equal(reads[0].params.scroll,undefined);
+        assert(reads.slice(1).every(c=>c.params.scroll===false));
+      }else{
+        await assert.rejects(inspect(),e=>e.code==='visual_target_readback_mismatch');
+        assert.equal(captures,change==='moves-every-capture'?2:1);
+      }
+      assert.equal(commands.slice(start).filter(c=>['visual.click','page.click','page.submit'].includes(c.method)).length,0);
+    }finally{await harness.close();}
+  }
+});
+
 test("canvas point proofs reject redraw, replacement, scroll, density and viewport changes before input", async () => {
   for (const change of ['unchanged', 'redraw', 'replacement', 'scroll', 'density', 'viewport', 'pageScale']) {
     const harness = await createCapsuleHarness();
@@ -1326,6 +1956,10 @@ test("canvas point proofs reject redraw, replacement, scroll, density and viewpo
       const dispatched = commands.slice(start).filter(command => command.method === 'visual.click');
       if (change === 'unchanged') {
         assert.equal(result.result, 'verified'); assert.equal(dispatched.length, 1);
+        assert.equal(dispatched[0].params.visualTargetGuard.kind, 'point');
+        assert.deepEqual(dispatched[0].params.visualTargetGuard.point, proof.visualProof.point);
+        assert.deepEqual(dispatched[0].params.visualTargetGuard.viewport, proof.visualProof.viewport);
+        assert.equal(dispatched[0].params.visualTargetGuard.pageInstanceId, proof.visualProof.pageInstanceId);
       } else {
         assert.equal(result.result, 'blocked'); assert.equal(dispatched.length, 0);
         assert.equal(result.exact_blocker.code, ['redraw', 'replacement'].includes(change) ? 'visual_canvas_content_changed' : 'visual_target_proof_stale_geometry');
@@ -2978,6 +3612,14 @@ test("broker integration enforces capsule target parallelism, lifecycle status, 
     assert.equal(semanticSubmitUnknown.exact_blocker.code, "operation_effect_unknown");
     assert.equal(semanticSubmitUnknown.exact_blocker.details.method, "page.click");
     assert.deepEqual(semanticSubmitUnknown.continuation, {
+      block_scope: "target",
+      affected_target: { task_id: "capsule_task", run_id: "run_submit_click_no_transition",
+        profile_instance_id: "profile_capsule", tab_id: semanticSubmitUnknown.tab.id,
+        target_key: `target_sha256:${createHash("sha256").update("submit-click-no-transition", "utf8").digest("hex")}` },
+      next_action: "perform_one_owner_signed_reconciliation_readback",
+      blocked_tab_id: semanticSubmitUnknown.tab.id,
+      blocked_run_id: "run_submit_click_no_transition",
+      independent_work_allowed: true,
       allowed: false,
       reason: "reconciliation_required",
       restart_point: "signed_task_status_readback",
@@ -3058,7 +3700,18 @@ test("broker integration enforces capsule target parallelism, lifecycle status, 
     assert.equal(reconciledStatus.reconciliation_required, false);
     assert.equal(broker.taskLedger.getTaskCapsule(semanticSubmitUnknown.capsule.capsuleId).state, "completed");
     assert.equal(broker.taskTabs.get(`profile_capsule:${semanticSubmitUnknown.tab.id}`).lifecycleState, "completed");
-    assert.equal(broker.taskTabs.get(`profile_capsule:${semanticSubmitUnknown.tab.id}`).retentionPolicy, "cleanup");
+    // Settling one uncertain operation does not end the task: the tab stays
+    // an ordinary retained task tab and the same task may continue on it.
+    assert.equal(broker.taskTabs.get(`profile_capsule:${semanticSubmitUnknown.tab.id}`).retentionPolicy, "retain");
+    assert.equal(reconciliationCompletion.task_may_continue, true);
+    assert.equal(reconciliationCompletion.continue_on_tab_id, semanticSubmitUnknown.tab.id);
+    assert.match(reconciliationCompletion.next_action, /^continue_remaining_task_steps_on_same_tab/u);
+    const continued = await client.requestAuthorizedTransaction({ sessionId: session.sessionId, taskId: "capsule_task",
+      runId: "run_submit_click_no_transition", idempotencyKey: "idem_after_reconciliation_continue",
+      targetOrigin: "https://example.test", startUrl: "https://example.test/editor", allowedOrigins: ["https://example.test"],
+      tabId: semanticSubmitUnknown.tab.id, keepTaskTab: true, actions: [{ method: "page.query", params: { query: "Application" } }] });
+    assert.notEqual(continued.exact_blocker?.code, "task_target_unavailable");
+    assert.equal(continued.tab?.id, semanticSubmitUnknown.tab.id);
     await assert.rejects(
       client.requestCompleteReconciliation({
         sessionId: session.sessionId,
@@ -3325,6 +3978,10 @@ test("a successful edit survives a later pre-dispatch failure in both receipt an
     });
     assert.equal(result.result, "blocked");
     assert.equal(result.effect_state, "known_effect");
+    assert.equal(result.exact_blocker.block_scope, "target");
+    assert.equal(result.exact_blocker.affected_target.tab_id, result.tab.id);
+    assert.equal(result.exact_blocker.independent_work_allowed, true);
+    assert.equal(result.continuation.next_action, "fresh_status_and_exact_owner_readback");
     assert.equal(result.failed_step.effect_state, "no_dispatch");
     assert.equal(result.completed_mutation_count, 1);
     assert.deepEqual(result.action_progress.remaining_action_indices, [1]);
@@ -3358,6 +4015,9 @@ test("a successful edit survives a later pre-dispatch failure in both receipt an
     harness.broker.taskTabs.delete(targetKey);
     const missing = await client.requestPrepareResume({ sessionId: session.sessionId, taskId: "capsule_task", runId: "run_partial_edit", capsuleId: result.capsule.capsuleId });
     assert.equal(missing.exact_blocker.code, "resume_target_missing");
+    assert.equal(missing.block_scope, "target");
+    assert.equal(missing.independent_work_allowed, true);
+    assert.equal(missing.exact_blocker.affected_target.tab_id, result.tab.id);
     assert.equal(missing.target_reservation, null);
     harness.broker.taskTabs.set(targetKey, { ...target, quarantine: "stale_generation" });
     const stale = await client.requestPrepareResume({ sessionId: session.sessionId, taskId: "capsule_task", runId: "run_partial_edit", capsuleId: result.capsule.capsuleId });
@@ -3439,6 +4099,74 @@ test("a delayed submit transition and transient capture recover with one click",
     assert.equal(commands.filter(command => command.method === "page.click").length, 1);
   } finally { await harness.close(); }
 });
+
+const captureProjectionReasons = {
+  activationInterruption: true, activeTabMismatch: false, windowMismatch: true, urlMismatch: false, loading: true,
+};
+const captureProjectionIds = {
+  targetTabId: 101, targetWindowId: 1, currentTabId: 101, currentWindowId: 2, activeTabId: null, activeWindowId: null,
+};
+for (const [name, details, expected, code = 'screenshot_target_changed'] of [
+  ...['before_capture', 'after_slot', 'after_capture', 'retry_guard'].map((phase, index) => [
+    phase, { reasons: captureProjectionReasons, phase, attempt: [0, 1, 2, 4][index], ...captureProjectionIds },
+    { reasons: captureProjectionReasons, phase, attempt: [0, 1, 2, 4][index], ...captureProjectionIds },
+  ]),
+  ['unknown fields and nested values', {
+    reasons: { ...captureProjectionReasons, url: 'https://private.test/?secret=hidden', extra: { token: 'hidden' } },
+    phase: 'after_slot', attempt: 1, ...captureProjectionIds,
+    url: 'https://private.test/?secret=hidden', currentUrl: 'https://private.test/other', token: 'hidden', arbitrary: { nested: true },
+  }, { reasons: captureProjectionReasons, phase: 'after_slot', attempt: 1, ...captureProjectionIds }],
+  ['malformed fields', {
+    reasons: { activationInterruption: 'true', activeTabMismatch: 1, windowMismatch: null, urlMismatch: { nested: true }, loading: false },
+    phase: { nested: 'after_slot' }, attempt: '1',
+    targetTabId: 0, targetWindowId: -1, currentTabId: 1.5, currentWindowId: '2', activeTabId: Number.MAX_SAFE_INTEGER + 1, activeWindowId: {},
+  }, { reasons: { loading: false } }],
+  ['out of range attempt and phase', { reasons: [], phase: 'unknown', attempt: 5 }, {}],
+  ['negative attempt and invalid reasons', { reasons: 'loading', phase: ['after_capture'], attempt: -1 }, {}],
+  ['fractional attempt and invalid nested booleans', { reasons: { loading: [true] }, attempt: 0.5 }, {}],
+  ['absent diagnostics', undefined, {}],
+  ['unrelated error diagnostics', { reasons: captureProjectionReasons, phase: 'after_slot', attempt: 1, ...captureProjectionIds }, {}, 'target_frame_unavailable'],
+]) {
+  test(`capture diagnostic projection through Extension error and transaction snapshot: ${name}`, async () => {
+    let errorResponses = 0;
+    const harness = await createCapsuleHarness({ interceptCommand: ({ message, extension }) => {
+      if (message.method !== 'page.screenshot') return false;
+      errorResponses += 1;
+      extension.send({ kind: 'command.error', operationId: message.operationId,
+        error: { code, message: 'synthetic transition during capture', ...(details === undefined ? {} : { details }) } });
+      return true;
+    } });
+    const { client, session, commands } = harness;
+    try {
+      const result = await client.requestAuthorizedTransaction({
+        sessionId: session.sessionId, runId: 'capture-projection', taskId: 'capsule_task',
+        idempotencyKey: 'capture-projection', targetOrigin: 'https://example.test',
+        startUrl: 'https://example.test/reader', allowedOrigins: ['https://example.test'],
+        actions: [{ method: 'page.query', params: { query: 'ready' } }],
+      });
+      assert.equal(result.exact_blocker.code, code);
+      assert.equal(result.exact_blocker.message, 'synthetic transition during capture');
+      assert.deepEqual(result.exact_blocker.details, {
+        operationEffectState: 'known_no_effect', mutationDispatchAttempted: false, ...expected,
+      });
+      assert.equal(result.result, 'blocked');
+      assert.equal(result.effect_state, 'no_dispatch');
+      assert.equal(result.action_progress.replay_allowed, false);
+      assert.equal(result.outcome.replay_allowed, false);
+      assert.equal(result.continuation.allowed, false);
+      assert.equal(commands.filter(command => command.method === 'page.query').length, 1);
+      // target_frame_unavailable also uses the existing per-operation read retry.
+      const expectedCaptureCount = code === 'target_frame_unavailable' ? 6 : 3;
+      assert.equal(errorResponses, expectedCaptureCount);
+      assert.equal(commands.filter(command => command.method === 'page.screenshot').length, expectedCaptureCount);
+      const projected = JSON.stringify(result.exact_blocker);
+      assert.ok(projected.length < 800);
+      assert.ok(!projected.includes('https://'));
+      assert.ok(!projected.includes('hidden'));
+      assert.ok(!projected.includes('arbitrary'));
+    } finally { await harness.close(); }
+  });
+}
 
 test("a permanent capture failure retains the completed edit and only requests readback", async () => {
   const harness = await createCapsuleHarness({ postCaptureBehavior: "permanent" });
@@ -3529,7 +4257,8 @@ test("signed reconciliation clears the exact operation and preserves remaining w
     assert.equal(broker.taskLedger.get("reconcile_remaining:999").effectState, "unknown_effect");
     const resumed = await client.requestPrepareResume({ sessionId: session.sessionId, taskId: "capsule_task",
       runId: "reconcile_remaining", capsuleId: result.capsule.capsuleId });
-    assert.equal(resumed.resume_ready, true);
+    assert.equal(resumed.resume_ready, false);
+    assert.equal(resumed.target_unresolved_external_operation_count, 1);
     assert.deepEqual(resumed.action_progress.remaining_action_indices, [1]);
     assert.equal(resumed.unresolved_operation_count, 0);
     const status = await client.requestTaskStatus({ sessionId: session.sessionId, taskId: "capsule_task",
@@ -3548,6 +4277,178 @@ test("signed reconciliation clears the exact operation and preserves remaining w
     assert.equal(commands.filter(command => command.method === "page.type").length, 0);
   } finally { await harness.close(); }
 });
+
+for (const legacy of [false, true]) {
+  test(`signed local navigation arrival maintenance accepts the exact target and preserves failure (${legacy ? "legacy failed" : "current reconciliation"} capsule)`, async () => {
+    const targetUrl = "https://example.test/local-navigation-arrived";
+    const runId = legacy ? "run_local_navigation_legacy" : "run_local_navigation_current";
+    const idempotencyKey = legacy ? "idem_local_navigation_legacy" : "idem_local_navigation_current";
+    const harness = await createCapsuleHarness({
+      interceptCommand: ({ message, extension }) => {
+        if (message.method !== "tabs.navigate") return false;
+        extension.send({ kind: "command.error", operationId: message.operationId, error: {
+          code: "tabs_navigate_ack_lost",
+          message: "Synthetic local navigation acknowledgement loss.",
+          details: { operationEffectState: "unknown_effect", mutationDispatchAttempted: true },
+        } });
+        return true;
+      },
+    });
+    const { broker, client, session, commands, liveTabs } = harness;
+    const request = {
+      sessionId: session.sessionId,
+      taskId: "capsule_task",
+      runId,
+      idempotencyKey,
+      targetOrigin: "https://example.test",
+      startUrl: "https://example.test/before-local-navigation",
+      allowedOrigins: ["https://example.test"],
+      actions: [{ method: "tabs.navigate", params: { url: targetUrl } }],
+      capsule: { workflowType: "AOS", targetKey: `url:${targetUrl}` },
+      keepTaskTab: true,
+    };
+    let leaseId = null;
+    try {
+      const transaction = await client.requestAuthorizedTransaction(request);
+      assert.equal(transaction.result, "unknown_effect");
+      assert.equal(transaction.effect_state, "unknown_effect");
+      assert.equal(transaction.external_action_executed, false);
+      assert.deepEqual(transaction.action_progress.uncertain_action_indices, [0]);
+      assert.deepEqual(transaction.action_progress.remaining_action_indices, []);
+      assert.equal(transaction.action_progress.replay_allowed, false);
+      assert.equal(transaction.capsule.state, "reconciliation_required");
+      assert.equal(transaction.capsule.effect.effectClass, "local_ui");
+      assert.equal(transaction.capsule.effect.externalActionExecuted, false);
+      assert.equal(transaction.capsule.retention.reason, "local_ui_navigation_arrival_pending");
+      assert.equal(commands.filter((command) => command.method === "tabs.navigate").length, 1);
+
+      if (legacy) {
+        const prior = broker.taskLedger.getTaskCapsule(transaction.capsule.capsuleId);
+        await broker.taskLedger.putTaskCapsule({
+          ...prior,
+          state: "failed",
+          retention: { ...prior.retention, reason: "local_ui_effect_unknown" },
+        });
+      }
+
+      liveTabs.set(transaction.tab.id, {
+        ...liveTabs.get(transaction.tab.id),
+        url: targetUrl,
+        text: "Navigation arrived and the requested page is ready.",
+      });
+      const lease = await client.request("lease.acquire", { sessionId: session.sessionId, tabId: transaction.tab.id });
+      leaseId = lease.leaseId;
+      const binding = {
+        sessionId: session.sessionId,
+        leaseId,
+        tabId: transaction.tab.id,
+        taskId: "capsule_task",
+        runId,
+        idempotencyKey,
+        capsuleId: transaction.capsule.capsuleId,
+      };
+
+      await assert.rejects(
+        client.requestInspectReconciliation({ ...binding, taskId: "foreign_task", successQuery: "Navigation arrived" }),
+        (error) => error.code === "task_id_mismatch",
+      );
+      await assert.rejects(
+        client.requestInspectReconciliation({ ...binding, leaseId: "foreign-lease", successQuery: "Navigation arrived" }),
+        (error) => error.code === "exact_tab_lease_required",
+      );
+
+      const inspection = await client.requestInspectReconciliation({ ...binding, successQuery: "Navigation arrived" });
+      const proof = inspection.reconciliationProof;
+      assert.equal(inspection.kind, "reconciliation_visual_confirmation");
+      assert.equal(inspection.local_navigation_arrival_verified, true);
+      assert.equal(inspection.provider_success_confirmed, false);
+      assert.equal(inspection.external_action_executed, false);
+      assert.equal(proof.proofKind, "local_navigation_arrival");
+      const navigationOperation = broker.taskLedger.listOperations().find((entry) =>
+        entry.binding?.taskId === "capsule_task"
+        && entry.binding?.runId === runId
+        && entry.binding?.method === "tabs.navigate");
+      assert.ok(navigationOperation);
+      assert.equal(proof.operationIndex, Number(navigationOperation.idempotencyKey.split(":").at(-1)));
+      assert.equal(proof.operationId, navigationOperation.operationId);
+      assert.ok(proof.recordedTargetDigest);
+
+      const signModifiedProof = (patch) => {
+        const { signature: _signature, ...payload } = proof;
+        const modified = { ...payload, ...patch };
+        return { ...modified, signature: payloadDigest(broker.ledgerSecret, modified) };
+      };
+      const originalReadbackCommandCount = commands.length;
+      for (const { patch, code } of [
+        { patch: { operationIndex: proof.operationIndex + 1 }, code: "reconciliation_visual_proof_invalid" },
+        { patch: { recordedTargetDigest: "wrong-recorded-target-digest" }, code: "reconciliation_visual_proof_invalid" },
+        { patch: { taskId: "foreign_task" }, code: "reconciliation_visual_proof_invalid" },
+        { patch: { sessionId: "foreign-session" }, code: "reconciliation_visual_proof_invalid" },
+        { patch: { leaseId: "foreign-lease" }, code: "reconciliation_visual_proof_invalid" },
+        { patch: { generation: "stale-generation" }, code: "reconciliation_visual_proof_invalid" },
+        { patch: { profileInstanceId: "foreign-profile" }, code: "reconciliation_visual_proof_invalid" },
+        { patch: { tabId: transaction.tab.id + 1 }, code: "reconciliation_visual_proof_invalid" },
+        { patch: { proofKind: "provider_success" }, code: "reconciliation_visual_proof_kind_invalid" },
+      ]) {
+        await assert.rejects(
+          client.requestCompleteReconciliation({ ...binding, reconciliationProof: signModifiedProof(patch) }),
+          (error) => error.code === code,
+        );
+      }
+      assert.equal(commands.length, originalReadbackCommandCount);
+
+      const providerSuccessClaim = signModifiedProof({ providerSuccessConfirmed: true, externalActionExecuted: true });
+      const completion = await client.requestCompleteReconciliation({ ...binding, reconciliationProof: providerSuccessClaim });
+      assert.equal(completion.schema, "aos.chrome_companion.local_navigation_arrival_maintenance.v1");
+      assert.equal(completion.status, "local_navigation_arrival_confirmed");
+      assert.equal(completion.state, "failed");
+      assert.equal(completion.effect_state, "known_effect");
+      assert.equal(completion.external_action_executed, false);
+      assert.equal(completion.provider_success_confirmed, false);
+      assert.equal(completion.remaining_action_dispatch_allowed, false);
+      assert.equal(completion.terminal_cleanup_ready, true);
+      assert.equal(completion.other_unresolved_effect_count, 0);
+      assert.equal(completion.original_failure.code, "tabs_navigate_ack_lost");
+
+      const settledCapsule = broker.taskLedger.getTaskCapsule(transaction.capsule.capsuleId);
+      assert.equal(settledCapsule.state, "failed");
+      assert.equal(settledCapsule.blocker.code, "tabs_navigate_ack_lost");
+      assert.equal(settledCapsule.effect.effectClass, "local_ui");
+      assert.equal(settledCapsule.effect.effectState, "known_effect");
+      assert.equal(settledCapsule.effect.externalActionExecuted, false);
+      assert.equal(settledCapsule.effect.localNavigationArrivalSettled, true);
+      assert.equal(settledCapsule.completion.reconciliation.providerSuccessConfirmed, false);
+      assert.deepEqual(settledCapsule.effect.actionProgress.remaining_action_indices, []);
+      assert.equal(settledCapsule.effect.actionProgress.replay_allowed, false);
+      if (legacy) assert.equal(settledCapsule.retention.reason, null);
+
+      const settledOperation = broker.taskLedger.get(navigationOperation.idempotencyKey);
+      assert.equal(settledOperation.state, "reconciled");
+      assert.equal(settledOperation.effectClass, "local_ui");
+      assert.equal(settledOperation.effectState, "known_effect");
+      assert.equal(settledOperation.externalActionExecuted, false);
+      assert.equal(settledOperation.localNavigationArrivalReconciled, true);
+      assert.equal(unresolvedLocalNavigationForTarget(broker.taskLedger.listOperations(), {
+        profileInstanceId: session.profileInstanceId, tabId: transaction.tab.id,
+      }).length, 0, "the existing signed exact-navigation reconciliation releases only its original operation guard");
+
+      await assert.rejects(
+        client.requestCompleteReconciliation({ ...binding, reconciliationProof: providerSuccessClaim }),
+        (error) => error.code === "task_reconciliation_state_invalid",
+      );
+      const settledStatus = await client.requestTaskStatus({ ...binding });
+      assert.equal(settledStatus.state, "failed");
+      assert.equal(settledStatus.effect_state, "known_effect");
+      assert.equal(settledStatus.completion.reconciliation.providerSuccessConfirmed, false);
+      assert.equal(settledStatus.remaining_action_dispatch_allowed, false);
+      assert.equal(commands.filter((command) => command.method === "tabs.navigate").length, 1);
+      assert.equal(commands.filter((command) => command.method === "page.click" || command.method === "page.submit").length, 0);
+    } finally {
+      if (leaseId) await client.request("lease.release", { leaseId }).catch(() => {});
+      await harness.close();
+    }
+  });
+}
 
 
 test("reusing an equivalent canonical URL preserves the document without navigation", async () => {
@@ -3587,6 +4488,11 @@ test("explicit transaction tab preserves SPA state and never reloads its startUr
     const missing = await client.requestAuthorizedTransaction({ ...base, tabId: 9999, idempotencyKey: "idem_missing_tab", actions: [{ method: "page.query", params: { query: "ready" } }] });
     assert.equal(missing.result, "blocked");
     assert.equal(missing.exact_blocker.code, "task_target_unavailable");
+    // No effect was dispatched, so this is a recoverable target blocker, not a terminal one.
+    assert.equal(missing.continuation.allowed, true);
+    assert.equal(missing.continuation.reason, "no_effect_target_readback_then_continue");
+    assert.equal(missing.continuation.task_may_continue, true);
+    assert.match(missing.continuation.next_action, /companion_reserve_tab/u);
     assert.ok(commands.slice(beforeInvalid).every(command => command.method === "tabs.list"));
   } finally { await harness.close(); }
 });
@@ -3610,6 +4516,187 @@ test("upload preparation failures do not create a reconciliation gate", async ()
     assert.equal(broker.snapshot().reconciliationPendingActiveCount, 0);
     assert.equal(result.capsule.state, "failed");
   } finally { await harness.close(); }
+});
+
+test("authenticated pre-mutation validation aliases survive command dispatch without an unknown effect", async () => {
+  for (const field of ["operationEffectState", "effectState"]) for (const alias of ["none", "no_effect", "known_no_effect"]) {
+    const harness = await createCapsuleHarness({ interceptCommand: ({ message, extension }) => {
+      if (message.method !== "page.type") return false;
+      extension.send({ kind: "command.error", operationId: message.operationId, error: {
+        code: "validation_failed", message: "No editor mutation started", details: { [field]: alias, mutationDispatchAttempted: false },
+      } });
+      return true;
+    } });
+    try {
+      const result = await harness.client.requestAuthorizedTransaction({ sessionId: harness.session.sessionId,
+        taskId: "capsule_task", runId: "alias-validation", idempotencyKey: "alias-validation",
+        startUrl: "https://example.test/editor", allowedOrigins: ["https://example.test"], keepTaskTab: true,
+        actions: [{ method: "page.type", params: { locator: { testId: "editor" }, text: "must not be typed" } }] });
+      assert.equal(result.result, "blocked", field + ":" + alias);
+      assert.equal(result.failed_step.effect_state, "known_no_effect");
+      assert.equal(result.effect_state, "known_no_effect");
+      assert.equal(result.dispatch_count, 1);
+      assert.equal(result.capsule.effect.effectState, "known_no_effect");
+      assert.equal(result.external_action_executed, false);
+      assert.deepEqual(result.action_progress.remaining_action_indices, [0]);
+      assert.deepEqual(result.action_progress.uncertain_action_indices, []);
+      assert.equal(harness.commands.filter(command => command.method === "page.type").length, 1);
+      assert.notEqual(harness.liveTabs.get(result.tab.id).text, "must not be typed");
+      assert.equal(harness.broker.snapshot().reconciliationPendingActiveCount, 0);
+    } finally { await harness.close(); }
+  }
+});
+
+test("late authenticated no-effect settles transport-only timeout and preserves the historical capsule", async () => {
+  for (const scenario of ["valid", "wrong-binding", "stale-peer", "foreign-peer", "forgery", "genuine-attempt", "action-event", "legacy", "created-tab", "different-operation"]) {
+    let trigger;
+    let harness;
+    harness = await createCapsuleHarness({ interceptCommand: ({ message }) => {
+      if (message.method !== "page.type") return false;
+      trigger = message;
+      // Exercise the actual broker timeout callback without waiting for the
+      // production page.type deadline in this isolated transport fixture.
+      const pending = harness.broker.pendingOperations.get(message.operationId);
+      const timeout = pending.timer._onTimeout;
+      clearTimeout(pending.timer);
+      setTimeout(timeout, 5);
+      return true;
+    } });
+    const { broker, client, session, commands } = harness;
+    const ownerExtension = harness.extensionPeer;
+    const flush = async (extension, message) => {
+      const barrier = onceMessage(extension, reply => reply.kind === "peer.error" && reply.error?.code === "extension_message_unknown");
+      extension.send(message);
+      extension.send({ kind: "test.barrier" });
+      await barrier;
+    };
+    try {
+      const original = await client.requestAuthorizedTransaction({ sessionId: session.sessionId,
+        taskId: session.taskId, runId: "late-proof", idempotencyKey: "late-proof",
+        startUrl: "https://example.test/editor", allowedOrigins: ["https://example.test"], keepTaskTab: true,
+        actions: [{ method: "page.type", params: { locator: { testId: "editor" }, text: "must-not-replay" } }] });
+      assert.equal(original.effect_state, "unknown_effect", scenario);
+      const capsule = structuredClone(broker.taskLedger.getTaskCapsule(original.capsule.capsuleId));
+      const operation = broker.timedOutOperations.get(trigger.operationId);
+      const key = operation.idempotencyKey;
+      const entry = broker.taskLedger.get(key);
+      assert.equal(entry.mutationDispatchProvenance, "transport_inference");
+      const message = { kind: "command.error", operationId: trigger.operationId,
+        binding: operation.binding, generation: session.generation, profileInstanceId: session.profileInstanceId,
+        error: { code: "validation_failed", message: "No page mutation started", details: {
+          operationEffectState: "none", mutationDispatchAttempted: false, externalActionExecuted: false } } };
+      if (scenario === "wrong-binding") message.binding = { ...operation.binding, runId: "foreign-run" };
+      if (scenario === "different-operation") message.operationId = "different-operation";
+      if (scenario === "forgery") message.error.details.external_action_executed = true;
+      if (scenario === "genuine-attempt") entry.mutationDispatchProvenance = "extension_observed";
+      if (scenario === "action-event") { operation.awaitedEvent = {}; entry.awaitedEvent = {}; }
+      if (scenario === "legacy") { delete operation.mutationDispatchProvenance; delete entry.mutationDispatchProvenance; }
+      if (scenario === "created-tab") { operation.createdTabId = 123; entry.createdTabId = 123; }
+      const profile = broker.profiles.get(session.profileInstanceId);
+      const currentPeerId = profile.peerId;
+      if (scenario === "stale-peer") profile.peerId = "a-new-current-peer";
+      let sender = ownerExtension;
+      if (scenario === "foreign-peer") sender = await harness.attachExtension("foreign-profile");
+      const before = commands.length;
+      await flush(sender, message);
+      if (scenario === "stale-peer") profile.peerId = currentPeerId;
+      const read = { sessionId: session.sessionId, taskId: session.taskId, runId: "late-proof",
+        idempotencyKey: "late-proof", capsuleId: capsule.capsuleId };
+      const status = await client.requestTaskStatus(read);
+      const resume = await client.requestPrepareResume(read);
+      assert.deepEqual(broker.taskLedger.getTaskCapsule(capsule.capsuleId), capsule, scenario);
+      assert.equal(commands.length, before, scenario);
+      assert.equal(commands.filter(command => command.method === "page.type").length, 1);
+      if (scenario === "valid") {
+        assert.equal(entry.state, "reconciled");
+        assert.equal(entry.mutationDispatchAttempted, false);
+        assert.equal(entry.externalActionExecuted, false);
+        assert.equal(status.effect_state, "known_no_effect");
+        assert.equal(status.effective_settlement.operationId, trigger.operationId);
+        assert.equal(status.state, capsule.state);
+        assert.equal(resume.effect_state, "known_no_effect");
+        assert.equal(resume.resume_ready, true, JSON.stringify(resume.blockers));
+        assert.equal(resume.operation_effect_proof.effectState, "known_no_effect");
+        assert.equal(resume.operation_effect_proof.mutationDispatchAttempted, false);
+        assert.equal(resume.operation_effect_proof.operationId, trigger.operationId);
+        assert.equal(resume.operation_effect_proof.idempotencyKey, key);
+        assert.equal(resume.operation_effect_proof.resultDigest, entry.resultDigest);
+        assert.equal(broker.timedOutOperations.has(trigger.operationId), false);
+      } else {
+        assert.equal(entry.state, "unknown_effect", scenario);
+        assert.equal(entry.mutationDispatchAttempted, true, scenario);
+        assert.equal(status.effect_state, "unknown_effect", scenario);
+        assert.equal(status.effective_settlement, null, scenario);
+        assert.equal(resume.effective_settlement, null, scenario);
+        assert.equal(broker.timedOutOperations.has(trigger.operationId), true, scenario);
+      }
+      if (scenario === "foreign-peer") ownerExtension.close();
+    } finally { await harness.close(); }
+  }
+});
+
+test("current-action preflight alias failures keep prior applied edits and ignore setup operation evidence", async () => {
+  for (const alias of ["none", "no_effect", "known_no_effect"]) {
+    const harness = await createCapsuleHarness({ interceptCommand: ({ message, extension }) => {
+      if (message.method !== "visual.inspectTarget" || message.params.locator?.testId !== "later-alias-failure") return false;
+      extension.send({ kind: "command.error", operationId: message.operationId, error: {
+        code: "semantic_locator_not_found", message: "Preflight target absent", details: { operationEffectState: alias, mutationDispatchAttempted: false },
+      } });
+      return true;
+    } });
+    try {
+      const result = await harness.client.requestAuthorizedTransaction({ sessionId: harness.session.sessionId,
+        taskId: "capsule_task", runId: "preflight-alias", idempotencyKey: "preflight-alias",
+        startUrl: "https://example.test/editor", allowedOrigins: ["https://example.test"], keepTaskTab: true,
+        actions: [
+          { method: "page.type", params: { locator: { testId: "editor" }, text: "preserved edit" } },
+          { method: "page.click", params: { locator: { testId: "later-alias-failure" } } },
+        ] });
+      assert.equal(result.result, "blocked");
+      assert.equal(result.failed_step.effect_state, "no_dispatch");
+      assert.equal(result.effect_state, "known_effect");
+      assert.equal(result.completed_mutation_count, 1);
+      assert.equal(result.dispatch_count, 1);
+      assert.equal(result.capsule.effect.effectState, "known_effect");
+      assert.deepEqual(result.action_progress.applied_action_indices, [0]);
+      assert.deepEqual(result.action_progress.remaining_action_indices, [1]);
+      assert.equal(harness.liveTabs.get(result.tab.id).text, "preserved edit");
+      assert.equal(harness.commands.filter(command => command.method === "page.type").length, 1);
+      assert.equal(harness.commands.filter(command => command.method === "page.click").length, 0);
+    } finally { await harness.close(); }
+  }
+});
+
+test("alias claims cannot override attempted mutation created tabs or unknown/pending errors", async () => {
+  for (const scenario of [
+    { details: { mutationDispatchAttempted: true } },
+    { details: { createdTabId: 12345, mutationDispatchAttempted: false, dispatchCount: 0 } },
+    { code: "operation_effect_unknown", details: { mutationDispatchAttempted: false, reconciliationRequired: false } },
+    { code: "action_event_pending", details: { mutationDispatchAttempted: false, reconciliationRequired: false, reconciliation_required: false } },
+    { details: { dispatchCount: 0 } },
+    { details: { mutationDispatchAttempted: false, effectState: "known_effect" } },
+  ]) {
+    const harness = await createCapsuleHarness({ interceptCommand: ({ message, extension }) => {
+      if (message.method !== "page.type") return false;
+      extension.send({ kind: "command.error", operationId: message.operationId, error: {
+        code: scenario.code ?? "validation_failed", message: "Contradictory or unproven alias", details: { operationEffectState: "no_effect", ...scenario.details },
+      } });
+      return true;
+    } });
+    try {
+      const result = await harness.client.requestAuthorizedTransaction({ sessionId: harness.session.sessionId,
+        taskId: "capsule_task", runId: "alias-contradiction", idempotencyKey: "alias-contradiction",
+        startUrl: "https://example.test/editor", allowedOrigins: ["https://example.test"], keepTaskTab: true,
+        actions: [{ method: "page.type", params: { locator: { testId: "editor" }, text: "uncertain" } }] });
+      assert.equal(result.result, "unknown_effect", JSON.stringify(scenario));
+      assert.equal(result.failed_step.effect_state, "unknown_effect");
+      assert.equal(result.effect_state, "unknown_effect");
+      assert.deepEqual(result.action_progress.uncertain_action_indices, [0]);
+      assert.deepEqual(result.action_progress.remaining_action_indices, []);
+      assert.equal(result.cleanup.closed, false);
+      assert.equal(harness.commands.filter(command => command.method === "page.type").length, 1);
+    } finally { await harness.close(); }
+  }
 });
 
 test("signed local fixture retirement accepts an ordinary owner task and preserves foreign resources", async () => {
@@ -3673,10 +4760,87 @@ for (const method of ['page.upload', 'page.uploadMultiple']) test(method + ' com
     assert.equal(result.actions[0].result.siteConfirmationVerified, true);
     assert.equal(result.actions[0].result.uploadControlReadbackVerified, false);
     assert.equal(result.actions[0].upload_readback_verified, true);
+    assert.equal(result.upload_delivery.applied, true);
+    assert.equal(result.upload_delivery.confirmation_observed, true);
+    assert.equal(result.upload_delivery.provider_submission_confirmed, false);
     assert.equal(harness.commands.filter(c => c.method === method).length, 1);
     assert.equal(harness.commands.find(c => c.method === method).params.allowInputReset, true);
     assert.equal(harness.commands.find(c => c.method === 'page.waitFor').params.timeoutMs, 700);
   } finally { await harness.close(); }
+});
+
+test('a preview-only site confirms one upload without showing the filename', async () => {
+  const harness = await createCapsuleHarness({ uploadBehavior: 'accepted-preview' });
+  try {
+    const file = { name: 'cat.png', mimeType: 'image/png', dataBase64: Buffer.from('fixture').toString('base64'), size: 7 };
+    const request = (runId, extra) => harness.client.requestAuthorizedTransaction({ sessionId: harness.session.sessionId,
+      taskId: 'capsule_task', runId, idempotencyKey: runId,
+      startUrl: 'https://example.test/upload', allowedOrigins: ['https://example.test'], keepTaskTab: true,
+      actions: [{ method: 'page.upload', params: { locator: { label: 'File' }, file, confirmationLocator: { testId: 'upload-ready' }, ...extra } }] });
+    // Without the opt-in the filename is still required, so a preview alone stays unknown.
+    const strict = await request('upload-preview-strict', {});
+    assert.equal(strict.exact_blocker.code, 'upload_confirmation_not_observed');
+    await harness.close();
+    const preview = await createCapsuleHarness({ uploadBehavior: 'accepted-preview' });
+    try {
+      const result = await preview.client.requestAuthorizedTransaction({ sessionId: preview.session.sessionId,
+        taskId: 'capsule_task', runId: 'upload-preview', idempotencyKey: 'upload-preview',
+        startUrl: 'https://example.test/upload', allowedOrigins: ['https://example.test'], keepTaskTab: true,
+        actions: [{ method: 'page.upload', params: { locator: { label: 'File' }, file, confirmationLocator: { testId: 'upload-ready' }, confirmationPreviewOnly: true } }] });
+      assert.equal(result.result, 'verified', JSON.stringify(result.exact_blocker));
+      assert.equal(result.actions[0].result.siteConfirmationVerified, true);
+      assert.equal(result.upload_delivery.confirmation_observed, true);
+      assert.equal(result.upload_delivery.confirmation_files[0].preview_only, true);
+      const dispatched = preview.commands.find(c => c.method === 'page.upload');
+      assert.equal(dispatched.params.confirmationPreviewOnly, undefined);
+      assert.equal(preview.commands.filter(c => c.method === 'page.upload').length, 1);
+    } finally { await preview.close(); }
+  } finally { await harness.close().catch(() => {}); }
+});
+
+test('preview-only confirmation is refused for multiple files and an already visible preview', async () => {
+  const harness = await createCapsuleHarness({ uploadBehavior: 'already-present' });
+  try {
+    const file = { name: 'cat.png', mimeType: 'image/png', dataBase64: 'Zml4dHVyZQ==', size: 7 };
+    const run = (runId, method, params) => harness.client.requestAuthorizedTransaction({ sessionId: harness.session.sessionId,
+      taskId: 'capsule_task', runId, idempotencyKey: runId, startUrl: 'https://example.test/upload',
+      allowedOrigins: ['https://example.test'], keepTaskTab: true, actions: [{ method, params }] });
+    const multiple = await run('preview-multiple', 'page.uploadMultiple', { locator: { label: 'File' }, files: [file],
+      confirmationLocator: { testId: 'upload-ready' }, confirmationPreviewOnly: true });
+    assert.equal(multiple.exact_blocker.code, 'upload_confirmation_preview_invalid');
+    const stale = await run('preview-stale', 'page.upload', { locator: { label: 'File' }, file,
+      confirmationLocator: { testId: 'upload-ready' }, confirmationPreviewOnly: true });
+    assert.equal(stale.exact_blocker.code, 'upload_confirmation_already_present');
+    assert.equal(harness.commands.filter(c => c.method.startsWith('page.upload')).length, 0);
+  } finally { await harness.close(); }
+});
+
+test("a pending upload reconciles from a preview-only site with previewOnly evidence", async () => {
+  const h = await createCapsuleHarness({ uploadBehavior: "pending" });
+  try {
+    const result = await h.client.requestAuthorizedTransaction({ sessionId: h.session.sessionId, taskId: h.session.taskId,
+      runId: "preview-reconcile", idempotencyKey: "preview-reconcile", startUrl: "https://example.test/upload", allowedOrigins: ["https://example.test"], keepTaskTab: true,
+      actions: [{ method: "page.upload", params: { locator: { label: "File" }, file: { name: "cat.png", mimeType: "image/png", size: 7, dataBase64: "Zml4dHVyZQ==" }, confirmationLocator: { testId: "upload-ready" } } }] });
+    assert.equal(result.exact_blocker.code, "upload_confirmation_not_observed");
+    const entry = h.broker.taskLedger.get("preview-reconcile:1");
+    const originalUploadPayload = structuredClone(h.commands.find(command => command.method === "page.upload").params);
+    delete originalUploadPayload.companionContext;
+    const lease = await h.client.request("lease.acquire", { sessionId: h.session.sessionId, tabId: result.tab.id });
+    const binding = { sessionId: h.session.sessionId, leaseId: lease.leaseId, tabId: result.tab.id, taskId: h.session.taskId,
+      runId: "preview-reconcile", idempotencyKey: "preview-reconcile", capsuleId: result.capsule.capsuleId, successQuery: "image preview ready" };
+    const tab = h.liveTabs.get(result.tab.id);
+    h.liveTabs.set(tab.id, { ...tab, attachmentReady: true, text: "image preview ready" });
+    const proofInput = { ...binding, originalOperationKey: entry.idempotencyKey, originalOperationId: entry.operationId,
+      originalFingerprint: entry.fingerprint, originalUploadPayload };
+    await assert.rejects(h.client.requestInspectReconciliation({ ...proofInput,
+      confirmationFiles: [{ filename: "cat.png", locator: { testId: "upload-ready" } }] }), { code: "upload_site_state_evidence_required" });
+    const inspected = await h.client.requestInspectReconciliation({ ...proofInput,
+      confirmationFiles: [{ filename: "cat.png", locator: { testId: "upload-ready" }, previewOnly: true }] });
+    assert.equal(inspected.provider_success_confirmed, false);
+    const settled = await h.client.requestCompleteReconciliation({ ...binding, reconciliationProof: inspected.reconciliationProof });
+    assert.equal(settled.terminal_cleanup_ready, false);
+    assert.equal(h.commands.filter(command => command.method === "page.upload").length, 1);
+  } finally { await h.close(); }
 });
 
 test('an existing attachment confirmation cannot certify a new upload', async () => {
@@ -3706,8 +4870,181 @@ test('a missing site confirmation preserves the delivered upload and is never re
     assert.equal(result.effect_state, 'unknown_effect');
     assert.equal(result.capsule.state, 'reconciliation_required');
     assert.equal(result.applied_actions.length, 1);
+    assert.equal(result.upload_delivery.applied, true);
+    assert.equal(result.upload_delivery.confirmation_observed, false);
+    assert.equal(result.upload_delivery.retry_upload, false);
     await harness.client.requestAuthorizedTransaction(request).catch(() => {});
     assert.equal(harness.commands.filter(c => c.method === 'page.upload').length, 1);
+  } finally { await harness.close(); }
+});
+
+test('authenticated read-only command errors are no-effect and preserve preceding applied edits', async () => {
+  const harness = await createCapsuleHarness({ interceptCommand: ({ message, extension }) => {
+    if (message.method !== 'page.query' || message.params.query !== 'later read') return false;
+    extension.send({ kind: 'command.error', operationId: message.operationId,
+      error: { code: 'query_failed', message: 'Renderer unavailable' } });
+    return true;
+  } });
+  try {
+    const result = await harness.client.requestAuthorizedTransaction({ sessionId: harness.session.sessionId,
+      taskId: 'capsule_task', runId: 'readonly-after-edit', idempotencyKey: 'readonly-after-edit',
+      startUrl: 'https://example.test/editor', allowedOrigins: ['https://example.test'], keepTaskTab: true,
+      actions: [{ method: 'page.type', params: { locator: { testId: 'editor' }, text: 'already applied' } },
+        { method: 'page.query', params: { query: 'later read' } }] });
+    assert.equal(result.exact_blocker.code, 'query_failed');
+    assert.equal(result.exact_blocker.details.operationEffectState, 'known_no_effect');
+    assert.equal(result.exact_blocker.details.mutationDispatchAttempted, false);
+    assert.equal(result.effect_state, 'known_effect');
+    assert.deepEqual(result.applied_actions.map(action => action.index), [0]);
+    assert.equal(result.continuation.block_scope, 'target');
+    assert.equal(result.continuation.independent_work_allowed, true);
+    assert.equal(harness.commands.filter(command => command.method === 'page.type').length, 1);
+  } finally { await harness.close(); }
+});
+
+test('unproven local mutation error remains unknown despite its local UI effect class', async () => {
+  const harness = await createCapsuleHarness({ interceptCommand: ({ message, extension }) => {
+    if (message.method !== 'page.pressKey') return false;
+    extension.send({ kind: 'command.error', operationId: message.operationId,
+      error: { code: 'renderer_failed', message: 'No no-effect evidence supplied' } });
+    return true;
+  } });
+  try {
+    const result = await harness.client.requestAuthorizedTransaction({ sessionId: harness.session.sessionId,
+      taskId: 'capsule_task', runId: 'local-unproven', idempotencyKey: 'local-unproven',
+      startUrl: 'https://example.test/editor', allowedOrigins: ['https://example.test'],
+      actions: [{ method: 'page.pressKey', params: { locator: { testId: 'editor' }, key: 'a' } }] });
+    assert.equal(result.result, 'unknown_effect');
+    assert.equal(result.failed_step.effect_state, 'unknown_effect');
+    assert.equal(result.action_progress.replay_allowed, false);
+    assert.equal(harness.commands.filter(command => command.method === 'page.pressKey').length, 1);
+  } finally { await harness.close(); }
+});
+
+for (const behavior of ["accepted", "pending"]) test(`two-file attachment confirmation ${behavior} proves every file with one upload dispatch`, async () => {
+  const h = await createCapsuleHarness({ uploadBehavior: behavior });
+  try {
+    const files = ["first.txt", "second.txt"].map(name => ({ name, mimeType: "text/plain", size: 7, dataBase64: "Zml4dHVyZQ==" }));
+    const request = { sessionId: h.session.sessionId, taskId: h.session.taskId, runId: "two-file", idempotencyKey: "two-file",
+      startUrl: "https://example.test/upload", allowedOrigins: ["https://example.test"], keepTaskTab: true,
+      actions: [{ method: "page.uploadMultiple", params: { locator: { label: "File" }, files, confirmationLocator: { testId: "upload-ready" } } }] };
+    const result = await h.client.requestAuthorizedTransaction(request);
+    assert.equal(h.commands.filter(command => command.method === "page.uploadMultiple").length, 1);
+    assert.equal(result.upload_delivery.confirmation_files.length, 2);
+    assert.ok(result.upload_delivery.confirmation_files.every(file => /^[0-9a-f]{64}$/u.test(file.file_sha256)));
+    assert.ok(result.upload_delivery.confirmation_files.every(file => file.filename_locator.exact === true));
+    const exactFilenameReads = h.commands.filter(command => command.method === "page.query" && command.params.locator?.exact === true);
+    assert.ok(exactFilenameReads.length >= 2);
+    assert.ok(exactFilenameReads.every(command => command.params.locator.anyOf.some(part => part.within?.testId === "upload-ready")));
+    if (behavior === "accepted") {
+      assert.equal(result.result, "verified", JSON.stringify(result.exact_blocker));
+      assert.equal(result.upload_delivery.provider_submission_confirmed, false);
+      return;
+    }
+    assert.equal(result.result, "unknown_effect");
+    const lease = await h.client.request("lease.acquire", { sessionId: h.session.sessionId, tabId: result.tab.id });
+    const binding = { sessionId: h.session.sessionId, leaseId: lease.leaseId, tabId: result.tab.id,
+      taskId: h.session.taskId, runId: "two-file", idempotencyKey: "two-file", capsuleId: result.capsule.capsuleId };
+    const tab = h.liveTabs.get(result.tab.id);
+    h.liveTabs.set(tab.id, { ...tab, attachmentReady: true, text: "first.txt attachment is ready" });
+    await assert.rejects(h.client.requestInspectReconciliation({ ...binding, successQuery: "attachment is ready" }), { code: "upload_site_state_evidence_required" });
+    h.liveTabs.set(tab.id, { ...tab, attachmentReady: true, text: "first.txt.old second.txt attachment is ready" });
+    await assert.rejects(h.client.requestInspectReconciliation({ ...binding, successQuery: "attachment is ready" }), { code: "upload_site_state_evidence_required" });
+    h.liveTabs.set(tab.id, { ...tab, attachmentReady: true, filenameHidden: true, text: "first.txt second.txt attachment is ready" });
+    await assert.rejects(h.client.requestInspectReconciliation({ ...binding, successQuery: "attachment is ready" }), { code: "upload_site_state_evidence_required" });
+    h.liveTabs.set(tab.id, { ...tab, attachmentReady: true, text: "first.txt second.txt attachment is ready" });
+    h.liveTabs.set(tab.id, { ...h.liveTabs.get(tab.id), sharedAttachmentWitness: true });
+    await assert.rejects(h.client.requestInspectReconciliation({ ...binding, successQuery: "attachment is ready" }), { code: "upload_site_state_evidence_required" });
+    h.liveTabs.set(tab.id, { ...h.liveTabs.get(tab.id), sharedAttachmentWitness: false });
+    const readback = await h.client.requestInspectReconciliation({ ...binding, successQuery: "attachment is ready" });
+    assert.equal(readback.reconciliationProof.uploadFilesEvidence.length, 2);
+    const originalFlags = h.broker.taskLedger.get("two-file:1").externalActionExecuted;
+    h.liveTabs.set(tab.id, { ...h.liveTabs.get(tab.id), sharedAttachmentWitness: true });
+    await assert.rejects(h.client.requestCompleteReconciliation({ ...binding, reconciliationProof: readback.reconciliationProof }), { code: "upload_site_state_evidence_required" });
+    h.liveTabs.set(tab.id, { ...h.liveTabs.get(tab.id), sharedAttachmentWitness: false });
+    const settled = await h.client.requestCompleteReconciliation({ ...binding, reconciliationProof: readback.reconciliationProof });
+    assert.equal(settled.provider_success_confirmed, false);
+    assert.equal(settled.terminal_cleanup_ready, false);
+    assert.equal(settled.status, "upload_confirmation_observed");
+    assert.equal(h.broker.taskLedger.get("two-file:1").externalActionExecuted, originalFlags);
+    const capsule = h.broker.taskLedger.getTaskCapsule(result.capsule.capsuleId);
+    assert.equal(capsule.state, "failed"); assert.equal(capsule.retention.policy, "retain_until_resume");
+    assert.equal(capsule.effect.providerSuccessConfirmed, false);
+    const closed = await h.client.request("session.close", { sessionId: h.session.sessionId });
+    assert.ok(closed.cleanup_receipt.retained.some(item => item.tabId === tab.id));
+    assert.equal(h.liveTabs.has(tab.id), true);
+    assert.equal(h.commands.filter(command => command.method === "page.uploadMultiple").length, 1);
+  } finally { await h.close(); }
+});
+
+test("old upload capsule accepts exact original dual-HMAC evidence and rejects changed bytes before browser readback", async () => {
+  const h = await createCapsuleHarness({ uploadBehavior: "pending" });
+  try {
+    const result = await h.client.requestAuthorizedTransaction({ sessionId: h.session.sessionId, taskId: h.session.taskId,
+      runId: "legacy-upload", idempotencyKey: "legacy-upload", startUrl: "https://example.test/upload", allowedOrigins: ["https://example.test"], keepTaskTab: true,
+      actions: [{ method: "page.upload", params: { locator: { label: "File" }, file: { name: "test.txt", mimeType: "text/plain", size: 7, dataBase64: "Zml4dHVyZQ==" }, confirmationLocator: { testId: "upload-ready" } } }] });
+    const capsule = structuredClone(h.broker.taskLedger.getTaskCapsule(result.capsule.capsuleId));
+    delete capsule.effect.uploadDelivery.confirmation_files; await h.broker.taskLedger.putTaskCapsule(capsule);
+    const entry = h.broker.taskLedger.get("legacy-upload:1");
+    const originalUploadPayload = structuredClone(h.commands.find(command => command.method === "page.upload").params);
+    delete originalUploadPayload.companionContext;
+    const lease = await h.client.request("lease.acquire", { sessionId: h.session.sessionId, tabId: result.tab.id });
+    const binding = { sessionId: h.session.sessionId, leaseId: lease.leaseId, tabId: result.tab.id, taskId: h.session.taskId,
+      runId: "legacy-upload", idempotencyKey: "legacy-upload", capsuleId: capsule.capsuleId, successQuery: "attachment is ready" };
+    await assert.rejects(h.client.requestInspectReconciliation(binding), { code: "upload_original_payload_required" });
+    const proofInput = { ...binding, originalOperationKey: entry.idempotencyKey, originalOperationId: entry.operationId,
+      originalFingerprint: entry.fingerprint, originalUploadPayload, confirmationFiles: [{ filename: "test.txt", locator: { testId: "upload-ready" } }] };
+    for (const change of [{ originalUploadPayload: { ...originalUploadPayload, file: { ...originalUploadPayload.file, dataBase64: "Y2hhbmdlZA==" } } },
+      { originalOperationId: "foreign" }, { originalFingerprint: "caller-hash" }]) {
+      const before = h.commands.length;
+      await assert.rejects(h.client.requestInspectReconciliation({ ...proofInput, ...change }), { code: "upload_original_payload_invalid" });
+      assert.equal(h.commands.length, before);
+    }
+    const before = h.commands.length;
+    await assert.rejects(h.client.request("task.reconciliation.inspect", proofInput), { code: "authority_missing" });
+    assert.equal(h.commands.length, before);
+    const tab = h.liveTabs.get(result.tab.id);
+    h.liveTabs.set(tab.id, { ...tab, attachmentReady: true, text: "test.txt attachment is ready" });
+    const inspected = await h.client.requestInspectReconciliation(proofInput);
+    assert.equal(inspected.provider_success_confirmed, false);
+    const settled = await h.client.requestCompleteReconciliation({ ...binding, reconciliationProof: inspected.reconciliationProof });
+    assert.equal(settled.terminal_cleanup_ready, false);
+    const close = await h.client.request("session.close", { sessionId: h.session.sessionId, taskTerminal: true });
+    assert.ok(close.cleanup_receipt.closed.includes(tab.id));
+    assert.equal(h.commands.filter(command => command.method === "page.upload").length, 1);
+  } finally { await h.close(); }
+});
+
+test('signed upload readiness rejects filename-only proof and continues only unapplied remaining actions', async () => {
+  const harness = await createCapsuleHarness({ uploadBehavior: 'pending' });
+  const { client, session, liveTabs, broker } = harness;
+  try {
+    const result = await client.requestAuthorizedTransaction({ sessionId: session.sessionId,
+      taskId: 'capsule_task', runId: 'upload-resume', idempotencyKey: 'upload-resume',
+      startUrl: 'https://example.test/upload', allowedOrigins: ['https://example.test'], keepTaskTab: true,
+      actions: [{ method: 'page.upload', params: { locator: { label: 'File' }, file: { name: 'test.txt', mimeType: 'text/plain', dataBase64: 'Zml4dHVyZQ==', size: 7 }, confirmationLocator: { testId: 'upload-ready' } } },
+        { method: 'page.type', params: { locator: { testId: 'editor' }, text: 'remaining action' } }] });
+    assert.equal(result.result, 'unknown_effect');
+    assert.deepEqual(result.action_progress.applied_action_indices, [0]);
+    assert.deepEqual(result.action_progress.remaining_action_indices, [1]);
+    assert.equal(broker.taskLedger.getTaskCapsule(result.capsule.capsuleId).effect.uploadDelivery.applied, true);
+    liveTabs.set(result.tab.id, { ...liveTabs.get(result.tab.id), attachmentReady: true, text: 'test.txt attachment is ready' });
+    const lease = await client.request('lease.acquire', { sessionId: session.sessionId, tabId: result.tab.id });
+    const binding = { sessionId: session.sessionId, leaseId: lease.leaseId, tabId: result.tab.id,
+      taskId: 'capsule_task', runId: 'upload-resume', idempotencyKey: 'upload-resume', capsuleId: result.capsule.capsuleId };
+    await assert.rejects(client.requestInspectReconciliation({ ...binding, successQuery: 'test.txt' }), { code: 'upload_site_state_evidence_required' });
+    const inspected = await client.requestInspectReconciliation({ ...binding, successQuery: 'attachment is ready' });
+    assert.equal(inspected.proof_kind, 'upload_site_confirmation');
+    assert.equal(inspected.provider_success_confirmed, false);
+    const completed = await client.requestCompleteReconciliation({ ...binding, reconciliationProof: inspected.reconciliationProof });
+    assert.equal(completed.status, 'ready_to_resume');
+    assert.equal(completed.provider_success_confirmed, false);
+    assert.deepEqual(completed.action_progress.remaining_action_indices, [1]);
+    const resume = await client.requestPrepareResume({ sessionId: session.sessionId, taskId: 'capsule_task', runId: 'upload-resume', capsuleId: result.capsule.capsuleId });
+    assert.equal(resume.resume_ready, true);
+    assert.deepEqual(resume.action_progress.remaining_action_indices, [1]);
+    assert.equal(harness.commands.filter(command => command.method === 'page.upload').length, 1);
+    assert.equal(harness.commands.filter(command => command.method === 'page.type').length, 0);
   } finally { await harness.close(); }
 });
 
@@ -3769,5 +5106,572 @@ test("transaction reuses one inspection only when its extension token supports a
     assert.equal(clicks.length, 1);
     assert.equal(clicks[0].params.semanticGuardId, `fresh-${clicks[0].params.tabId}-1`);
     assert.notEqual(clicks[0].params.semanticGuardId, 'caller-token-must-not-be-trusted');
+  } finally { await harness.close(); }
+});
+
+const disposalSource = Object.freeze({
+  taskId: '01a106b1-2e41-7093-b639-dfce60fdf22b', runId: 'heavy-model-desktop-parity-new-20261005',
+  profileInstanceId: 'profile_37fd31b6-ed53-4a35-8604-ab92ffbab05a', generation: 'gen_62542f46-232b-4ad4-94f2-38f1456e1bf9',
+  sessionId: 'session_3553c4d5-3ba1-4ae1-bccf-8a511e6d4ae8', tabId: 1980936256,
+  pageInstanceId: 'chrome-document:276C41EB36EEF86C4FD3FC33E6419E3D', windowId: 1980934932, frameId: 0,
+  origin: 'https://jp.linkaigc.com', url: 'https://jp.linkaigc.com/model-library/model-custom-form',
+  operationId: 'op_56cf952d-9447-4b16-875a-ca4476d26eda', operationKey: 'light-parity-1280-restore-once:1',
+  capsuleId: 'capsule_41a03eae-b3a8-42ee-9882-0a6e6e171104',
+});
+
+async function retainedDisposalHarness(fault = null) {
+  const source = disposalSource;
+  let harness, closed = false;
+  harness = await createCapsuleHarness({ interceptCommand: ({ message, extension }) => {
+    if (message.method === 'page.snapshot' && message.params.tabId === source.tabId) {
+      if (fault === 'late-pinned') harness.liveTabs.get(source.tabId).pinned = true;
+      if (fault === 'late-active') harness.liveTabs.get(source.tabId).active = true;
+      if (fault === 'late-group') {
+        harness.liveTabs.get(source.tabId).groupId = 7;
+        harness.liveTabs.set(55, { id: 55, windowId: source.windowId, url: source.url, active: true, groupId: 7 });
+      }
+      if (fault === 'late-window') harness.liveTabs.get(source.tabId).windowId = source.windowId + 1;
+      if (fault === 'snapshot-auth') {
+        const pending = harness.broker.pendingOperations.get(message.operationId);
+        const timeout = pending.timer._onTimeout;
+        clearTimeout(pending.timer);
+        extension.send({ kind: 'command.result', operationId: message.operationId, binding: { generation: 'foreign-generation' }, result: {} });
+        setTimeout(timeout, 5);
+        return true;
+      }
+      const snapshot = mergeSemanticSnapshotResults([{ frameId: 0, result: {
+        url: fault === 'snapshot-url' ? `${source.url}?foreign=1` : source.url,
+        title: 'retained', text: 'baseline 713x636 dpr2', readyState: 'complete', controls: [],
+        pageInstanceId: fault === 'document' ? 'foreign-document' : source.pageInstanceId,
+      } }], message.params.maxTextChars);
+      extension.send({ kind: 'command.result', operationId: message.operationId, result: snapshot });
+      return true;
+    }
+    if (message.method === 'tabs.close') {
+      closed = true;
+      if (fault !== 'present') harness.liveTabs.delete(source.tabId);
+      extension.send({ kind: 'command.result', operationId: message.operationId, result: fault === 'ack'
+        ? { closed: true, tabId: source.tabId } : { closed: true, closedExpected: true, tabId: source.tabId } });
+      return true;
+    }
+    if (message.method === 'tabs.list' && closed && ['capped', 'inventory-failed', 'duplicate', 'malformed'].includes(fault)) {
+      if (fault === 'inventory-failed') extension.send({ kind: 'command.error', operationId: message.operationId,
+        error: { code: 'inventory_failed', message: 'Synthetic inventory failure' } });
+      else extension.send({ kind: 'command.result', operationId: message.operationId, result: fault === 'capped'
+        ? Array.from({ length: 200 }, (_, i) => ({ id: i + 1, windowId: source.windowId }))
+        : fault === 'duplicate' ? [{ id: 1, windowId: 1 }, { id: 1, windowId: 1 }] : [{ id: 1 }] });
+      return true;
+    }
+    return false;
+  } });
+  await harness.attachExtension(source.profileInstanceId);
+  const session = await harness.client.request('session.open', { profileInstanceId: source.profileInstanceId, taskId: source.taskId });
+  harness.broker.profiles.get(source.profileInstanceId).generation = source.generation;
+  harness.broker.sessions.get(session.sessionId).generation = source.generation;
+  session.generation = source.generation;
+  harness.session = session;
+  const target = { taskId: source.taskId, sessionId: source.sessionId, leaseId: null,
+    profileInstanceId: source.profileInstanceId, generation: source.generation, tabId: source.tabId,
+    pageInstanceId: source.pageInstanceId, windowId: source.windowId, frameId: 0, origin: source.origin };
+  const binding = { ...source, method: 'page.configureViewport', ownerKey: source.sessionId,
+    targetIdentity: target, targetFingerprint: targetIdentityDigest(harness.broker.ledgerSecret, target) };
+  await harness.broker.taskLedger.prepare({ idempotencyKey: source.operationKey, binding, fingerprint: 'original-restore-fingerprint' });
+  await harness.broker.taskLedger.transition(source.operationKey, 'dispatched', { operationId: source.operationId, dispatchCount: 1 });
+  await harness.broker.taskLedger.transition(source.operationKey, 'unknown_effect', { effectState: 'unknown_effect',
+    effectClass: 'local_ui', dispatchCount: 1, mutationDispatchAttempted: true });
+  const capsule = normalizeTaskExecutionCapsule({ capsuleId: source.capsuleId }, {
+    taskId: source.taskId, runId: source.runId, startUrl: source.url, allowedOrigins: [source.origin],
+    profileInstanceId: source.profileInstanceId, generation: source.generation, sessionId: source.sessionId,
+    idempotencyKey: 'light-parity-1280-restore-once' });
+  const capsuleTarget = { ...target };
+  delete capsuleTarget.taskId; // Real capsule target schema owns taskId only at capsule top level.
+  Object.assign(capsule, { state: 'failed', resumeToken: null,
+    target: { ...capsule.target, ...capsuleTarget, intendedUrl: source.url }, resources: { ...capsule.resources, tabId: source.tabId },
+    effect: { ...capsule.effect, failedOperationId: source.operationId, failedOperationKey: source.operationKey,
+      idempotencyKey: 'light-parity-1280-restore-once', effectState: 'unknown_effect', effectClass: 'local_ui' },
+    retention: { ...capsule.retention, reason: 'local_ui_effect_unknown', policy: 'retain_until_resume', userHelpRequired: false } });
+  await harness.broker.taskLedger.putTaskCapsule(capsule);
+  const repairedSessionId = 'session_d95519d6-31cf-431c-8669-a5da43cd306f';
+  const repairedTarget = { ...target, sessionId: repairedSessionId };
+  const tab = { taskId: source.taskId, runId: source.runId, sessionId: repairedSessionId,
+    identityRepairReason: 'same_task_fresh_lease',
+    profileInstanceId: source.profileInstanceId, generation: source.generation, tabId: source.tabId,
+    capsuleId: source.capsuleId, windowId: source.windowId, lifecycleState: 'failed',
+    retentionReason: 'local_ui_effect_unknown', retentionPolicy: 'retain_until_resume', resumeToken: null,
+    userHelpRequired: false, quarantine: null, targetIdentity: repairedTarget,
+    targetFingerprint: targetIdentityDigest(harness.broker.ledgerSecret, repairedTarget) };
+  await harness.broker.taskLedger.recordTaskTab(tab);
+  harness.broker.taskTabs.set(`${source.profileInstanceId}:${source.tabId}`, harness.broker.taskLedger.getTaskTab(source.profileInstanceId, source.tabId));
+  harness.liveTabs.set(source.tabId, { id: source.tabId, windowId: source.windowId, url: source.url, pinned: fault === 'pinned', active: false });
+  harness.request = overrides => harness.client.requestCleanupTaskTabs({ sessionId: session.sessionId,
+    taskId: source.taskId, runId: source.runId, preserveTabIds: [], dryRun: false,
+    idempotencyKey: 'heavy-owned-cleanup-disposal-execute-rev3-once', ...overrides });
+  return harness;
+}
+
+
+test('cleanup disposal uses original generation and baseline operation schema without public contract changes', async () => {
+  const { OPERATION_SCHEMA_DIGEST, AUTHORIZED_TRANSACTION_METHODS } = await import('../src/shared/operation-schema.mjs');
+  const generated = await import('../extension/operation-schema.generated.js');
+  assert.equal(OPERATION_SCHEMA_DIGEST, generated.OPERATION_SCHEMA_DIGEST);
+  assert.equal(AUTHORIZED_TRANSACTION_METHODS.includes('tabs.close'), false);
+});
+
+test('cleanup disposal dry-run reads reasons with zero mutations and no original ledger changes', async () => {
+  const h = await retainedDisposalHarness();
+  try {
+    const before = { operation: structuredClone(h.broker.taskLedger.get(disposalSource.operationKey)),
+      capsule: structuredClone(h.broker.taskLedger.getTaskCapsule(disposalSource.capsuleId)),
+      tab: structuredClone(h.broker.taskLedger.getTaskTab(disposalSource.profileInstanceId, disposalSource.tabId)),
+      operationCount: h.broker.taskLedger.listOperations().length };
+    const preview = await h.request({ idempotencyKey: 'heavy-owned-cleanup-disposal-preview-rev3-once', dryRun: true });
+    assert.equal(preview.dry_run, true);
+    assert.deepEqual(preview.candidates, [disposalSource.tabId]);
+    assert.deepEqual(preview.closed, []);
+    assert.deepEqual(h.commands.map(c => c.method), ['tabs.list']);
+    assert.deepEqual(h.broker.taskLedger.get(disposalSource.operationKey), before.operation);
+    assert.deepEqual(h.broker.taskLedger.getTaskCapsule(disposalSource.capsuleId), before.capsule);
+    assert.deepEqual(h.broker.taskLedger.getTaskTab(disposalSource.profileInstanceId, disposalSource.tabId), before.tab);
+    assert.equal(h.broker.taskLedger.listOperations().length, before.operationCount);
+  } finally { await h.close(); }
+});
+
+test('cleanup disposal closes once on maintenance authority with authenticated absence and original unknown preserved', async () => {
+  const h = await retainedDisposalHarness();
+  try {
+    const source = disposalSource, original = structuredClone(h.broker.taskLedger.get(source.operationKey)),
+      capsule = structuredClone(h.broker.taskLedger.getTaskCapsule(source.capsuleId));
+    const otherIdentity = { ...h.broker.taskLedger.getTaskTab(source.profileInstanceId, source.tabId).targetIdentity,
+      tabId: 99, pageInstanceId: 'other-document', sessionId: null };
+    const other = { taskId: source.taskId, runId: source.runId, profileInstanceId: source.profileInstanceId,
+      generation: source.generation, sessionId: null, tabId: 99, windowId: source.windowId,
+      lifecycleState: 'completed', retentionPolicy: 'cleanup', targetIdentity: otherIdentity,
+      targetFingerprint: targetIdentityDigest(h.broker.ledgerSecret, otherIdentity) };
+    await h.broker.taskLedger.recordTaskTab(other);
+    h.broker.taskTabs.set(`${source.profileInstanceId}:99`, h.broker.taskLedger.getTaskTab(source.profileInstanceId, 99));
+    h.liveTabs.set(99, { id: 99, url: source.url, windowId: source.windowId, active: false, pinned: false });
+    // Also ensure this scoped branch never prunes an ordinary missing record.
+    await h.broker.taskLedger.recordTaskTab({ ...other, tabId: 98, targetIdentity: { ...otherIdentity, tabId: 98 },
+      targetFingerprint: targetIdentityDigest(h.broker.ledgerSecret, { ...otherIdentity, tabId: 98 }) });
+    const result = await h.request();
+    assert.deepEqual(result.closed, [source.tabId], JSON.stringify(result));
+    assert.deepEqual(result.collapsed, []);
+    assert.deepEqual(result.missing, []);
+    assert.equal(h.commands.filter(c => c.method === 'tabs.close').length, 1);
+    assert.deepEqual(h.commands.map(c => c.method), ['tabs.list', 'page.snapshot', 'tabs.list', 'tabs.close', 'tabs.list']);
+    assert.equal(h.commands.filter(c => c.method === 'page.configureViewport').length, 0);
+    assert.equal(h.liveTabs.has(99), true);
+    assert.ok(h.broker.taskLedger.getTaskTab(source.profileInstanceId, 98));
+    assert.deepEqual(h.broker.taskLedger.get(source.operationKey), original);
+    assert.deepEqual(h.broker.taskLedger.getTaskCapsule(source.capsuleId), capsule);
+    const command = h.commands.find(c => c.method === 'tabs.close');
+    assert.equal(command.authority.method, 'maintenance.tabs.cleanup');
+    assert.equal(command.authority.intent, 'cleanup_task_tabs');
+    assert.equal(command.authority.targetOrigin, '*');
+    const { signature, ...payload } = result.disposal_receipt;
+    assert.equal(signature, payloadDigest(h.broker.ledgerSecret, payload));
+    assert.equal(payload.closeOperationKey, 'heavy-owned-cleanup-disposal-execute-rev3-once:1980936256');
+    assert.equal(payload.originalSource.operationKey, source.operationKey);
+    assert.equal(payload.absence.inventoryEvidence.brokerEvidence, true);
+    assert.equal(payload.absence.exactTargetAbsent, true);
+    assert.deepEqual(payload.absence.inventoryParams, {});
+    assert.equal(payload.absence.inventoryCap, 200);
+    assert.equal(payload.originalAcknowledgementClaimed, false);
+    assert.equal(payload.viewportRestoreClaimed, false);
+    assert.equal(payload.cancellationClaimed, false);
+  } finally { await h.close(); }
+});
+
+for (const fault of ['ack', 'capped', 'inventory-failed', 'present', 'duplicate', 'malformed']) test(`cleanup disposal ${fault} rejects success and prevents repeated close with original history immutable`, async () => {
+  const h = await retainedDisposalHarness(fault);
+  try {
+    const original = structuredClone(h.broker.taskLedger.get(disposalSource.operationKey)),
+      capsule = structuredClone(h.broker.taskLedger.getTaskCapsule(disposalSource.capsuleId));
+    const result = await h.request();
+    assert.deepEqual(result.closed, []);
+    assert.equal(result.unknown_effect.length, 1, JSON.stringify(result));
+    assert.equal(result.unknown_effect[0].replay_allowed, false);
+    assert.equal(result.disposal_receipt, undefined);
+    assert.equal(h.commands.filter(c => c.method === 'tabs.close').length, 1);
+    assert.deepEqual(h.broker.taskLedger.get(disposalSource.operationKey), original);
+    assert.deepEqual(h.broker.taskLedger.getTaskCapsule(disposalSource.capsuleId), capsule);
+    assert.ok(h.broker.taskLedger.getTaskTab(disposalSource.profileInstanceId, disposalSource.tabId));
+    const before = h.commands.length;
+    const repeated = await h.request();
+    assert.ok(repeated.preserved[0].reasons.includes('disposal_reconciliation_required'));
+    assert.equal(h.commands.length, before);
+    await assert.rejects(h.request({ idempotencyKey: 'heavy-owned-cleanup-disposal-execute-new-key' }), { code: 'owned_cleanup_disposal_key_invalid' });
+    assert.equal(h.commands.length, before);
+  } finally { await h.close(); }
+});
+
+for (const fault of ['foreign-task', 'wrong-run', 'generation', 'profile', 'foreign-lease', 'own-lease', 'live-owner', 'restore-id', 'restore-key', 'SET', 'retention', 'pinned', 'active-tab', 'active-group', 'user-help', 'resume', 'quarantine', 'broker-active', 'broker-queue', 'document', 'origin', 'explicit-preserve']) test(`cleanup disposal preserves ${fault} with zero mutations`, async () => {
+  const h = await retainedDisposalHarness(fault);
+  try {
+    const source = disposalSource, broker = h.broker;
+    const tab = broker.taskLedger.getTaskTab(source.profileInstanceId, source.tabId);
+    const operation = broker.taskLedger.get(source.operationKey);
+    const overrides = {};
+    if (fault === 'foreign-task') { tab.taskId = 'foreign'; tab.targetIdentity.taskId = 'foreign'; tab.targetFingerprint = targetIdentityDigest(broker.ledgerSecret, tab.targetIdentity); }
+    if (fault === 'wrong-run') overrides.runId = 'wrong-run';
+    if (fault === 'generation') tab.generation = 'foreign-generation';
+    if (fault === 'profile') tab.profileInstanceId = 'foreign-profile';
+    if (fault === 'restore-id') operation.operationId = 'op_other';
+    if (fault === 'restore-key') operation.idempotencyKey = 'restore-once:99';
+    if (fault === 'SET') operation.binding.method = 'page.configureViewport.SET';
+    if (fault === 'retention') tab.retentionReason = 'ai_reconciliation_pending';
+    if (fault === 'user-help') tab.userHelpRequired = true;
+    if (fault === 'resume') tab.resumeToken = 'protected-resume';
+    if (fault === 'quarantine') tab.quarantine = 'stale_generation';
+    if (fault === 'active-tab') h.liveTabs.get(source.tabId).active = true;
+    if (fault === 'active-group') { h.liveTabs.get(source.tabId).groupId = 7; h.liveTabs.set(55, { id: 55, windowId: source.windowId, url: source.url, active: true, groupId: 7 }); }
+    if (fault === 'origin') h.liveTabs.get(source.tabId).url = 'https://foreign.test/';
+    if (fault === 'explicit-preserve') overrides.preserveTabIds = [source.tabId];
+    if (['foreign-lease', 'own-lease'].includes(fault)) {
+      const leaseId = 'fixture-protected-lease';
+      broker.leases.set(leaseId, { leaseId, sessionId: fault === 'foreign-lease' ? 'foreign' : h.session.sessionId,
+        profileInstanceId: source.profileInstanceId, generation: source.generation, tabId: source.tabId });
+      broker.tabLeaseIndex.set(`${source.profileInstanceId}:${source.tabId}`, leaseId);
+    }
+    if (fault === 'live-owner') broker.sessions.set(source.sessionId, { generation: source.generation });
+    if (fault === 'broker-active') broker.pendingOperations.set('fixture-active', { operationId: source.operationId, profileInstanceId: source.profileInstanceId, binding: { tabId: source.tabId } });
+    if (fault === 'broker-queue') broker.operationQueues.set(`tab:${source.profileInstanceId}:${source.tabId}`, Promise.resolve());
+    const result = await h.request(overrides).catch(error => ({ preserved: [{ reasons: [error.code] }] }));
+    assert.ok(result.preserved.length > 0, JSON.stringify(result));
+    assert.ok(h.commands.every(c => ['tabs.list', 'page.snapshot'].includes(c.method)), JSON.stringify(h.commands));
+    broker.pendingOperations.delete('fixture-active'); broker.operationQueues.delete(`tab:${source.profileInstanceId}:${source.tabId}`); broker.sessions.delete(source.sessionId);
+  } finally { await h.close(); }
+});
+
+test('cleanup disposal rejects wrong key/dry-run binding and invalid maintenance authority before dispatch', async () => {
+  const h = await retainedDisposalHarness();
+  try {
+    for (const overrides of [
+      { idempotencyKey: 'heavy-owned-cleanup-disposal-preview-rev3-once', dryRun: false },
+      { idempotencyKey: 'heavy-owned-cleanup-disposal-execute-rev3-once', dryRun: true },
+      { idempotencyKey: 'unrelated-key' },
+    ]) {
+      const before = h.commands.length;
+      await assert.rejects(h.request(overrides), { code: 'owned_cleanup_disposal_key_invalid' });
+      assert.equal(h.commands.length, before);
+    }
+    const before = h.commands.length;
+    await assert.rejects(h.client.request('maintenance.tabs.cleanup', { sessionId: h.session.sessionId,
+      taskId: disposalSource.taskId, runId: disposalSource.runId, preserveTabIds: [], dryRun: false }));
+    assert.equal(h.commands.length, before);
+  } finally { await h.close(); }
+});
+
+for (const fault of ['late-pinned', 'late-active', 'late-group']) test(`cleanup disposal rechecks ${fault} immediately before close with zero mutations`, async () => {
+  const h = await retainedDisposalHarness(fault);
+  try {
+    const original = structuredClone(h.broker.taskLedger.get(disposalSource.operationKey));
+    const capsule = structuredClone(h.broker.taskLedger.getTaskCapsule(disposalSource.capsuleId));
+    const result = await h.request();
+    assert.deepEqual(result.closed, []);
+    assert.equal(result.skipped[0].reason, 'owned_cleanup_disposal_protected');
+    assert.equal(h.commands.filter(c => c.method === 'tabs.close').length, 0);
+    assert.deepEqual(h.commands.map(c => c.method), ['tabs.list', 'page.snapshot', 'tabs.list']);
+    assert.deepEqual(h.broker.taskLedger.get(disposalSource.operationKey), original);
+    assert.deepEqual(h.broker.taskLedger.getTaskCapsule(disposalSource.capsuleId), capsule);
+  } finally { await h.close(); }
+});
+
+test('cleanup disposal rejects signed foreign owner, wrong method and changed payload before ANY dispatch', async () => {
+  const h = await retainedDisposalHarness();
+  try {
+    const payload = { taskId: disposalSource.taskId, runId: disposalSource.runId, preserveTabIds: [], dryRun: false };
+    for (const patch of [{ ownerKey: 'foreign-owner' }, { method: 'task.transaction' }, { payload: { ...payload, preserveTabIds: [disposalSource.tabId] } }]) {
+      const authority = createAuthorityEnvelope({ issuer: 'codex_mcp', secret: 'capsule-integration-issuer',
+        taskId: disposalSource.taskId, runId: disposalSource.runId, ownerKey: h.session.sessionId,
+        method: 'maintenance.tabs.cleanup', intent: 'cleanup_task_tabs', targetOrigin: '*',
+        idempotencyKey: 'heavy-owned-cleanup-disposal-execute-rev3-once', payload, approved: true, ...patch });
+      const before = h.commands.length;
+      await assert.rejects(h.client.request('maintenance.tabs.cleanup', { ...payload, sessionId: h.session.sessionId, authority }));
+      assert.equal(h.commands.length, before);
+    }
+  } finally { await h.close(); }
+});
+
+test('cleanup disposal missing-target preview preserves all history and does not prune a task tab', async () => {
+  const h = await retainedDisposalHarness();
+  try {
+    h.liveTabs.delete(disposalSource.tabId);
+    const original = structuredClone(h.broker.taskLedger.get(disposalSource.operationKey));
+    const capsule = structuredClone(h.broker.taskLedger.getTaskCapsule(disposalSource.capsuleId));
+    const tab = structuredClone(h.broker.taskLedger.getTaskTab(disposalSource.profileInstanceId, disposalSource.tabId));
+    const preview = await h.request({ idempotencyKey: 'heavy-owned-cleanup-disposal-preview-rev3-once', dryRun: true });
+    assert.deepEqual(preview.preserved[0].reasons, ['exact_target_missing']);
+    assert.deepEqual(preview.missing, []);
+    assert.deepEqual(h.commands.map(c => c.method), ['tabs.list']);
+    assert.deepEqual(h.broker.taskLedger.get(disposalSource.operationKey), original);
+    assert.deepEqual(h.broker.taskLedger.getTaskCapsule(disposalSource.capsuleId), capsule);
+    assert.deepEqual(h.broker.taskLedger.getTaskTab(disposalSource.profileInstanceId, disposalSource.tabId), tab);
+  } finally { await h.close(); }
+});
+
+test('cleanup lineage evolved-session preview and execution preserve the original old-session unknown bindings', async () => {
+  const h = await retainedDisposalHarness();
+  try {
+    const original = structuredClone(h.broker.taskLedger.get(disposalSource.operationKey));
+    const capsule = structuredClone(h.broker.taskLedger.getTaskCapsule(disposalSource.capsuleId));
+    const tab = structuredClone(h.broker.taskLedger.getTaskTab(disposalSource.profileInstanceId, disposalSource.tabId));
+    assert.equal(tab.sessionId, 'session_d95519d6-31cf-431c-8669-a5da43cd306f');
+    assert.equal(tab.targetIdentity.sessionId, tab.sessionId);
+    assert.equal(tab.identityRepairReason, 'same_task_fresh_lease');
+    assert.equal(taskTabIdentityConsistent(h.broker.ledgerSecret, tab), true);
+    assert.equal(original.binding.sessionId, disposalSource.sessionId);
+    assert.equal(capsule.target.sessionId, disposalSource.sessionId);
+    assert.equal(Object.hasOwn(capsule.target, 'taskId'), false);
+    assert.equal(capsule.taskId, disposalSource.taskId);
+    assert.equal(capsule.runId, disposalSource.runId);
+    const preview = await h.request({ idempotencyKey: 'heavy-owned-cleanup-disposal-preview-rev3-once', dryRun: true });
+    assert.deepEqual(preview.candidates, [disposalSource.tabId]);
+    assert.deepEqual(preview.closed, []);
+    assert.deepEqual(h.broker.taskLedger.getTaskTab(disposalSource.profileInstanceId, disposalSource.tabId), tab);
+    const result = await h.request();
+    assert.deepEqual(result.closed, [disposalSource.tabId]);
+    assert.equal(h.commands.filter(c => c.method === 'tabs.close').length, 1);
+    assert.equal(h.commands.filter(c => c.method === 'page.configureViewport').length, 0);
+    assert.deepEqual(h.broker.taskLedger.get(disposalSource.operationKey), original);
+    assert.deepEqual(h.broker.taskLedger.getTaskCapsule(disposalSource.capsuleId), capsule);
+  } finally { await h.close(); }
+});
+
+for (const fault of ['wrong-session', 'old-session', 'repair-reason', 'bad-signature', 'target-document', 'target-generation', 'original-session', 'capsule-session', 'repaired-live-owner']) test(`cleanup lineage rejects ${fault} without any dispatch`, async () => {
+  const h = await retainedDisposalHarness();
+  try {
+    const broker = h.broker, source = disposalSource;
+    const tab = broker.taskLedger.getTaskTab(source.profileInstanceId, source.tabId);
+    if (['wrong-session', 'old-session'].includes(fault)) {
+      tab.sessionId = fault === 'wrong-session' ? 'session_arbitrary' : source.sessionId;
+      tab.targetIdentity.sessionId = tab.sessionId;
+      tab.targetFingerprint = targetIdentityDigest(broker.ledgerSecret, tab.targetIdentity);
+    }
+    if (fault === 'repair-reason') tab.identityRepairReason = 'unapproved_repair';
+    if (fault === 'bad-signature') tab.targetFingerprint = 'invalid-fingerprint';
+    if (fault === 'target-document') {
+      tab.targetIdentity.pageInstanceId = 'foreign-document';
+      tab.targetFingerprint = targetIdentityDigest(broker.ledgerSecret, tab.targetIdentity);
+    }
+    if (fault === 'target-generation') {
+      tab.generation = 'generation-other'; tab.targetIdentity.generation = tab.generation;
+      tab.targetFingerprint = targetIdentityDigest(broker.ledgerSecret, tab.targetIdentity);
+    }
+    if (fault === 'original-session') broker.taskLedger.get(source.operationKey).binding.sessionId = tab.sessionId;
+    if (fault === 'capsule-session') broker.taskLedger.getTaskCapsule(source.capsuleId).target.sessionId = tab.sessionId;
+    if (fault === 'repaired-live-owner') broker.sessions.set(tab.sessionId, { generation: source.generation });
+    const before = h.commands.length;
+    const result = await h.request({ idempotencyKey: 'heavy-owned-cleanup-disposal-preview-rev3-once', dryRun: true });
+    assert.deepEqual(result.candidates, []);
+    assert.ok(result.preserved[0].reasons.includes(fault === 'repaired-live-owner' ? 'live_owner_session' : 'original_restore_tuple_mismatch'));
+    assert.equal(h.commands.length, before);
+    if (fault === 'repaired-live-owner') broker.sessions.delete(tab.sessionId);
+  } finally { await h.close(); }
+});
+
+test('cleanup lineage rejects the consumed original preview key while preserving the unattempted execute key', async () => {
+  const h = await retainedDisposalHarness();
+  try {
+    await assert.rejects(h.request({ idempotencyKey: 'heavy-owned-cleanup-disposal-preview-once', dryRun: true }), { code: 'owned_cleanup_disposal_key_invalid' });
+    assert.equal(h.commands.length, 0);
+    const result = await h.request();
+    assert.deepEqual(result.closed, [disposalSource.tabId]);
+    assert.equal(result.disposal_receipt.closeOperationKey, 'heavy-owned-cleanup-disposal-execute-rev3-once:1980936256');
+  } finally { await h.close(); }
+});
+
+for (const fault of ['capsule-task', 'capsule-run', 'original-task', 'original-run', 'original-identity-task']) test(`cleanup lineage rejects ${fault} with actual capsule schema before ANY dispatch`, async () => {
+  const h = await retainedDisposalHarness();
+  try {
+    const source = disposalSource;
+    const capsule = h.broker.taskLedger.getTaskCapsule(source.capsuleId);
+    const original = h.broker.taskLedger.get(source.operationKey);
+    assert.equal(Object.hasOwn(capsule.target, 'taskId'), false);
+    if (fault === 'capsule-task') capsule.taskId = 'foreign-task';
+    if (fault === 'capsule-run') capsule.runId = 'foreign-run';
+    if (fault === 'original-task') original.binding.taskId = 'foreign-task';
+    if (fault === 'original-run') original.binding.runId = 'foreign-run';
+    if (fault === 'original-identity-task') original.binding.targetIdentity.taskId = 'foreign-task';
+    const before = h.commands.length;
+    const preview = await h.request({ idempotencyKey: 'heavy-owned-cleanup-disposal-preview-rev3-once', dryRun: true });
+    assert.deepEqual(preview.candidates, []);
+    assert.ok(preview.preserved[0].reasons.includes('original_restore_tuple_mismatch'));
+    assert.equal(h.commands.length, before);
+  } finally { await h.close(); }
+});
+
+test('cleanup snapshot real semantic merge without windowId passes with exact inventory window and original history preserved', async () => {
+  const h = await retainedDisposalHarness();
+  try {
+    const source = disposalSource;
+    const sample = mergeSemanticSnapshotResults([{ frameId: 0, result: { url: source.url, title: 'retained',
+      readyState: 'complete', text: 'baseline', controls: [], pageInstanceId: source.pageInstanceId } }]);
+    assert.equal(Object.hasOwn(sample, 'windowId'), false);
+    assert.equal(sample.pageInstanceId, source.pageInstanceId);
+    const original = structuredClone(h.broker.taskLedger.get(source.operationKey));
+    const capsule = structuredClone(h.broker.taskLedger.getTaskCapsule(source.capsuleId));
+    const preview = await h.request({ idempotencyKey: 'heavy-owned-cleanup-disposal-preview-rev3-once', dryRun: true });
+    assert.deepEqual(preview.candidates, [source.tabId]);
+    const result = await h.request();
+    assert.deepEqual(result.closed, [source.tabId]);
+    assert.equal(result.disposal_receipt.closeOperationKey, 'heavy-owned-cleanup-disposal-execute-rev3-once:1980936256');
+    assert.equal(h.commands.filter(c => c.method === 'tabs.close').length, 1);
+    assert.equal(h.commands.filter(c => c.method === 'page.configureViewport').length, 0);
+    assert.deepEqual(h.broker.taskLedger.get(source.operationKey), original);
+    assert.deepEqual(h.broker.taskLedger.getTaskCapsule(source.capsuleId), capsule);
+  } finally { await h.close(); }
+});
+
+for (const fault of ['initial-window', 'late-window', 'document', 'snapshot-url', 'snapshot-auth']) test(`cleanup snapshot rejects ${fault} with zero close dispatch and immutable original unknown`, async () => {
+  const h = await retainedDisposalHarness(fault);
+  try {
+    const source = disposalSource;
+    if (fault === 'initial-window') h.liveTabs.get(source.tabId).windowId = source.windowId + 1;
+    const original = structuredClone(h.broker.taskLedger.get(source.operationKey));
+    const capsule = structuredClone(h.broker.taskLedger.getTaskCapsule(source.capsuleId));
+    const result = await h.request().catch(error => ({ read_error: error.code }));
+    assert.deepEqual(result.closed ?? [], []);
+    assert.equal(h.commands.filter(c => c.method === 'tabs.close').length, 0);
+    assert.equal(h.commands.filter(c => c.method === 'page.configureViewport').length, 0);
+    assert.deepEqual(h.broker.taskLedger.get(source.operationKey), original);
+    assert.deepEqual(h.broker.taskLedger.getTaskCapsule(source.capsuleId), capsule);
+    if (fault === 'initial-window') assert.ok(result.preserved[0].reasons.includes('live_target_tuple_mismatch'));
+    if (fault === 'late-window') assert.equal(result.skipped[0].reason, 'owned_cleanup_disposal_protected');
+    if (['document', 'snapshot-url'].includes(fault)) assert.deepEqual(result.preserved[0].reasons, ['live_document_mismatch']);
+    if (fault === 'snapshot-auth') assert.ok(result.read_error);
+  } finally { await h.close(); }
+});
+
+test('cleanup snapshot refuses prior rev2 preview/execute keys before ANY dispatch', async () => {
+  const h = await retainedDisposalHarness();
+  try {
+    for (const overrides of [
+      { idempotencyKey: 'heavy-owned-cleanup-disposal-preview-rev2-once', dryRun: true },
+      { idempotencyKey: 'heavy-owned-cleanup-disposal-execute-once', dryRun: false },
+    ]) {
+      await assert.rejects(h.request(overrides), { code: 'owned_cleanup_disposal_key_invalid' });
+      assert.equal(h.commands.length, 0);
+    }
+  } finally { await h.close(); }
+});
+
+test('cleanup snapshot prior unresolved disposal blocks rev3 regardless of its older key', async () => {
+  const h = await retainedDisposalHarness();
+  try {
+    const source = disposalSource, oldKey = 'heavy-owned-cleanup-disposal-execute-once:1980936256';
+    await h.broker.taskLedger.prepare({ idempotencyKey: oldKey, fingerprint: 'older-unresolved-close', binding: {
+      taskId: source.taskId, runId: source.runId, profileInstanceId: source.profileInstanceId,
+      generation: source.generation, tabId: source.tabId, method: 'tabs.close', ownedCleanupDisposal: true } });
+    await h.broker.taskLedger.transition(oldKey, 'dispatched', { dispatchCount: 1, operationId: 'fixture-prior-close' });
+    await h.broker.taskLedger.transition(oldKey, 'unknown_effect', { effectState: 'unknown_effect' });
+    const previous = structuredClone(h.broker.taskLedger.get(oldKey));
+    const before = h.commands.length;
+    const result = await h.request();
+    assert.ok(result.preserved[0].reasons.includes('disposal_reconciliation_required'));
+    assert.equal(h.commands.length, before);
+    assert.deepEqual(h.broker.taskLedger.get(oldKey), previous);
+  } finally { await h.close(); }
+});
+
+
+test("a renamed upload is confirmed when the upload list grows, without a filename", async () => {
+  const harness = await createCapsuleHarness({ uploadBehavior: "accepted-renamed" });
+  try {
+    const file = { name: "okinawa-banyan.png", mimeType: "image/png", dataBase64: Buffer.from("fixture").toString("base64"), size: 7 };
+    const result = await harness.client.requestAuthorizedTransaction({ sessionId: harness.session.sessionId,
+      taskId: "capsule_task", runId: "upload-count", idempotencyKey: "upload-count",
+      startUrl: "https://example.test/upload", allowedOrigins: ["https://example.test"], keepTaskTab: true,
+      actions: [{ method: "page.upload", params: { locator: { label: "File" }, file, confirmationCountLocator: { testId: "upload-list-item" }, confirmationTimeoutMs: 700 } }] });
+    assert.equal(result.result, "verified", JSON.stringify(result.exact_blocker));
+    assert.equal(result.upload_delivery.confirmation_observed, true);
+    assert.equal(result.upload_delivery.count_witness.before, 0);
+    assert.equal(result.upload_delivery.count_witness.observed, 1);
+    assert.equal(result.upload_delivery.assigned_files.length, 1);
+    const dispatched = harness.commands.find(c => c.method === "page.upload");
+    assert.equal(dispatched.params.confirmationCountLocator, undefined);
+    assert.equal(dispatched.params.allowInputReset, true);
+    assert.equal(harness.commands.filter(c => c.method === "page.upload").length, 1);
+  } finally { await harness.close(); }
+});
+
+test("an upload without a declared confirmation can register preview evidence during reconciliation", async () => {
+  const h = await createCapsuleHarness({ uploadBehavior: "accepted-preview" });
+  try {
+    const result = await h.client.requestAuthorizedTransaction({ sessionId: h.session.sessionId, taskId: h.session.taskId,
+      runId: "late-preview", idempotencyKey: "late-preview", startUrl: "https://example.test/upload", allowedOrigins: ["https://example.test"], keepTaskTab: true,
+      actions: [{ method: "page.upload", params: { locator: { label: "File" }, file: { name: "cat.png", mimeType: "image/png", size: 7, dataBase64: "Zml4dHVyZQ==" } } }] });
+    assert.equal(result.exact_blocker.code, "upload_confirmation_required");
+    const lease = await h.client.request("lease.acquire", { sessionId: h.session.sessionId, tabId: result.tab.id });
+    const base = { sessionId: h.session.sessionId, leaseId: lease.leaseId, tabId: result.tab.id, runId: "late-preview",
+      taskId: h.session.taskId, idempotencyKey: "late-preview", successQuery: "image preview ready" };
+    await assert.rejects(h.client.requestInspectReconciliation({ ...base }), { code: "upload_original_payload_required" });
+    await assert.rejects(h.client.requestInspectReconciliation({ ...base, confirmationFiles: [{ filename: "other.png", locator: { testId: "upload-ready" }, previewOnly: true }] }),
+      { code: "upload_confirmation_files_invalid" });
+    const inspection = await h.client.requestInspectReconciliation({ ...base, confirmationFiles: [{ filename: "cat.png", locator: { testId: "upload-ready" }, previewOnly: true }] });
+    assert.equal(inspection.reconciliationProof.uploadDeliveryEvidence.late_registered, true);
+    const completion = await h.client.requestCompleteReconciliation({ ...base, capsuleId: inspection.reconciliationProof.capsuleId,
+      reconciliationProof: inspection.reconciliationProof });
+    assert.equal(completion.status, "upload_confirmation_observed");
+    assert.equal(completion.provider_success_confirmed, false);
+    assert.equal(h.commands.filter(c => c.method === "page.upload").length, 1);
+  } finally { await h.close(); }
+});
+
+test("a wrong reconciliation key names the pending reconciliations of the run", async () => {
+  const h = await createCapsuleHarness({ uploadBehavior: "pending" });
+  try {
+    const result = await h.client.requestAuthorizedTransaction({ sessionId: h.session.sessionId, taskId: h.session.taskId,
+      runId: "pending-keys", idempotencyKey: "pending-keys-upload", startUrl: "https://example.test/upload", allowedOrigins: ["https://example.test"], keepTaskTab: true,
+      actions: [{ method: "page.upload", params: { locator: { label: "File" }, file: { name: "cat.png", mimeType: "image/png", size: 7, dataBase64: "Zml4dHVyZQ==" } } }] });
+    assert.equal(result.result, "unknown_effect");
+    const lease = await h.client.request("lease.acquire", { sessionId: h.session.sessionId, tabId: result.tab.id });
+    await assert.rejects(h.client.requestInspectReconciliation({ sessionId: h.session.sessionId, leaseId: lease.leaseId, tabId: result.tab.id,
+      runId: "pending-keys", taskId: h.session.taskId, idempotencyKey: "guessed-key", successQuery: "anything visible" }),
+      (error) => error.code === "task_reconciliation_not_found" && /pending-keys-upload/u.test(error.message));
+  } finally { await h.close(); }
+});
+
+test("a transaction waits for the first target of a slow single-page app before its pre-read", async () => {
+  const harness = await createCapsuleHarness();
+  try {
+    const result = await harness.client.requestAuthorizedTransaction({ sessionId: harness.session.sessionId,
+      taskId: "capsule_task", runId: "spa-ready", idempotencyKey: "spa-ready",
+      startUrl: "https://example.test/editor", allowedOrigins: ["https://example.test"], keepTaskTab: true,
+      actions: [{ method: "page.click", params: { locator: { testId: "fill-to-placeholder" } } }] });
+    const waits = harness.commands.filter(c => c.method === "page.waitFor");
+    assert.equal(waits[0].params.locator.testId, "fill-to-placeholder");
+    assert.equal(waits[0].params.timeoutMs, 15000);
+    const waitIndex = harness.commands.indexOf(waits[0]);
+    const firstSnapshot = harness.commands.findIndex(c => c.method === "page.snapshot");
+    assert.ok(waitIndex < firstSnapshot, "the readiness wait precedes the signed pre-read");
+    assert.ok(["observed", "timed_out", "unavailable"].includes(result.target_ready_wait));
+  } finally { await harness.close(); }
+});
+
+test("the task may re-reserve and continue on its own completed tab even while Chrome shows it active", async () => {
+  const harness = await createCapsuleHarness();
+  const { client, session, broker, liveTabs } = harness;
+  try {
+    const tabId = 11920;
+    liveTabs.set(tabId, { id: tabId, url: "https://example.test/editor", active: true, pinned: false, windowId: 1, text: "editor ready" });
+    const entry = await broker.taskLedger.recordTaskTab({ profileInstanceId: session.profileInstanceId, generation: session.generation,
+      tabId, taskId: session.taskId, runId: "own-active", sessionId: session.sessionId, lifecycleState: "completed", retentionPolicy: "cleanup", userHelpRequired: false });
+    broker.taskTabs.set(`${session.profileInstanceId}:${tabId}`, entry);
+    await client.request("lease.acquire", { sessionId: session.sessionId, tabId });
+    const base = { sessionId: session.sessionId, taskId: session.taskId, runId: "own-active", targetOrigin: "https://example.test",
+      startUrl: "https://example.test/editor", allowedOrigins: ["https://example.test"], tabId, keepTaskTab: true };
+    const result = await client.requestAuthorizedTransaction({ ...base, idempotencyKey: "own-active-continue", actions: [{ method: "page.query", params: { query: "editor" } }] });
+    assert.equal(result.result, "verified", JSON.stringify(result.exact_blocker));
+    assert.equal(result.tab.id, tabId);
+    // A foreign task's active tab is still refused.
+    const foreignTab = 11921;
+    liveTabs.set(foreignTab, { id: foreignTab, url: "https://example.test/editor", active: true, pinned: false, windowId: 1, text: "editor" });
+    const foreign = await broker.taskLedger.recordTaskTab({ profileInstanceId: session.profileInstanceId, generation: session.generation,
+      tabId: foreignTab, taskId: "foreign_task", runId: "other", sessionId: "other-session", lifecycleState: "completed", retentionPolicy: "cleanup", userHelpRequired: false });
+    broker.taskTabs.set(`${session.profileInstanceId}:${foreignTab}`, foreign);
+    await client.request("lease.acquire", { sessionId: session.sessionId, tabId: foreignTab }).catch(() => null);
+    const refused = await client.requestAuthorizedTransaction({ ...base, tabId: foreignTab, idempotencyKey: "foreign-active", actions: [{ method: "page.query", params: { query: "editor" } }] });
+    assert.notEqual(refused.result, "verified");
   } finally { await harness.close(); }
 });

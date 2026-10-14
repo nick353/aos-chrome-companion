@@ -4,6 +4,7 @@ import {readFile,writeFile,mkdtemp,rm,symlink} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import vm from 'node:vm';
+import {createHash,webcrypto} from 'node:crypto';
 import {BINARY_CLIPBOARD_MIME_ALLOWLIST, MAX_CLIPBOARD_BINARY_BYTES} from '../src/shared/peripheral-policy.mjs';
 import * as z from 'zod/v4';
 import {transactionActionSchema} from '../src/mcp/action-schema.mjs';
@@ -15,21 +16,38 @@ const workerFunction = worker.slice(worker.indexOf('async function runClipboardO
 const format = (mimeType,text) => ({mimeType,dataBase64:Buffer.from(text).toString('base64')});
 const schema = transactionActionSchema(z.object({label:z.string()}));
 
-function fixture({writeRejects=false, acknowledgementLost=false, wrongBinding=false, unsupported=false}={}) {
-  let listener;const writes=[],messages=[];
+function fixture({writeRejects=false, acknowledgementLost=false, wrongBinding=false, unsupported=false, mutateAck, liveUrl='https://page.test/body'}={}) {
+  let listener,nextOperation=0;const writes=[],messages=[],storage=new Map();
+  const companionError=(code,message,details)=>Object.assign(Error(message),{code,details});
   class ClipboardItem { constructor(data){this.data=data;} static supports(type){return !unsupported && ['text/plain','text/html','image/png'].includes(type);} }
-  const context={URL,Blob,Uint8Array,atob,btoa,ClipboardItem,BINARY_CLIPBOARD_MIME_ALLOWLIST,MAX_CLIPBOARD_BINARY_BYTES,
-    navigator:{clipboard:{write:async items=>{writes.push(items);if(writeRejects)throw Error('write acknowledgement unavailable');}}},
+  const context={crypto:webcrypto,TextEncoder,URL,Blob,Uint8Array,atob,btoa,ClipboardItem,BINARY_CLIPBOARD_MIME_ALLOWLIST,MAX_CLIPBOARD_BINARY_BYTES,
+    navigator:{clipboard:{write:async items=>{writes.push(items);if(writeRejects)throw Error('write acknowledgement unavailable');},writeText:async text=>{writes.push([{text}]);if(writeRejects)throw Error('write acknowledgement unavailable');}}},
     chrome:{runtime:{id:'own-extension',onMessage:{addListener:fn=>{listener=fn;}}}}};
   vm.createContext(context);vm.runInContext(offscreen,context);
+  const bind=message=>{
+    const payload=message.formats?{formats:message.formats.map(({mimeType,dataBase64})=>({mimeType,dataBase64}))}:{text:message.text};
+    return {operationId:`source-${++nextOperation}`,generation:'generation-a',...message,payloadSha256:createHash('sha256').update(JSON.stringify(payload)).digest('hex')};
+  };
   const send=(message,sender={id:'own-extension'})=>new Promise((resolve,reject)=>{
+    if(message.kind.includes('clipboard')&&message.kind.endsWith('write')&&!message.operationId)message=bind(message);
     const returned=listener(message,sender,resolve);if(returned===false)resolve({ignored:true});
   });
-  const workerContext={URL,atob,MAX_CLIPBOARD_BINARY_BYTES,requireOptionalPermission:async()=>{},ensureOffscreenClipboard:async()=>{},
-    companionError:(code,message,details)=>Object.assign(Error(message),{code,details}),
-    chrome:{runtime:{sendMessage:async message=>{messages.push(message);const result=await send(message);if(acknowledgementLost)throw Error('channel closed');return wrongBinding?{...result,taskId:'different-task'}:result;}}}};
-  vm.createContext(workerContext);vm.runInContext(workerFunction,workerContext);
-  return {writes,messages,send,run:params=>workerContext.runClipboardOperation('clipboard.write',{taskId:'task-a',targetOrigin:'https://page.test',approved:true,...params})};
+  const workerContext={crypto:webcrypto,TextEncoder,URL,atob,MAX_CLIPBOARD_BINARY_BYTES,requireOptionalPermission:async()=>{},ensureOffscreenClipboard:async()=>{},requireTabId:value=>value,
+    companionError,chrome:{tabs:{get:async()=>({id:42,url:liveUrl})},runtime:{id:'own-extension',getURL:path=>`chrome-extension://own-extension/${path}`,
+      sendMessage:async message=>{messages.push(message);const result=await send(message);if(acknowledgementLost)throw Error('channel closed');return mutateAck?mutateAck(result):wrongBinding?{...result,taskId:'different-task'}:result;}},
+      storage:{local:{get:async key=>key===null?Object.fromEntries(storage):{[key]:storage.get(key)},set:async values=>{for(const [key,value] of Object.entries(values))storage.set(key,JSON.parse(JSON.stringify(value)));}}}}};
+  vm.createContext(workerContext);
+  vm.runInContext(worker.slice(worker.indexOf('async function handleClipboardSourceStorage('),worker.indexOf('async function runClipboardOperation(')),workerContext);
+  context.chrome.runtime.sendMessage=async message=>{
+    try{return {ok:true,value:await workerContext.handleClipboardSourceStorage(message,{id:'own-extension',url:'chrome-extension://own-extension/offscreen.html'})};}
+    catch(error){return {ok:false,code:error.code??'clipboard_source_storage_unavailable'};}
+  };
+  vm.runInContext(workerFunction,workerContext);
+  vm.runInContext(worker.slice(worker.indexOf('function originOf('),worker.indexOf('async function probeCommittedDocument(')),workerContext);
+  vm.runInContext(worker.slice(worker.indexOf('async function executeCommand('),worker.indexOf('async function waitForPageLocator(')),workerContext);
+  const params=value=>({operationId:`worker-${++nextOperation}`,generation:'generation-a',taskId:'task-a',targetOrigin:'https://page.test',approved:true,...value});
+  return {writes,messages,send,storage,run:value=>workerContext.runClipboardOperation('clipboard.write',params(value)),
+    dispatch:value=>workerContext.executeCommand('clipboard.write',{mutation:true,tabId:42,allowedOrigins:['https://page.test'],...params(value)})};
 }
 
 test('HTML and text are written as one item, with metadata returned and no automatic paste',async()=>{
@@ -75,6 +93,52 @@ test('unsupported browser MIME is known no effect; rejected or lost write acknow
   const unsupported=fixture({unsupported:true});await assert.rejects(unsupported.run({formats:[format('image/png','x')]}),e=>e.code==='clipboard_write_mime_unsupported'&&e.details.mutationDispatchAttempted===false);assert.equal(unsupported.writes.length,0);
   for(const options of [{writeRejects:true},{acknowledgementLost:true},{wrongBinding:true}]){
     const f=fixture(options);await assert.rejects(f.run({formats:[format('text/html','<p>日本語</p>')]}),e=>e.code==='clipboard_write_result_unknown'&&e.details.operationEffectState==='unknown'&&e.details.retryWrite===false);assert.equal(f.writes.length,1);
+  }
+});
+
+test('text clipboard accepts exactly 100000 UTF-16 units and rejects excess before offscreen dispatch',async()=>{
+  const accepted=fixture(),text='😀'.repeat(50000);
+  const result=await accepted.run({text});assert.equal(result.chars,100000);assert.equal(accepted.writes.length,1);
+  const excess=fixture();await assert.rejects(excess.run({text:text+'x'}),error=>error.code==='clipboard_payload_too_large'&&error.details.operationEffectState==='none'&&error.details.mutationDispatchAttempted===false);
+  assert.equal(excess.messages.length,0);assert.equal(excess.writes.length,0);assert.equal(excess.storage.size,0);
+  const direct=await excess.send({kind:'offscreen.clipboard.write',taskId:'task-a',targetOrigin:'https://page.test',text:text+'x'});
+  assert.equal(direct.details.operationEffectState,'none');assert.equal(excess.writes.length,0);assert.equal(excess.storage.size,0);
+});
+
+test('MIME ACK requires exact terminal metadata and complete task/origin/generation/payload binding',async()=>{
+  for(const mutate of [
+    result=>({...result,binary:false}),
+    result=>({...result,sourceReceipt:{...result.sourceReceipt,ack:{...result.sourceReceipt.ack,binary:false}}}),
+    result=>({...result,sourceReceipt:{...result.sourceReceipt,ack:{...result.sourceReceipt.ack,size:999}}}),
+    result=>({...result,sourceReceipt:{...result.sourceReceipt,ack:{...result.sourceReceipt.ack,formats:[]}}}),
+    ...['taskId','targetOrigin','generation','payloadSha256','operationId'].map(field=>result=>({...result,sourceReceipt:{...result.sourceReceipt,sourceBinding:{...result.sourceReceipt.sourceBinding,[field]:'other'}}})),
+  ]){
+    const f=fixture({mutateAck:mutate});
+    await assert.rejects(f.run({formats:[format('text/html','<p>Bound</p>')]}),error=>error.code==='clipboard_write_result_unknown'&&error.details.operationEffectState==='unknown'&&error.details.retryWrite===false);
+    assert.equal(f.writes.length,1);assert.equal(f.messages.length,1);
+  }
+});
+
+test('actual clipboard dispatcher rejects live-origin mismatch before offscreen write',async()=>{
+  for(const options of [{liveUrl:'https://foreign.test/body'},{}]){
+    const f=fixture(options);
+    await assert.rejects(f.dispatch({text:'Bound',...(options.liveUrl?{}:{targetOrigin:'https://other.test'})}),error=>['target_origin_not_allowed','target_origin_mismatch'].includes(error.code));
+    assert.equal(f.writes.length,0);assert.equal(f.messages.length,0);assert.equal(f.storage.size,0);
+  }
+  const valid=fixture();assert.equal((await valid.dispatch({text:'Bound'})).written,true);assert.equal(valid.writes.length,1);
+});
+
+test('worker accepts exact compacted text/MIME receipts as historical ACK with no new write or paste claim',async()=>{
+  for(const payload of [{text:'Bound'},{formats:[format('text/plain','Bound'),format('text/html','<b>Bound</b>')]}]) {
+    const f=fixture(),first=await f.run(payload),binding=first.sourceReceipt.sourceBinding;
+    for(let index=1;index<512;index++)f.storage.set(`companion.clipboard.source.v1:seed-${index}`,
+      {...first.sourceReceipt,sourceBinding:{...binding,operationId:`seed-${index}`}});
+    await f.run({text:'new'});
+    const result=await f.run({...payload,operationId:binding.operationId});
+    assert.equal(result.compacted,true);assert.equal(result.written,false);assert.equal(result.writeAcknowledged,true);
+    assert.equal(result.acknowledgedHistorical,true);assert.equal(result.pasteVerified,false);assert.equal(result.contentReturned,false);
+    assert.equal(result.mutationDispatchAttempted,false);assert.equal(f.writes.length,2);
+    assert.equal(result.sourceReceipt.ack,undefined);
   }
 });
 

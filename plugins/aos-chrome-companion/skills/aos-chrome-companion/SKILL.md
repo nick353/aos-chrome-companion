@@ -61,6 +61,11 @@ semantic plus visual preflight; it must never take over a Companion lease.
    conflict for this operation. Do not invent blockers such as
    `foreign_owner_current_generation_target_with_pending_operation` merely
    because another task is active in the same profile.
+   Use the returned `block_scope`, `affected_target`, `independent_work_allowed`
+   and next action rather than turning one target's historical hold into a
+   global stop. A task/profile blocker applies only to the identified shared
+   dependency. Provider consent, CAPTCHA and unknown effects still stop their
+   exact target; they do not authorize bypass or replay.
 6. Read the exact target immediately before a mutation and read it again after
    the operation when completion matters. `companion_read_page` always captures
    a screenshot from the same session/lease/tab, even when the semantic
@@ -106,11 +111,38 @@ semantic plus visual preflight; it must never take over a Companion lease.
    call `companion_inspect_reconciliation` with the specific success text,
    inspect its same-page screenshot, then pass the returned
    `reconciliationProof` unchanged to
-   `companion_complete_reconciliation`. On `terminal_cleanup_ready=true`, call
+   `companion_complete_reconciliation`. Completion settles that one operation,
+   not the task: when the task still has steps left (`task_may_continue=true`),
+   continue them on `continue_on_tab_id` with `tabId` (re-reserve it with
+   `companion_reserve_tab` if the lease was released). Only when the whole task
+   is done and `terminal_cleanup_ready=true`, call
    `companion_close_session(taskTerminal=true)` so the former
-   `ai_reconciliation_pending` tab closes. Never mark reconciliation complete
+   `ai_reconciliation_pending` tab closes.
+   A blocked result whose `continuation.allowed=true` dispatched nothing
+   (for example a control that had not rendered yet, or a tab that must be
+   re-reserved): follow `continuation.next_action` and continue the task; do
+   not stop the task for it.
+   For uploads: sites that rename files (Printify) can be confirmed with
+   `confirmationCountLocator` (a locator matching every item in the upload
+   list; the count must grow by the number of files). If an upload ends
+   `upload_confirmation_required` without a usable confirmation, register one
+   during reconciliation with `confirmationFiles` objects, e.g.
+   `[{ filename: "<original name>", locator: { role: "button", name: "Next" }, previewOnly: true }]`.
+   More than 32 actions may be passed to one `companion_authorized_transaction`;
+   they run as consecutive 32-action parts and stop at the first part that is
+   not verified (`split_transaction` lists the remaining original indices). Never mark reconciliation complete
    from a caller-supplied status string, a different tab, or a screenshot
    without the signed exact-page proof.
+   For an owned tab stuck in navigation, first use
+   `companion_navigation_diagnostics` with a fresh session/lease and the exact
+   URL, window and pending URL from the current tab inventory. If stopping
+   loading is intended, `companion_stop_loading` requires that same exact
+   tuple, an allowlist covering committed and pending origins, and explicit
+   `optIn:true`. This is one new signed local-loading operation, not a retry of
+   reload/navigation and not reconciliation of the earlier operation. Re-read
+   the exact document afterward. Do not infer provider completion, discard the
+   original unknown receipt, or auto-submit after stop. Permission/identity
+   changes remain blockers; no alternate browser/OS fallback is permitted.
 8. Close the logical session when the task is done. This releases all owned
    leases and, with the default `taskTerminal=true`, closes every completed or
    failed Companion task-owned tab plus safe pre-effect `discovered` retained

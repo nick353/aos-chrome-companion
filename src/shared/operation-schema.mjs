@@ -18,6 +18,9 @@ const definitions = [
   ["extension.reload", false, true, true],
   ["tabs.list", false, false, false],
   ["tabs.get", true, false, false],
+  ["tabs.waitForCommit", true, false, false],
+  ["tabs.navigationDiagnostics", true, false, false],
+  ["tabs.stopLoading", true, true, false],
   ["tabs.create", false, true, true],
   ["tabs.close", true, true, false],
   ["tabs.activate", true, true, true],
@@ -59,6 +62,7 @@ const definitions = [
   ["page.elementScreenshot", true, false, true],
   ["page.download", true, true, true],
   ["clipboard.read", true, false, true],
+  ["clipboard.receipt", true, false, true],
   ["clipboard.readBinary", true, false, true],
   ["clipboard.write", true, true, true],
   ["page.inspectDialog", true, false, true],
@@ -79,9 +83,18 @@ const definitions = [
   ["page.nativeChooser", true, true, false],
   ["page.submit", true, true, false],
   ["tabs.claimExisting", true, true, true],
+  // Native recording is scoped to the owned Chrome window/profile, not to a
+  // disposable page tab.  Keeping these operations targetless lets a task
+  // stop a recording even when the tab used to start it was closed or lost.
+  ["recording.status", false, false, true],
+  ["recording.startAuto", false, true, true],
+  ["recording.stopAuto", false, true, true],
   ["page.waitFor", true, false, false],
   ["page.delay", true, false, false],
-].map(([method, targetScoped, mutation, profileGlobal]) => Object.freeze({ method, targetScoped, mutation, profileGlobal }));
+].map(([method, targetScoped, mutation, profileGlobal]) => Object.freeze({ method, targetScoped, mutation, profileGlobal,
+  ...(method === "page.query" ? { optIns: { exactEditor: { locatorCss: "div.ProseMirror", maxChars: 100_000, truncated: false, offsetUnit: "utf16" } } } : {}),
+  ...(method === "visual.typeText" ? { optIns: { clickBeforeType: false, editorGuardRequired: true, clear: false, maxInsertChars: 1_000, verification: "exact-full-body-before-and-after" } } : {}),
+}));
 
 export const OPERATION_DEFINITIONS = Object.freeze(definitions);
 
@@ -92,6 +105,9 @@ const PURPOSES = Object.freeze({
   "page.uploadMultiple": ["upload", "Deliver prepared local files to an exact file input", "file-input or site confirmation readback; this does not prove submission"],
   "page.submit": ["submit", "Submit an exact form after its fields are verified", "same-target page transition or provider confirmation"],
   "page.screenshot": ["inspect", "Capture visual evidence for the exact leased tab", "image metadata and unchanged target verification"],
+  "recording.status": ["record", "Read the current Companion native Chrome-window recording state", "active state and media metadata"],
+  "recording.startAuto": ["record", "Start an audio-enabled Chrome-window recording through the Companion Native Host", "recording started and capture target state"],
+  "recording.stopAuto": ["record", "Stop the owned native Chrome-window recording and finalize its movie", "saved artifact metadata and media verification"],
   "visual.inspectTarget": ["inspect", "Create a single-use screenshot-bound target proof", "proof freshness and exact target binding"],
 });
 
@@ -116,7 +132,7 @@ export const AUTHORIZED_TRANSACTION_METHODS = Object.freeze([
   "visual.pointerMove", "visual.click", "visual.doubleClick", "visual.drag", "visual.scroll", "visual.pressKey", "visual.keyDown", "visual.keyUp",
   "visual.typeText",
   "page.download", "clipboard.write", "page.handleDialog",
-  "page.webMcpCall", "page.nativeChooser", "tabs.claimExisting",
+  "page.webMcpCall", "page.nativeChooser", "tabs.claimExisting", "recording.startAuto", "recording.stopAuto",
   "page.query",
   "page.selectOption", "page.type", "page.upload", "page.uploadMultiple", "page.submit", "page.richText", "page.waitFor", "page.delay",
 ]);

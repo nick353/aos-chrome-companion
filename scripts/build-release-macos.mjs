@@ -239,7 +239,7 @@ export async function buildMacosRelease(args) {
           cwd: join(PRODUCT_ROOT, "app"),
           env: { AOS_CHROME_COMPANION_ROOT: join(PRODUCT_ROOT, "app") },
           enabled: true,
-          startup_timeout_sec: 15,
+          startup_timeout_sec: 60,
           tool_timeout_sec: 90,
         },
       },
