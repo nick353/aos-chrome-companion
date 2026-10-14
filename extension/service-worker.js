@@ -5472,8 +5472,18 @@ async function injectedPageOperation(action, payload) {
     }
     const currentValue = element.isContentEditable ? String(element.innerText ?? "") : String(element.value ?? "");
     const expectedText = String(payload.expectedText ?? "").replace(/\r\n?/gu, "\n");
+    // Rich editors (ProseMirror, Draft.js, Lexical) keep each line as its own block, so their
+    // innerText shows extra blank lines, non-breaking spaces or zero-width characters around text
+    // that was retained exactly (LinkedIn turned each paragraph break into three newlines and the
+    // post was stopped, AOS 2026-10-11 and 10-14). In an editor the same non-empty lines in the same
+    // order count as committed; a plain input or textarea must still match exactly.
+    const editorLines = (value) => value.replace(/\r\n?/gu, "\n").replace(/[\u200b-\u200d\ufeff]/gu, "").replace(/\u00a0/gu, " ")
+      .split("\n").map((line) => line.replace(/[ \t]+$/u, "")).filter((line) => line.trim() !== "").join("\n");
+    const exact = currentValue === expectedText;
+    const sameLines = !exact && element.isContentEditable === true && editorLines(currentValue) === editorLines(expectedText);
     return {
-      committed: currentValue === expectedText,
+      committed: exact || sameLines,
+      commitMatch: exact ? "exact" : sameLines ? "editor_lines" : "mismatch",
       valueLength: currentValue.length,
       expectedValueLength: expectedText.length,
       element: describe(element),
