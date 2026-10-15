@@ -532,6 +532,34 @@ export class BrokerClient {
     return this.request("task.reconciliation.complete", { ...params, ...payload, authority }, { timeoutMs });
   }
 
+  async requestSettleFromEvidence(params, { timeoutMs = 30_000 } = {}) {
+    const secret = await this.#issuerSecret();
+    const payload = {
+      runId: params.runId,
+      taskId: params.taskId,
+      idempotencyKey: params.idempotencyKey,
+      capsuleId: params.capsuleId,
+      evidenceUrl: params.evidenceUrl,
+      successQuery: params.successQuery,
+      found: params.found,
+      evidenceDigest: params.evidenceDigest,
+    };
+    const authority = createAuthorityEnvelope({
+      issuer: this.issuer,
+      secret,
+      runId: params.runId,
+      taskId: params.taskId,
+      ownerKey: params.sessionId,
+      method: "task.reconciliation.settle_from_evidence",
+      intent: "settle_send_from_provider_evidence",
+      targetOrigin: "*",
+      idempotencyKey: `reconciliation-evidence:${params.idempotencyKey}:${createId("evidence")}`,
+      payload,
+      approved: true,
+    });
+    return this.request("task.reconciliation.settle_from_evidence", { ...params, ...payload, authority }, { timeoutMs });
+  }
+
   async requestRepairPreDispatchReadonly(params, { timeoutMs = 30_000 } = {}) {
     const secret = await this.#issuerSecret();
     const payload = repairPreDispatchReadonlyPayload({

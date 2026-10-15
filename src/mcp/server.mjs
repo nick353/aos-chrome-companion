@@ -13,6 +13,7 @@ import { materializeTransactionActions } from "./action-materializer.mjs";
 import { bindCodexTaskId, McpTaskBindingRegistry, resolveCodexTaskId } from "./task-context.mjs";
 import { normalizeBinaryClipboardRequest } from "../shared/peripheral-policy.mjs";
 import { readUrls } from "./read-urls.mjs";
+import { settleUnknownSend } from "./settle-unknown-send.mjs";
 import { MAX_SPLIT_ACTIONS, runSplitTransaction } from "./split-transaction.mjs";
 
 let brokerClientPromise;
@@ -901,7 +902,7 @@ server.registerTool("companion_inspect_reconciliation", {
     taskId: z.string().min(1).optional(),
     idempotencyKey: z.string().min(1),
     capsuleId: z.string().min(1).optional(),
-    successQuery: z.string().min(8).max(500),
+    successQuery: z.string().min(2).max(500),
     originalOperationKey: z.string().min(1).optional(),
     originalOperationId: z.string().min(1).optional(),
     originalFingerprint: z.string().min(1).optional(),
@@ -913,6 +914,24 @@ server.registerTool("companion_inspect_reconciliation", {
   const taskId = bindCodexTaskId(args.taskId, process.env, extra);
   assertSessionAndLease(args, extra);
   return (await broker()).requestInspectReconciliation({ ...args, taskId });
+}));
+
+server.registerTool("companion_settle_unknown_send", {
+  description: "Settle a send/post/submit/application whose result is unknown, from where the site lists such items, instead of guessing. Give evidenceUrl (on the same site: the sent folder, your own timeline or profile, the applications or messages list) and successQuery (a short distinctive phrase of what was sent, e.g. the first words of the post or the job title). It opens evidenceUrl in its own temporary tab and looks for the phrase. outcome 'sent': it was sent, continue (never send again). 'not_seen_yet': call again with the same arguments after retry_after_seconds (absence is only trusted after two reads 30 s apart, at least 90 s after the send). 'not_sent': it was not sent; you may send it once more with a new idempotencyKey, and if that is unknown too, settle it the same way and stop. No send is ever repeated by this tool.",
+  inputSchema: {
+    sessionId,
+    runId: z.string().min(1),
+    taskId: z.string().min(1).optional(),
+    idempotencyKey: z.string().min(1).describe("The uncertain transaction's key exactly as returned"),
+    capsuleId: z.string().min(1).optional(),
+    evidenceUrl: z.string().url().describe("Where the site lists the sent item, on the same site as the send"),
+    successQuery: z.string().min(2).max(500).describe("Distinctive text of the sent item as it appears in that list"),
+  },
+  annotations: { readOnlyHint: false },
+}, guarded(async (args, extra) => {
+  const taskId = bindCodexTaskId(args.taskId, process.env, extra);
+  assertSession(args, extra);
+  return settleUnknownSend(await broker(), { ...args, taskId }, { signal: extra?.signal });
 }));
 
 server.registerTool("companion_repair_pre_dispatch_reconciliation", {

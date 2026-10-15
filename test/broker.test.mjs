@@ -6,6 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 import * as z from "zod/v4";
 import { transactionActionSchema } from "../src/mcp/action-schema.mjs";
+import { settleUnknownSend } from "../src/mcp/settle-unknown-send.mjs";
 import { CompanionBroker, deriveActiveReconciliationCounts, isAllowedTaskFrameOrigin, isSafePreEffectTaskTab, shouldRequestBrokerRestartForBuildMismatch, transactionFailureNoEffectEvidence } from "../src/broker/broker.mjs";
 import { BrokerClient } from "../src/client/broker-client.mjs";
 import { mergeSemanticSnapshotResults } from "../extension/semantic-snapshot.js";
@@ -5704,5 +5705,72 @@ test("the task may re-reserve and continue on its own completed tab even while C
     await client.request("lease.acquire", { sessionId: session.sessionId, tabId: foreignTab }).catch(() => null);
     const refused = await client.requestAuthorizedTransaction({ ...base, tabId: foreignTab, idempotencyKey: "foreign-active", actions: [{ method: "page.query", params: { query: "editor" } }] });
     assert.notEqual(refused.result, "verified");
+  } finally { await harness.close(); }
+});
+
+// A send whose result is unknown is settled from where the site lists sent items (owner, 2026-10-16).
+async function uncertainSend(evidenceText) {
+  const harness = await createCapsuleHarness({
+    interceptCommand: ({ tab }) => {
+      if (tab?.url?.includes("/sent") && tab.text === undefined) tab.text = evidenceText.value;
+      return false;
+    },
+  });
+  const result = await harness.client.requestAuthorizedTransaction({
+    sessionId: harness.session.sessionId, runId: "run_send", taskId: "capsule_task", idempotencyKey: "idem_send",
+    targetOrigin: "https://example.test", startUrl: "https://example.test/apply", allowedOrigins: ["https://example.test"],
+    actions: [{ method: "page.click", params: { locator: { testId: "submit-no-transition" } } }],
+  });
+  assert.equal(result.result, "unknown_effect");
+  const settle = () => settleUnknownSend(harness.client, { sessionId: harness.session.sessionId, taskId: "capsule_task",
+    runId: "run_send", idempotencyKey: "idem_send", evidenceUrl: "https://example.test/sent", successQuery: "Data Analyst at Acme" });
+  return { harness, result, settle };
+}
+
+test("a send found in the site's own list is settled as sent and never sent again", async () => {
+  const { harness, settle } = await uncertainSend({ value: "Sent applications: Data Analyst at Acme — 2 min ago" });
+  try {
+    const before = harness.commands.filter(c => c.method === "page.click").length;
+    const settled = await settle();
+    assert.equal(settled.outcome, "sent");
+    assert.equal(settled.resend_allowed, false);
+    const capsule = harness.broker.taskLedger.findTaskCapsule({ taskId: "capsule_task", runId: "run_send", idempotencyKey: "idem_send" });
+    assert.equal(capsule.state, "completed");
+    assert.equal(harness.commands.filter(c => c.method === "page.click").length, before, "no click replayed");
+  } finally { await harness.close(); }
+});
+
+test("a send missing from the list is not sent only after two reads apart and long enough after the send", async () => {
+  const { harness, settle } = await uncertainSend({ value: "Sent applications: nothing yet" });
+  try {
+    const first = await settle();
+    assert.equal(first.outcome, "not_seen_yet");
+    assert.equal(first.resend_allowed, false);
+    assert.ok(first.retry_after_seconds >= 30);
+    const again = await settle();
+    assert.equal(again.outcome, "not_seen_yet", "a second read right away is not enough");
+    // Let time pass: the send and the first absence read are now old enough.
+    const ledger = harness.broker.taskLedger;
+    const capsule = ledger.findTaskCapsule({ taskId: "capsule_task", runId: "run_send", idempotencyKey: "idem_send" });
+    const past = (ms) => new Date(Date.now() - ms).toISOString();
+    capsule.effect.providerAbsenceReads = capsule.effect.providerAbsenceReads.map((read, i) => ({ ...read, at: past(120_000 - i * 1000) }));
+    for (const entry of ledger.listOperations().filter(e => e.idempotencyKey.startsWith("idem_send:"))) entry.updatedAt = past(180_000);
+    capsule.updatedAt = past(180_000);
+    const settled = await settle();
+    assert.equal(settled.outcome, "not_sent");
+    assert.equal(settled.resend_allowed, true);
+    const after = ledger.findTaskCapsule({ taskId: "capsule_task", runId: "run_send", idempotencyKey: "idem_send" });
+    assert.equal(after.state, "failed");
+    assert.equal(after.effect.effectState, "known_no_effect");
+    assert.equal(after.effect.reconciliationRequired, false);
+  } finally { await harness.close(); }
+});
+
+test("evidence from another site is refused", async () => {
+  const { harness } = await uncertainSend({ value: "" });
+  try {
+    await assert.rejects(harness.client.requestSettleFromEvidence({ sessionId: harness.session.sessionId, taskId: "capsule_task",
+      runId: "run_send", idempotencyKey: "idem_send", evidenceUrl: "https://elsewhere.test/sent", successQuery: "Data Analyst",
+      found: true, evidenceDigest: "x" }), { code: "evidence_origin_not_allowed" });
   } finally { await harness.close(); }
 });

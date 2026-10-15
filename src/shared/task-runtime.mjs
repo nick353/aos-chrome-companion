@@ -2479,6 +2479,89 @@ export class TaskOperationLedger {
   }
 
   /**
+   * Provider evidence for an uncertain send (owner, 2026-10-16): the sent item was looked for where the
+   * provider lists it (a sent folder, the timeline, the applications list) and was not there. One absence
+   * read proves nothing; the broker settles "not sent" only after two reads far enough apart and long
+   * enough after the dispatch. Records the read on the capsule and returns the reads so far.
+   */
+  async recordProviderAbsence(capsuleId, { at, evidenceDigest, evidenceUrlSha256 }) {
+    return this.#queue(async () => {
+      await this.ready();
+      const capsule = this.capsules.get(capsuleId);
+      if (!capsule || capsule.state !== "reconciliation_required") {
+        throw authorityError("task_reconciliation_state_invalid", "Only an unresolved task capsule may record provider evidence");
+      }
+      const reads = [...(capsule.effect?.providerAbsenceReads ?? []), { at, evidenceDigest, evidenceUrlSha256 }].slice(-10);
+      this.capsules.set(capsuleId, { ...capsule, effect: { ...capsule.effect, providerAbsenceReads: reads } });
+      await this.#persist();
+      return reads;
+    });
+  }
+
+  /** When the uncertain send's operations were dispatched (the latest of them). */
+  providerEvidenceDispatchedAt(capsuleId) {
+    const capsule = this.capsules.get(capsuleId);
+    if (!capsule?.effect?.idempotencyKey) return null;
+    const keyPrefix = `${capsule.effect.idempotencyKey}:`;
+    const times = this.listOperations()
+      .filter(entry => entry.idempotencyKey.startsWith(keyPrefix) && entry.binding?.taskId === capsule.taskId
+        && entry.binding?.runId === capsule.runId && isUnresolvedOperationEffect(entry))
+      .map(entry => Date.parse(entry.updatedAt ?? entry.preparedAt ?? ""))
+      .filter(Number.isFinite);
+    return times.length ? Math.max(...times) : null;
+  }
+
+  /**
+   * Settle an uncertain send as not sent, from repeated provider evidence. The operations become a known
+   * no-effect, the capsule a failed no-effect record: the task may send once more under a new key (the
+   * old key still never replays).
+   */
+  async settleNotSentFromEvidence(capsuleId, details, { brokerEvidence = false, proofDigest } = {}) {
+    if (!brokerEvidence || typeof proofDigest !== "string" || !proofDigest) {
+      throw authorityError("reconciliation_evidence_required", "Settling an uncertain send requires broker-verified provider evidence");
+    }
+    return this.#queue(async () => {
+      await this.ready();
+      const capsule = this.capsules.get(capsuleId);
+      if (!capsule || capsule.state !== "reconciliation_required" || !capsule.effect?.idempotencyKey) {
+        throw authorityError("task_reconciliation_state_invalid", "Only an unresolved task capsule may be settled");
+      }
+      const keyPrefix = `${capsule.effect.idempotencyKey}:`;
+      const operations = this.listOperations().filter(entry =>
+        entry.idempotencyKey.startsWith(keyPrefix)
+        && /^\d+$/u.test(entry.idempotencyKey.slice(keyPrefix.length))
+        && entry.binding?.taskId === capsule.taskId
+        && entry.binding?.runId === capsule.runId
+        && isUnresolvedOperationEffect(entry));
+      if (operations.length > 1) throw authorityError("task_reconciliation_operation_ambiguous", "Several unresolved operations require separate evidence");
+      const now = new Date(this.now()).toISOString();
+      const next = transitionTaskExecutionCapsule(capsule, "failed", {
+        ...details,
+        blocker: capsule.blocker,
+        restartPoint: "task_failure_recovery",
+        resumeToken: null,
+        retention: { ...capsule.retention, policy: "cleanup", reason: null, resumeTokenRequired: false, userHelpRequired: false,
+          whyTabWasKept: null, requiredUserAction: null, resumeAction: null },
+        effect: {
+          ...capsule.effect, effectState: "known_no_effect", externalActionExecuted: false,
+          reconciliationRequired: false, reconciledAt: now, reconciliationProofDigest: proofDigest,
+          providerEvidence: "not_sent",
+        },
+      }, now);
+      for (const entry of operations) {
+        this.operations.set(entry.idempotencyKey, {
+          ...entry, state: "reconciled", effectState: "known_no_effect", externalActionExecuted: false,
+          reconciliationRequired: false, brokerEvidence: true, providerEvidence: "not_sent", reconciledAt: now, updatedAt: now,
+          resultDigest: proofDigest,
+        });
+      }
+      this.capsules.set(capsuleId, next);
+      await this.#persist();
+      return next;
+    });
+  }
+
+  /**
    * End an ownerless reconciliation after one bounded retention window.  This
    * does not assert that the provider effect did or did not happen: the
    * operation ledger stays `unknown_effect`, while the task capsule becomes a

@@ -2177,6 +2177,8 @@ export class CompanionBroker extends EventEmitter {
         return this.#repairPreDispatchReadonly(peer, params);
       case "task.reconciliation.complete":
         return this.#completeTaskReconciliation(peer, params);
+      case "task.reconciliation.settle_from_evidence":
+        return this.#settleTaskFromEvidence(peer, params);
       case "task.reconciliation.resolve_local_editor":
         return this.#resolveLocalEditor(peer, params);
       case "task.reconciliation.resolve_local_selection":
@@ -7397,8 +7399,8 @@ export class CompanionBroker extends EventEmitter {
     const session = this.#requireOwnedSession(peer, params.sessionId);
     const binding = this.#requireTaskReconciliationBinding(session, params);
     const successQuery = requireString(params.successQuery, "successQuery").replace(/\s+/gu, " ").trim();
-    if (successQuery.length < 8 || successQuery.length > 500) {
-      throw new CompanionError("reconciliation_success_query_invalid", "Reconciliation successQuery must contain 8 to 500 characters");
+    if (successQuery.length < 2 || successQuery.length > 500) {
+      throw new CompanionError("reconciliation_success_query_invalid", "Reconciliation successQuery must contain 2 to 500 characters");
     }
     let uploadDelivery = binding.capsule.effect?.uploadDelivery;
     const uploadConfirmation = ["upload_confirmation_required", "upload_confirmation_not_observed"].includes(binding.capsule.blocker?.code)
@@ -7563,6 +7565,90 @@ export class CompanionBroker extends EventEmitter {
       mutation_dispatch_count: 0,
       operation_effect_state: "none",
     };
+  }
+
+  // An uncertain send settled from where the provider lists sent items (owner, 2026-10-16: sends whose
+  // result was unknown stopped whole runs; the success text was on the sent list or the timeline, never on
+  // the page that sent). The MCP layer reads evidenceUrl in a temporary task tab of its own and reports
+  // whether successQuery was there; nothing is replayed here. Present: the send is settled as sent.
+  // Absent: only after a second read at least 30 s after the first and 90 s after the dispatch is it
+  // settled as not sent, and the task may then send once more under a new key.
+  async #settleTaskFromEvidence(peer, params) {
+    const session = this.#requireOwnedSession(peer, params.sessionId);
+    const runId = requireString(params.runId, "runId");
+    const taskId = requireString(params.taskId ?? session.taskId, "taskId");
+    const idempotencyKey = requireString(params.idempotencyKey, "idempotencyKey");
+    if (session.taskId !== taskId) throw new CompanionError("task_id_mismatch", "Settlement taskId does not match the logical session task");
+    const evidenceUrl = requireString(params.evidenceUrl, "evidenceUrl");
+    const successQuery = requireString(params.successQuery, "successQuery").replace(/\s+/gu, " ").trim();
+    if (successQuery.length < 2 || successQuery.length > 500) throw new CompanionError("reconciliation_success_query_invalid", "successQuery must contain 2 to 500 characters");
+    const evidenceDigest = requireString(params.evidenceDigest, "evidenceDigest");
+    if (typeof params.found !== "boolean") throw new CompanionError("invalid_request", "found must be a boolean");
+    const capsule = params.capsuleId ? this.taskLedger.getTaskCapsule(requireString(params.capsuleId, "capsuleId"))
+      : this.taskLedger.findTaskCapsule({ taskId, runId, idempotencyKey });
+    if (!capsule || capsule.taskId !== taskId || capsule.runId !== runId || capsule.effect?.idempotencyKey !== idempotencyKey) {
+      throw new CompanionError("task_reconciliation_not_found", "No matching uncertain send exists for this run and idempotency key (companion_transaction_status lists them)");
+    }
+    if (capsule.state !== "reconciliation_required") {
+      throw new CompanionError("task_reconciliation_state_invalid", `Only an uncertain send can be settled from evidence, not a ${capsule.state} one`);
+    }
+    let origin;
+    try { origin = new URL(evidenceUrl).origin; } catch { throw new CompanionError("invalid_request", "evidenceUrl must be an absolute URL"); }
+    const allowed = capsule.target?.allowedOrigins ?? capsule.allowedOrigins ?? [];
+    if (!allowed.includes(origin)) {
+      throw new CompanionError("evidence_origin_not_allowed", `Evidence must come from the site of the send (${allowed.join(", ") || "unknown"})`);
+    }
+    // Signed exactly as the client sent it (capsuleId may be absent).
+    const payload = { runId, taskId, idempotencyKey, capsuleId: params.capsuleId, evidenceUrl, successQuery: params.successQuery, found: params.found, evidenceDigest };
+    await this.taskLedger.verifyAndConsumeAuthority(params.authority, {
+      secrets: this.issuerSecrets,
+      payload,
+      expected: { runId, taskId, ownerKey: session.sessionId, method: "task.reconciliation.settle_from_evidence", intent: "settle_send_from_provider_evidence" },
+    });
+    const proofDigest = payloadDigest(this.ledgerSecret, payload);
+    const at = nowIso();
+    const evidenceUrlSha256 = createHash("sha256").update(evidenceUrl, "utf8").digest("hex");
+    const reconciliation = { schema: "aos.chrome_companion.provider_evidence_reconciliation.v1",
+      evidenceUrlSha256, successQuerySha256: createHash("sha256").update(successQuery, "utf8").digest("hex"), completedAt: at };
+    const tabId = capsule.resources?.tabId, profileInstanceId = capsule.target?.profileInstanceId;
+    const recordTab = async (fields) => {
+      const tab = Number.isSafeInteger(tabId) && profileInstanceId ? this.taskLedger.getTaskTab(profileInstanceId, tabId) : null;
+      if (!tab) return;
+      await this.taskLedger.recordTaskTab({ ...tab, resumeToken: null, userHelpRequired: false, whyTabWasKept: null,
+        requiredUserAction: null, resumeAction: null, updatedAt: at, ...fields });
+      this.taskTabs.set(this.#tabKey(profileInstanceId, tabId), this.taskLedger.getTaskTab(profileInstanceId, tabId));
+    };
+    if (params.found) {
+      const completed = await this.taskLedger.completeTaskReconciliation(capsule.capsuleId, {
+        blocker: null, restartPoint: null, resumeToken: null,
+        completion: { ...capsule.completion, reconciliation: { ...reconciliation, status: "completed", providerSuccessConfirmed: true },
+          cleanup: { status: "pending_terminal_session_close" } },
+        retention: { policy: "retain", resumeTokenRequired: false, userHelpRequired: false, reason: null,
+          whyTabWasKept: null, requiredUserAction: null, resumeAction: null },
+      }, { brokerEvidence: true, proofDigest });
+      await recordTab({ lifecycleState: completed.state, retentionPolicy: "retain", retentionReason: null });
+      return { schema: "aos.chrome_companion.provider_evidence_settlement.v1", outcome: "sent", run_id: runId,
+        idempotency_key: idempotencyKey, capsule_id: capsule.capsuleId, effect_state: "known_effect",
+        provider_success_confirmed: true, resend_allowed: false, next_action: "continue_after_the_send" };
+    }
+    const reads = await this.taskLedger.recordProviderAbsence(capsule.capsuleId, { at, evidenceDigest, evidenceUrlSha256 });
+    const dispatchedAt = this.taskLedger.providerEvidenceDispatchedAt(capsule.capsuleId) ?? Date.parse(capsule.updatedAt ?? at);
+    const now = Date.parse(at), firstAt = Date.parse(reads[0].at);
+    const waitForDispatch = Math.max(0, dispatchedAt + 90_000 - now), waitForSecondRead = reads.length < 2 ? 30_000 : Math.max(0, firstAt + 30_000 - now);
+    if (reads.length < 2 || waitForDispatch > 0 || waitForSecondRead > 0) {
+      return { schema: "aos.chrome_companion.provider_evidence_settlement.v1", outcome: "not_seen_yet", run_id: runId,
+        idempotency_key: idempotencyKey, capsule_id: capsule.capsuleId, absence_reads: reads.length,
+        retry_after_seconds: Math.ceil(Math.max(waitForDispatch, waitForSecondRead, reads.length < 2 ? 30_000 : 0) / 1000),
+        resend_allowed: false, next_action: "read_the_same_evidence_again_after_retry_after_seconds" };
+    }
+    await this.taskLedger.settleNotSentFromEvidence(capsule.capsuleId, {
+      completion: { ...capsule.completion, reconciliation: { ...reconciliation, status: "not_sent", providerSuccessConfirmed: false,
+        absenceReads: reads.length }, cleanup: { status: "pending_terminal_session_close" } },
+    }, { brokerEvidence: true, proofDigest });
+    await recordTab({ lifecycleState: "failed", retentionPolicy: "cleanup", retentionReason: null });
+    return { schema: "aos.chrome_companion.provider_evidence_settlement.v1", outcome: "not_sent", run_id: runId,
+      idempotency_key: idempotencyKey, capsule_id: capsule.capsuleId, effect_state: "known_no_effect", absence_reads: reads.length,
+      resend_allowed: true, next_action: "send_once_more_under_a_new_idempotency_key_then_stop_if_still_unknown" };
   }
 
   async #completeTaskReconciliation(peer, params) {
