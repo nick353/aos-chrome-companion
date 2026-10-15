@@ -4091,6 +4091,24 @@ test("post-dispatch readback failure preserves an applied edit even without an a
   } finally { await harness.close(); }
 });
 
+test("a finished task closes the tab that only holds its own edits", async () => {
+  const harness = await createCapsuleHarness({ failPostTypeReadback: true });
+  const { client, session } = harness;
+  try {
+    const result = await client.requestAuthorizedTransaction({
+      sessionId: session.sessionId, runId: "run_finished_edit", taskId: "capsule_task",
+      idempotencyKey: "idem_finished_edit", targetOrigin: "https://example.test",
+      startUrl: "https://example.test/editor", allowedOrigins: ["https://example.test"],
+      actions: [{ method: "page.type", params: { locator: { testId: "editor" }, text: "draft never sent", clear: true } }],
+    });
+    assert.equal(result.cleanup.retained, true, "kept while the task may still resume");
+    // Once the task says it is finished there is nothing to resume, and closing the page sends nothing
+    // (owner, 2026-10-16: finished runs left draft tabs open in Chrome).
+    const close = await client.request("session.close", { sessionId: session.sessionId, taskTerminal: true });
+    assert.ok(close.cleanup_receipt.closed.includes(result.tab.id), JSON.stringify(close.cleanup_receipt));
+  } finally { await harness.close(); }
+});
+
 test("a delayed submit transition and transient capture recover with one click", async () => {
   const harness = await createCapsuleHarness({ postCaptureBehavior: "transient" });
   const { client, session, commands } = harness;

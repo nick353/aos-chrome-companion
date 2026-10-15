@@ -212,7 +212,28 @@ test("authority signature and every exact payload field reject tampering before 
   } finally { await f.close(); }
 });
 
-for (const [method, profileInstanceId] of [["page.click", "selection-profile"], ["page.type", "selection-profile"], ["page.type", "other-profile"]]) {
+// An uncertain typed edit changed nothing outside its page, so it no longer holds the task back (owner,
+// 2026-10-16); its ledger entry keeps the history.
+for (const profileInstanceId of ["selection-profile", "other-profile"]) {
+  test(`resolved selection is not held back by an unrelated uncertain page.type on ${profileInstanceId}`, async () => {
+    const f = await fixture();
+    try {
+      await f.client.requestResolveLocalSelection(f.args);
+      await f.broker.taskLedger.prepare({ idempotencyKey: "unrelated:1", fingerprint: "unrelated",
+        binding: { ...f.binding, method: "page.type", tabId: 77, profileInstanceId } });
+      await f.broker.taskLedger.transition("unrelated:1", "dispatched", { mutationDispatchAttempted: true });
+      await f.broker.taskLedger.transition("unrelated:1", "unknown_effect", { effectState: "unknown_effect" });
+      const status = await f.status(), resume = await f.resume();
+      // The task/run total stays historical; only the gates leave the edit out.
+      assert.equal(status.unresolved_operation_count, 0); assert.equal(resume.unresolved_operation_count, 1);
+      assert.equal(status.remaining_action_dispatch_allowed, true);
+      assert.notEqual(resume.exact_blocker?.code, "reconciliation_required");
+      assert.equal(f.broker.taskLedger.get("unrelated:1").state, "unknown_effect");
+    } finally { await f.close(); }
+  });
+}
+
+for (const [method, profileInstanceId] of [["page.click", "selection-profile"]]) {
   test(`resolved selection leaves unrelated ${method} on ${profileInstanceId} unknown blocked in both gates`, async () => {
     const f = await fixture();
     try {

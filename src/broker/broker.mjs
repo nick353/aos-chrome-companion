@@ -53,6 +53,7 @@ import {
   normalizeOperationEffectState,
   isUncertainLocalNavigationEffect,
   operationRequiresReconciliation,
+  uncertaintyBlocksContinuation,
   operationEffectStateForEntry,
   operationEffectProofPayload,
   signOperationEffectProof,
@@ -2820,7 +2821,9 @@ export class CompanionBroker extends EventEmitter {
         }
         entry = { ...entry, retentionPolicy: "cleanup", retentionReason: "explicit_owner_terminal_unsubmitted_workflow" };
       }
-      if (entry.retentionPolicy === "retain_until_resume" && ["partial_actions_applied", "local_ui_effect_unknown"].includes(entry.retentionReason)) {
+      // Kept for the task to resume; once the task says it is finished there is nothing to resume, and closing
+      // a page sends nothing (known effects are already recorded, local edits were never sent).
+      if (!explicitTaskTerminal && entry.retentionPolicy === "retain_until_resume" && ["partial_actions_applied", "local_ui_effect_unknown"].includes(entry.retentionReason)) {
         result.retained.push({ tabId: entry.tabId, user_help_required: false,
           retention_reason: entry.retentionReason, why_tab_was_kept: entry.whyTabWasKept,
           resume_action: "read_back_same_target_then_continue_remaining_actions" });
@@ -3310,7 +3313,10 @@ export class CompanionBroker extends EventEmitter {
     const pendingEditor = ["page.type", "visual.typeText"].includes(method) && this.taskLedger.listOperations().find(entry =>
       entry.state === "unknown_effect" && entry.binding?.method === "page.type" && entry.binding?.taskId === session.taskId
       && entry.binding?.profileInstanceId === session.profileInstanceId && entry.binding?.tabId === tabId);
-    if (pendingEditor && (method !== "visual.typeText" || operationParams.clickBeforeType !== false
+    // Replacing the whole field again (clear: true) cannot duplicate text, so it needs no repair binding;
+    // only an insertion next to text of unknown state does.
+    const replacesWholeField = operationParams.clear === true;
+    if (pendingEditor && !replacesWholeField && (method !== "visual.typeText" || operationParams.clickBeforeType !== false
       || operationParams.editorGuard?.originalOperationKey !== pendingEditor.idempotencyKey
       || !operationParams.editorGuard?.resolutionId)) {
       throw new CompanionError("local_editor_resolution_required", "Uncertain whole-field editor input permits only a signed different-key surgical insertion");
@@ -7858,6 +7864,7 @@ export class CompanionBroker extends EventEmitter {
     const settlement = capsuleNoEffectSettlement(capsule, this.taskLedger.listOperations()) ?? selectionSettlement;
     const unresolvedEffects = this.taskLedger.listOperations().filter(operation => operation.binding?.taskId === taskId
       && operation.binding?.runId === runId && operationEffectStateForEntry(operation) === "unknown_effect"
+      && uncertaintyBlocksContinuation(operation)
       && !this.taskLedger.localSelectionResolution(operation));
     const lateResultReconciled = operationState === "reconciled"
       && entry?.brokerEvidence === true
@@ -8279,7 +8286,8 @@ export class CompanionBroker extends EventEmitter {
     // trusted physical target. A foreign task's uncertainty on this tab still
     // blocks it; absent/ambiguous footprints remain conservative.
     const targetUnresolved = this.taskLedger.listOperations().filter(operation => {
-      if (operationEffectStateForEntry(operation) !== "unknown_effect" || this.taskLedger.localSelectionResolution(operation)) return false;
+      if (operationEffectStateForEntry(operation) !== "unknown_effect" || !uncertaintyBlocksContinuation(operation)
+        || this.taskLedger.localSelectionResolution(operation)) return false;
       if (!exactFootprint) return operation.binding?.taskId === taskId && operation.binding?.runId === runId;
       const owner = operation.binding ?? {};
       return (!owner.profileInstanceId || owner.profileInstanceId === exactFootprint.profileInstanceId)

@@ -124,6 +124,18 @@ export function operationRequiresReconciliation(entry = {}) {
 }
 
 /**
+ * Only uncertainty that may have reached a provider (a send, a submit, an
+ * upload) or a local navigation whose arrival is tracked holds a task back.
+ * An uncertain edit, selection or scroll changed nothing outside its page:
+ * read the page again and carry on, or redo it (owner, 2026-10-16: runs
+ * stopped on LinkedIn and Instagram drafts whose typing could not be
+ * confirmed, though nothing had been sent).
+ */
+export function uncertaintyBlocksContinuation(entry = {}) {
+  return operationRequiresReconciliation(entry) || isUncertainLocalNavigationEffect(entry);
+}
+
+/**
  * A dispatched local navigation can outlive its acknowledgement. Keep this
  * one operation in the reconciliation ledger without classifying it as a
  * provider effect. Other local UI uncertainty remains owner maintenance only.
@@ -1912,7 +1924,8 @@ export class TaskOperationLedger {
     const resolution = this.localSelectionResolution(entry, capsule);
     if (!resolution || this.listOperations().some(other => other !== entry
       && other.binding?.taskId === capsule.taskId && other.binding?.runId === capsule.runId
-      && operationEffectStateForEntry(other) === "unknown_effect" && !this.localSelectionResolution(other))) return null;
+      && operationEffectStateForEntry(other) === "unknown_effect" && uncertaintyBlocksContinuation(other)
+      && !this.localSelectionResolution(other))) return null;
     return { capsuleId: capsule.capsuleId, operationId: entry.operationId, idempotencyKey: entry.idempotencyKey,
       resolutionId: resolution.resolutionId, effectState: "known_effect", observedScope: "local_selection_only",
       originalEffectState: "unknown_effect", providerCompletion: false, replayAllowed: false };
