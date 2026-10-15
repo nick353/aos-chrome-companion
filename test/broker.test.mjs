@@ -4310,6 +4310,45 @@ test("signed reconciliation clears the exact operation and preserves remaining w
   } finally { await harness.close(); }
 });
 
+for (const [landing, accepted] of [["https://example.test/canonical/arrived?ref=redirect", true], ["https://elsewhere.test/arrived", false]]) {
+  test(`a page move that ${accepted ? "was redirected within the task's site settles its arrival" : "left the task's sites is still a mismatch"}`, async () => {
+    // Owner, 2026-10-16: redirects to a canonical or login page of the same site stopped 24 runs a week.
+    const targetUrl = "https://example.test/local-navigation-target";
+    const harness = await createCapsuleHarness({
+      interceptCommand: ({ message, extension }) => {
+        if (message.method !== "tabs.navigate") return false;
+        extension.send({ kind: "command.error", operationId: message.operationId, error: {
+          code: "tabs_navigate_ack_lost", message: "Synthetic local navigation acknowledgement loss.",
+          details: { operationEffectState: "unknown_effect", mutationDispatchAttempted: true } } });
+        return true;
+      },
+    });
+    const { client, session, liveTabs } = harness;
+    try {
+      const transaction = await client.requestAuthorizedTransaction({ sessionId: session.sessionId, taskId: "capsule_task",
+        runId: "run_redirected", idempotencyKey: "idem_redirected", targetOrigin: "https://example.test",
+        startUrl: "https://example.test/before", allowedOrigins: ["https://example.test"],
+        actions: [{ method: "tabs.navigate", params: { url: targetUrl } }],
+        capsule: { workflowType: "AOS", targetKey: `url:${targetUrl}` }, keepTaskTab: true });
+      assert.equal(transaction.capsule.state, "reconciliation_required");
+      liveTabs.set(transaction.tab.id, { ...liveTabs.get(transaction.tab.id), url: landing, text: "The page is ready after a redirect." });
+      const lease = await client.request("lease.acquire", { sessionId: session.sessionId, tabId: transaction.tab.id });
+      const binding = { sessionId: session.sessionId, leaseId: lease.leaseId, tabId: transaction.tab.id, taskId: "capsule_task",
+        runId: "run_redirected", idempotencyKey: "idem_redirected", capsuleId: transaction.capsule.capsuleId };
+      if (!accepted) {
+        await assert.rejects(client.requestInspectReconciliation({ ...binding, successQuery: "page is ready" }),
+          (error) => error.code === "local_navigation_arrival_target_mismatch");
+        return;
+      }
+      const inspection = await client.requestInspectReconciliation({ ...binding, successQuery: "page is ready" });
+      assert.equal(inspection.local_navigation_arrival_verified, true);
+      const completed = await client.requestCompleteReconciliation({ ...binding, reconciliationProof: inspection.reconciliationProof });
+      assert.equal(completed.status, "local_navigation_arrival_confirmed");
+      assert.equal(completed.reconciliation_required, false);
+    } finally { await harness.close(); }
+  });
+}
+
 for (const legacy of [false, true]) {
   test(`signed local navigation arrival maintenance accepts the exact target and preserves failure (${legacy ? "legacy failed" : "current reconciliation"} capsule)`, async () => {
     const targetUrl = "https://example.test/local-navigation-arrived";

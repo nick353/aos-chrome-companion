@@ -7486,10 +7486,8 @@ export class CompanionBroker extends EventEmitter {
       method: "page.snapshot",
       params: { tabId: binding.tabId, maxTextChars: 30_000 },
     });
-    if (binding.localNavigation
-      && localNavigationTargetDigest(this.ledgerSecret, String(semantic?.url ?? ""))
-        !== binding.localNavigation.recordedTargetDigest) {
-      throw new CompanionError("local_navigation_arrival_target_mismatch", "The exact leased tab has not arrived at the recorded navigation target");
+    if (binding.localNavigation && !this.#navigationArrived(binding, semantic?.url)) {
+      throw new CompanionError("local_navigation_arrival_target_mismatch", "The exact leased tab has not arrived at the recorded navigation target or another page of the task's sites");
     }
     const query = await this.#executeOperation(peer, {
       sessionId: session.sessionId,
@@ -7573,6 +7571,19 @@ export class CompanionBroker extends EventEmitter {
   // whether successQuery was there; nothing is replayed here. Present: the send is settled as sent.
   // Absent: only after a second read at least 30 s after the first and 90 s after the dispatch is it
   // settled as not sent, and the task may then send once more under a new key.
+  // A page move sends nothing, so landing on the recorded URL or on any page of the task's own sites (a
+  // redirect to a canonical URL, a login or consent page of the same site) settles its arrival (owner,
+  // 2026-10-16: 24 runs a week stopped as local_navigation_arrival_target_mismatch after a redirect).
+  #navigationArrived(binding, url) {
+    const href = String(url ?? "");
+    if (localNavigationTargetDigest(this.ledgerSecret, href) === binding.localNavigation.recordedTargetDigest) return true;
+    let origin;
+    try { origin = new URL(href).origin; } catch { return false; }
+    if (!/^https?:/u.test(origin)) return false;
+    const allowed = binding.capsule?.target?.allowedOrigins ?? binding.capsule?.allowedOrigins ?? [];
+    return allowed.includes(origin);
+  }
+
   async #settleTaskFromEvidence(peer, params) {
     const session = this.#requireOwnedSession(peer, params.sessionId);
     const runId = requireString(params.runId, "runId");
@@ -7716,10 +7727,8 @@ export class CompanionBroker extends EventEmitter {
       method: "page.snapshot",
       params: { tabId: binding.tabId, maxTextChars: 30_000 },
     });
-    if (binding.localNavigation
-      && localNavigationTargetDigest(this.ledgerSecret, String(semantic?.url ?? ""))
-        !== binding.localNavigation.recordedTargetDigest) {
-      throw new CompanionError("local_navigation_arrival_target_mismatch", "The exact leased tab has moved away from the recorded navigation target");
+    if (binding.localNavigation && !this.#navigationArrived(binding, semantic?.url)) {
+      throw new CompanionError("local_navigation_arrival_target_mismatch", "The exact leased tab has moved away from the recorded navigation target and the task's sites");
     }
     const query = await this.#executeOperation(peer, {
       sessionId: session.sessionId,
