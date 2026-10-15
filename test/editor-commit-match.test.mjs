@@ -52,3 +52,36 @@ test("a plain input or textarea still has to match exactly", async () => {
   assert.deepEqual([result.committed, result.commitMatch], [false, "mismatch"]);
   assert.equal((await verify(env(input("住所 1-2-3"), "住所 1-2-3"))).committed, true);
 });
+
+// The production page.type branch: appending after Enter in a rich editor reads back with extra
+// blank lines (AOS run 619, 2026-10-15) and still counts as committed; a changed line never does.
+const typeStart = source.indexOf('  if (action === "type") {');
+const typeEnd = source.indexOf('  if (action === "verifyTypeValue") {', typeStart);
+assert.ok(typeStart > 0 && typeEnd > typeStart);
+const pageType = new AsyncFunction("env", `with (env) { ${source.slice(typeStart, typeEnd)} }`);
+const appendEnv = (before, shownAfter) => {
+  const element = { isContentEditable: true, innerText: before, textContent: before, scrollIntoView() {}, focus() {}, dispatchEvent() {} };
+  let reads = 0;
+  Object.defineProperty(element, "innerText", { get: () => (reads++ === 0 ? before : shownAfter), set() {} });
+  const range = { selectNodeContents() {}, collapse() {}, deleteContents() {}, insertNode() {}, setStartAfter() {} };
+  return {
+    action: "type", payload: { locator: {}, text: "Google launched Argon.", clear: false, verifyCommit: true },
+    find: () => element, HTMLInputElement: Input, HTMLTextAreaElement: TextArea, HTMLSelectElement: class {},
+    operationError: (code, message) => Object.assign(new Error(message), { code }), describe: () => ({}),
+    visualize: async () => {}, wait: async () => {}, InputEvent: class {}, Event: class {},
+    globalThis: { getSelection: () => ({ removeAllRanges() {}, addRange() {} }) },
+    document: { createRange: () => range, createElement: () => ({ firstChild: null }), createDocumentFragment: () => ({ lastChild: null, appendChild() {} }) },
+  };
+};
+
+test("page.type after Enter in a rich editor counts the reshaped lines as committed", async () => {
+  const before = "Gemini 4 Argon brings AI work beyond the chat window.\n\n";
+  const result = await pageType(appendEnv(before, `${before}\n\nGoogle launched Argon.​`));
+  assert.equal(result.semanticCommitted, true);
+});
+
+test("page.type never counts a changed line as committed", async () => {
+  const before = "Gemini 4 Argon brings AI work beyond the chat window.\n\n";
+  const result = await pageType(appendEnv(before, `${before}\nGoogle launch Argon.`));
+  assert.equal(result.semanticCommitted, false);
+});

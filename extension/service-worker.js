@@ -5451,7 +5451,13 @@ async function injectedPageOperation(action, payload) {
     element.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
     if (payload.verifyCommit === true) await wait(180);
     const afterValue = readValue();
-    const semanticCommitted = afterValue === expectedValue;
+    // Same rule as verifyTypeValue: a rich editor keeps each line as its own block, so text added
+    // after Enter shows extra blank lines in innerText (LinkedIn, AOS run 619 on 2026-10-15). There
+    // the same non-empty lines in the same order count as committed; plain inputs match exactly.
+    const editorLines = (value) => value.replace(/\r\n?/gu, "\n").replace(/[​-‍﻿]/gu, "").replace(/ /gu, " ")
+      .split("\n").map((line) => line.replace(/[ \t]+$/u, "")).filter((line) => line.trim() !== "").join("\n");
+    const semanticCommitted = afterValue === expectedValue
+      || (element.isContentEditable === true && editorLines(afterValue) === editorLines(expectedValue));
     const semanticNoEffectVerified = payload.verifyCommit === true && afterValue === beforeValue;
     return {
       typed: semanticCommitted,
