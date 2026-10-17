@@ -1168,7 +1168,7 @@ async function createCapsuleHarness({ failVisualInspectionFor = null, failPostTy
         const matches = matched
           ? [{ tag: "h2", role: "heading", name: filename ?? text, text: filename ?? text, visible: true,
             nodeIdentity: tab?.sharedAttachmentWitness ? "shared-parent" : `row:${message.params?.locator?.allOf?.find(filter => filter.hasText)?.hasText ?? "query"}`,
-            rect: { x: 20, y: 20, width: 320, height: 40 } }]
+            rect: { x: 20, y: tab?.matchY ?? 20, width: 320, height: 40 }, focused: tab?.matchFocused === true }]
           : [];
         extension.send({
           kind: "command.result",
@@ -3675,9 +3675,11 @@ test("broker integration enforces capsule target parallelism, lifecycle status, 
       }),
       (error) => error.code === "reconciliation_visual_proof_invalid",
     );
+    // The success text changing after inspection still blocks completion.
     liveTabs.set(semanticSubmitUnknown.tab.id, {
       ...liveTabs.get(semanticSubmitUnknown.tab.id),
-      screenshotVersion: "changed-after-inspection",
+      savedText: liveTabs.get(semanticSubmitUnknown.tab.id).text,
+      text: `${liveTabs.get(semanticSubmitUnknown.tab.id).text} (edited)`,
     });
     await assert.rejects(
       client.requestCompleteReconciliation({
@@ -3690,11 +3692,16 @@ test("broker integration enforces capsule target parallelism, lifecycle status, 
         capsuleId: semanticSubmitUnknown.capsule.capsuleId,
         reconciliationProof: reconciliationInspection.reconciliationProof,
       }),
-      (error) => error.code === "reconciliation_readback_changed",
+      (error) => error.code === "reconciliation_readback_changed" && error.details?.changed?.includes("success elements or their text"),
     );
+    // Pixels, position and focus moving (a blinking caret, a scroll, the tab coming to the front)
+    // no longer block it (2026-10-17: every Ashby upload reconciliation failed this way).
     liveTabs.set(semanticSubmitUnknown.tab.id, {
       ...liveTabs.get(semanticSubmitUnknown.tab.id),
-      screenshotVersion: "stable",
+      text: liveTabs.get(semanticSubmitUnknown.tab.id).savedText,
+      screenshotVersion: "changed-after-inspection",
+      matchY: 220,
+      matchFocused: true,
     });
     const reconciliationCompletion = await client.requestCompleteReconciliation({
       sessionId: session.sessionId,

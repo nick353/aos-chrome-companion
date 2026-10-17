@@ -2370,10 +2370,12 @@ async function executeCommand(method, params) {
       });
       return { ...sanitizeTab(await chrome.tabs.get(tabId)), groupId, grouped: true, collapsed };
     }
-    case "page.snapshot":
-      return runPageOperation(requireTabId(params.tabId), "snapshot", {
+    case "page.snapshot": {
+      const tabId = requireTabId(params.tabId);
+      return readRenderedInForeground(tabId, () => runPageOperation(tabId, "snapshot", {
         maxTextChars: Math.min(Math.max(params.maxTextChars ?? 30_000, 1_000), 100_000),
-      });
+      }));
+    }
     case "page.screenshot":
       return params.fullPage === true || params.clip
         ? captureDocumentScreenshot(requireTabId(params.tabId), params)
@@ -2419,11 +2421,14 @@ async function executeCommand(method, params) {
       }, { allowedOrigins: params.allowedOrigins });
     case "page.assets":
       return runPageOperation(requireTabId(params.tabId), "assets", params, { allowedOrigins: params.allowedOrigins });
-    case "page.exportContent":
-      return runPageOperation(requireTabId(params.tabId), "exportContent", {
+    case "page.exportContent": {
+      const tabId = requireTabId(params.tabId);
+      const exportContent = () => runPageOperation(tabId, "exportContent", {
         format: params.format === "html" ? "html" : "text",
         maxChars: Math.min(Math.max(Number(params.maxChars ?? 50_000), 1_000), 100_000),
       });
+      return params.format === "html" ? exportContent() : readRenderedInForeground(tabId, exportContent);
+    }
     case "page.exportArtifact":
       return runPageOperation(requireTabId(params.tabId), "exportArtifact", {
         format: params.format === "html" ? "html" : "text",
@@ -2628,6 +2633,43 @@ async function waitForPageLocator(tabId, params) {
     const remaining = deadline - Date.now();
     if (remaining <= 0) throw companionError("page_wait_timeout", "Timed out waiting for the semantic locator", { timeoutMs, lastRead: result });
     await new Promise(resolve => setTimeout(resolve, Math.min(100, remaining)));
+  }
+}
+
+// Sites that draw their content from animation frames (X, Etsy, TikTok) stay blank in a
+// background tab: Chrome pauses rendering there, and runs gave up on "a white page" (owner,
+// 2026-10-17). When a read of a background tab finds almost no text, bring that tab to the front
+// of its window, wait up to 5 seconds for it to draw, read again, and give the window back the tab
+// that was in front, unless the user switched tabs meanwhile.
+const BLANK_PAGE_TEXT_CHARS = 200;
+const readText = result => String(result?.text ?? result?.content ?? "").trim();
+async function readRenderedInForeground(tabId, read) {
+  const first = await read();
+  if (readText(first).length >= BLANK_PAGE_TEXT_CHARS) return first;
+  let target;
+  try { target = await chrome.tabs.get(tabId); } catch { return first; }
+  if (target.active || target.discarded) return first;
+  const previous = (await chrome.tabs.query({ windowId: target.windowId, active: true }))[0]?.id;
+  let interrupted = false;
+  const activated = info => { if (info.windowId === target.windowId && info.tabId !== tabId) interrupted = true; };
+  chrome.tabs.onActivated.addListener(activated);
+  let result = first;
+  try {
+    await chrome.tabs.update(tabId, { active: true });
+    for (let waited = 0; waited < 5_000; waited += 500) {
+      await new Promise(resolve => setTimeout(resolve, 500));
+      result = await read();
+      if (readText(result).length >= BLANK_PAGE_TEXT_CHARS) break;
+    }
+    return { ...result, renderedInForeground: true };
+  } finally {
+    chrome.tabs.onActivated.removeListener(activated);
+    if (!interrupted && Number.isSafeInteger(previous) && previous !== tabId) {
+      try {
+        const active = await chrome.tabs.query({ windowId: target.windowId, active: true });
+        if (active[0]?.id === tabId) await chrome.tabs.update(previous, { active: true });
+      } catch { /* The previous tab may have closed. */ }
+    }
   }
 }
 

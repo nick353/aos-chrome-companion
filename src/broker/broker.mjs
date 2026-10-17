@@ -527,6 +527,19 @@ function validateCapabilityHandshake(value, { taskId, profile } = {}) {
   };
 }
 
+// What a reconciliation proof binds of a page.query match: the same element (its per-page
+// identity), its role, name and text. Position, focus and other live state are left out: a caret
+// moving into a field, a scroll or the tab coming to the front changed them between inspection and
+// completion, and every Ashby upload reconciliation failed as reconciliation_readback_changed
+// (owner, 2026-10-17: 48 failures in 10 runs in a week).
+function stableQueryMatches(matches) {
+  return (Array.isArray(matches) ? matches : []).map(match => ({
+    tag: match?.tag ?? null, role: match?.role ?? null, name: match?.name ?? null, testId: match?.testId ?? null,
+    controlType: match?.controlType ?? null, visible: match?.visible === true, nodeIdentity: match?.nodeIdentity ?? null,
+    text: match?.text ?? null,
+  }));
+}
+
 function semanticTargetStateDigest(secret, locator, inspection) {
   return payloadDigest(secret, {
     locator,
@@ -7374,7 +7387,7 @@ export class CompanionBroker extends EventEmitter {
       seenWitnesses.add(query.matches[0].nodeIdentity);
       if (file.preview_only === true && files.length === 1) {
         evidence.push({ filename_sha256: file.filename_sha256, file_sha256: file.file_sha256, preview_only: true,
-          query_digest: payloadDigest(this.ledgerSecret, { locator: file.locator, matches: query.matches }) });
+          query_digest: payloadDigest(this.ledgerSecret, { locator: file.locator, matches: stableQueryMatches(query.matches) }) });
         continue;
       }
       if (!file.filename_locator || file.filename_locator.exact !== true
@@ -7389,8 +7402,8 @@ export class CompanionBroker extends EventEmitter {
         || filenameQuery.pageInstanceId !== pageInstanceId || filenameQuery.url !== pageUrl)
         throw new CompanionError("upload_site_state_evidence_required", "The exact original filename must have one visible full-count witness within its attachment-ready row; renamed files require explicit mapping, never re-upload");
       evidence.push({ filename_sha256: file.filename_sha256, file_sha256: file.file_sha256,
-        query_digest: payloadDigest(this.ledgerSecret, { locator: file.locator, matches: query.matches,
-          filenameLocator: file.filename_locator, filenameMatches: filenameQuery.matches }) });
+        query_digest: payloadDigest(this.ledgerSecret, { locator: file.locator, matches: stableQueryMatches(query.matches),
+          filenameLocator: file.filename_locator, filenameMatches: stableQueryMatches(filenameQuery.matches) }) });
     }
     return evidence;
   }
@@ -7533,7 +7546,7 @@ export class CompanionBroker extends EventEmitter {
       pageUrl: String(semantic.url || ""),
       pageInstanceId: semantic.pageInstanceId ?? null,
       successQuery,
-      queryDigest: payloadDigest(this.ledgerSecret, { successQuery, matches: query.matches }),
+      queryDigest: payloadDigest(this.ledgerSecret, { successQuery, matches: stableQueryMatches(query.matches) }),
       screenshotDigest: payloadDigest(this.ledgerSecret, visual.dataBase64),
       capturedAt,
       expiresAt,
@@ -7743,7 +7756,7 @@ export class CompanionBroker extends EventEmitter {
       params: { tabId: binding.tabId, restoreActive: true, quality: 60, maxBytes: 700_000 },
       timeoutMs: 30_000,
     });
-    const queryDigest = payloadDigest(this.ledgerSecret, { successQuery: proofPayload.successQuery, matches: query?.matches ?? [] });
+    const queryDigest = payloadDigest(this.ledgerSecret, { successQuery: proofPayload.successQuery, matches: stableQueryMatches(query?.matches) });
     if (uploadConfirmation) {
       // Evidence rebuilt from the exact original payload (e.g. previewOnly) supersedes the
       // locators recorded at dispatch; its original operation is re-checked just below.
@@ -7763,19 +7776,21 @@ export class CompanionBroker extends EventEmitter {
     const screenshotDigest = visual?.dataBase64
       ? payloadDigest(this.ledgerSecret, visual.dataBase64)
       : null;
-    if (String(semantic?.url || "") !== String(proofPayload.pageUrl || "")
-      || semantic?.pageInstanceId !== proofPayload.pageInstanceId
-      || String(query?.url || "") !== String(proofPayload.pageUrl || "")
-      || query?.pageInstanceId !== proofPayload.pageInstanceId
-      || !Number.isSafeInteger(query?.count)
-      || query.count < 1
-      || queryDigest !== proofPayload.queryDigest
-      || visual?.kind !== "screenshot"
-      || visual?.tabId !== binding.tabId
-      || String(visual?.url || "") !== String(proofPayload.pageUrl || "")
-      || screenshotDigest !== proofPayload.screenshotDigest) {
-      throw new CompanionError("reconciliation_readback_changed", "The exact success page, semantic evidence, or screenshot changed after visual inspection");
+    // The page, its instance and the success elements must be exactly those inspected. The fresh
+    // screenshot must show the same tab and page, but its pixels need not be byte-identical: a
+    // blinking caret or a loading animation re-encodes differently every time (2026-10-17). Whether
+    // it changed is recorded with the completion.
+    const changed = [
+      (String(semantic?.url || "") !== String(proofPayload.pageUrl || "") || String(query?.url || "") !== String(proofPayload.pageUrl || "")) && "page URL",
+      (semantic?.pageInstanceId !== proofPayload.pageInstanceId || query?.pageInstanceId !== proofPayload.pageInstanceId) && "page instance (the page was reloaded or replaced)",
+      (!Number.isSafeInteger(query?.count) || query.count < 1) && "success text is no longer visible",
+      queryDigest !== proofPayload.queryDigest && "success elements or their text",
+      (visual?.kind !== "screenshot" || !screenshotDigest || visual?.tabId !== binding.tabId || String(visual?.url || "") !== String(proofPayload.pageUrl || "")) && "screenshot of the same tab and page",
+    ].filter(Boolean);
+    if (changed.length) {
+      throw new CompanionError("reconciliation_readback_changed", `The exact success page or its semantic evidence changed after visual inspection (${changed.join("; ")}). Call companion_inspect_reconciliation again and complete promptly`, { changed });
     }
+    const screenshotChangedAfterInspection = screenshotDigest !== proofPayload.screenshotDigest;
     this.consumedReconciliationProofs.set(signature, expiresAt);
     for (const [key, expiry] of this.consumedReconciliationProofs) if (expiry <= Date.now()) this.consumedReconciliationProofs.delete(key);
     const completedAt = nowIso();
@@ -7799,6 +7814,7 @@ export class CompanionBroker extends EventEmitter {
             uploadActionIndex: binding.capsule.effect.uploadDelivery.action_index } : {}),
           successQuerySha256: createHash("sha256").update(proofPayload.successQuery, "utf8").digest("hex"),
           pageUrl: proofPayload.pageUrl,
+          screenshotChangedAfterInspection,
           completedAt,
         },
         cleanup: { status: uploadConfirmation ? "pending_unsubmitted_workflow" : "pending_terminal_session_close" },
