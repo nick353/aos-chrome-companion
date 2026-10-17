@@ -7558,18 +7558,23 @@ export class CompanionBroker extends EventEmitter {
         recordedTargetDigest: binding.localNavigation.recordedTargetDigest,
       } : {}),
     };
+    // The proof comes first and the page text is cut short: on a big page (Gmail) the whole snapshot
+    // pushed the proof past the MCP client's output limit and it could not be passed on (2026-10-17).
+    // Completion reads the page again, so nothing here is relied on for the decision.
+    const brief = (value, max) => { const text = String(value ?? ""); return text.length > max ? `${text.slice(0, max)}…` : text; };
     return {
       kind: "reconciliation_visual_confirmation",
+      reconciliationProof: { ...proofPayload, signature: payloadDigest(this.ledgerSecret, proofPayload) },
       ...(uploadConfirmation ? { proof_kind: "upload_site_confirmation", upload_confirmation_observed: true, provider_success_confirmed: false } : {}),
       ...(binding.localNavigation ? {
         proof_kind: "local_navigation_arrival",
         local_navigation_arrival_verified: true,
         provider_success_confirmed: false,
       } : {}),
-      semantic,
-      successEvidence: query,
+      semantic: { url: semantic?.url, title: semantic?.title, readyState: semantic?.readyState, pageInstanceId: semantic?.pageInstanceId,
+        text: brief(semantic?.text, 2_000), textTruncated: String(semantic?.text ?? "").length > 2_000 },
+      successEvidence: { ...query, matches: (query?.matches ?? []).slice(0, 3).map(match => ({ ...match, name: brief(match?.name, 300), text: brief(match?.text, 300) })) },
       visual,
-      reconciliationProof: { ...proofPayload, signature: payloadDigest(this.ledgerSecret, proofPayload) },
       visual_readback_verified: true,
       external_action_executed: false,
       mutation_dispatch_attempted: false,
