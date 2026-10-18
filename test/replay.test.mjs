@@ -67,7 +67,8 @@ test('the replay copies the screens and writes a timeline without a video when a
       [{ at: at('2026-10-19T00:00:01Z'), path: source }]);
     steps[0].exactBlocker = 'semantic_locator_ambiguous';
     const out = join(dir, 'out');
-    const result = await writeReplay({ steps, outDir: out, video: false, meta: { runId: 'run-1' } });
+    // A folder given with a doubled slash (e.g. from $TMPDIR/…) must not shift the frame paths.
+    const result = await writeReplay({ steps, outDir: `${dir}//out`, video: false, meta: { runId: 'run-1' } });
     assert.equal(result.video, null);
     assert.equal(result.frameCount, 1);
     assert.equal(readFileSync(join(out, 'frames', '0001.jpg')).toString(), 'fake-jpeg');

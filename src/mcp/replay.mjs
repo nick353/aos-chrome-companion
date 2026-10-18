@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { copyFileSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
-import { extname, join } from "node:path";
+import { extname, join, relative } from "node:path";
 
 // A replay of what a task did, built from what Companion already keeps: the task's operation
 // history and the screens saved after each operation (result.mjs). Nothing new is captured, so
@@ -151,11 +151,11 @@ export async function writeReplay({ steps, outDir, secondsPerFrame = 1.5, video 
     operationCount: steps.filter(step => step.kind === "operation").length, frameCount: frames.length,
     secondsPerFrame, video: videoPath ? "replay.mp4" : null, videoError,
     steps: steps.map(({ screenshots, frames: stepFrames, ...step }) => ({ ...step, at: new Date(step.at).toISOString(),
-      frames: stepFrames.map(path => path.slice(outDir.length + 1)) })),
+      frames: stepFrames.map(path => relative(outDir, path)) })),
   };
   writeFileSync(join(outDir, "timeline.json"), `${JSON.stringify(timeline, null, 2)}\n`, { mode: 0o600 });
 
-  const rows = steps.map(step => `| ${step.index} | ${tokyoTime(step.at)} | ${stepTitle(step)} | ${step.state ? (STATES[step.state] ?? step.state) : ""}${step.exactBlocker ? `（${step.exactBlocker}）` : ""} | ${step.frames.length ? step.frames.map(path => path.slice(outDir.length + 1)).join(" ") : "画面なし"} |`);
+  const rows = steps.map(step => `| ${step.index} | ${tokyoTime(step.at)} | ${stepTitle(step)} | ${step.state ? (STATES[step.state] ?? step.state) : ""}${step.exactBlocker ? `（${step.exactBlocker}）` : ""} | ${step.frames.length ? step.frames.map(path => relative(outDir, path)).join(" ") : "画面なし"} |`);
   const markdown = [
     "# 振り返り",
     "",
