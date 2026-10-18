@@ -352,6 +352,9 @@ for (const [name, hooks, code] of [
   ['missing browser identity', { documentId: null }, 'document_identity_unavailable'],
   ['permission failure', { probe: () => { throw Object.assign(new Error('Cannot access page'), { code: 'permission_denied' }); } }, 'permission_denied'],
   ['malformed result', { probe: () => [{}] }, 'document_probe_invalid'],
+  // A document swapped during the probe answers nothing: still loading, read again (Gmail, 2026-10-18).
+  ['empty answer while the document is replaced', { probe: () => [{ frameId: 0, result: null }] }, 'document_not_ready'],
+  ['no answer at all', { probe: () => [] }, 'document_not_ready'],
   ['invalid readyState', { readyState: 'unknown' }, 'document_probe_invalid'],
   ['document URL mismatch', { probe: api => api.setDocument({ url: 'https://owned.example/other' }) }, 'document_target_changed'],
   ['pending redirect', { probe: api => api.setCurrent({ pendingUrl: 'https://owned.example/redirect' }) }, 'document_target_changed'],

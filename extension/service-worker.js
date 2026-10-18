@@ -788,6 +788,12 @@ async function probeCommittedDocument(tabId, { expectedWindowId, expectedUrl, al
       { tabId, frameIds: [0] }, "snapshot", { maxTextChars: 0 }, deadline - Date.now(),
     ));
     const entry = results[0];
+    // An empty answer is a document being swapped while the probe ran (Gmail rebuilds itself while it
+    // starts: 2-3 new Gmail tabs a day stopped here as malformed, 2026-10-15..17). It is still loading,
+    // so the commit wait reads it again; a malformed answer still stops.
+    if (results.length === 0 || (results.length === 1 && entry?.frameId === 0 && (entry.result === null || entry.result === undefined))) {
+      throw companionError("document_not_ready", "The committed document was still being replaced during its readiness probe");
+    }
     if (results.length !== 1 || entry?.frameId !== 0 || !entry.result || typeof entry.result !== "object" || Array.isArray(entry.result)) {
       throw companionError("document_probe_invalid", "Chrome returned a malformed committed document probe");
     }
