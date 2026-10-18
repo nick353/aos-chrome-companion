@@ -142,7 +142,17 @@ export function resolveDynamicTaskTarget({
   for (const entry of currentEntries) {
     const live = liveById.get(entry.tabId);
     if (!live) continue;
-    const origin = entryOrigin(entry, live);
+    // An explicitly named task tab that the task itself moved to another
+    // allowlisted site (a sign-in page such as accounts.google.com, on the way
+    // back to the site it was opened for) is judged by where it is now, as
+    // long as the site it was registered for is allowlisted too. 2026-10-18:
+    // CrowdWorks, Daijob and an ARC ATS form stopped on Google's account
+    // chooser as task_target_unavailable because the record still said the
+    // first site while the live tab was on accounts.google.com.
+    const registeredOrigin = entryOrigin(entry, live);
+    const origin = exactTabId !== undefined && allowedOrigins.includes(registeredOrigin)
+      ? originOf(live.url)
+      : registeredOrigin;
     if (exactTabId !== undefined && (entry.generation !== generation
       || originOf(live.url) !== expectedOrigin
       || !allowedOrigins.includes(originOf(live.url)))) continue;

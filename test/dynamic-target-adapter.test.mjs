@@ -71,6 +71,26 @@ test("explicit tab targeting preserves current routes and cannot fall back to an
   assert.equal(resolve([entry({ targetKey: "different" })], [changedRoute], { leases: [{ tabId: 10, sessionId: "another" }] }).status, "busy");
 });
 
+test("an explicit task tab that moved to an allowlisted sign-in page can be targeted there", () => {
+  const google = "https://accounts.google.com";
+  const chooser = live({ url: `${google}/v3/signin/accountchooser?redirect_uri=https%3A%2F%2Fexample.test%2Fcallback` });
+  const resolve = (extra, entries = [entry()]) => resolveDynamicTaskTarget({ session, taskTabs: entries, inventory: [chooser],
+    descriptor: { ...descriptor, tabId: 10, targetOrigin: google, allowedOrigins: ["https://example.test", google], ...extra } });
+  const result = resolve({});
+  assert.equal(result.status, "resolved");
+  assert.equal(result.live.url, chooser.url);
+  // Still the task's own tab only, and only while both sites are allowlisted.
+  assert.notEqual(resolve({ allowedOrigins: [google] }).status, "resolved");
+  assert.notEqual(resolve({ targetOrigin: "https://example.test" }).status, "resolved");
+  assert.notEqual(resolve({}, [entry({ taskId: "foreign" })]).status, "resolved");
+  assert.notEqual(resolve({}, [entry({ generation: "old" })]).status, "resolved");
+  assert.equal(resolve({}, [entry({ lifecycleState: "reconciliation_required" })]).status, "protected");
+  // Without an explicit tab nothing is adopted by its new site.
+  const loose = resolveDynamicTaskTarget({ session, taskTabs: [entry({ targetKey: "different" })], inventory: [chooser],
+    allowSameOriginReuse: true, descriptor: { ...descriptor, targetOrigin: google, allowedOrigins: ["https://example.test", google] } });
+  assert.notEqual(loose.status, "resolved");
+});
+
 test("dynamic target adapter rejects duplicate exact matches as ambiguous", () => {
   const result = resolveDynamicTaskTarget({
     session,
