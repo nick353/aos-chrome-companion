@@ -5842,3 +5842,24 @@ test("a click target below the fold is brought into view once instead of stoppin
     assert.equal(commands.filter((c) => c.method === "page.click").length, 1);
   } finally { await harness.close(); }
 });
+
+test("a locator miss reaches the run with the controls it nearly matched and its hidden matches", async () => {
+  const harness = await createCapsuleHarness({ interceptCommand: ({ message, extension }) => {
+    if (message.method !== "visual.inspectTarget" || message.params?.locator?.name !== "Post") return false;
+    extension.send({ kind: "command.error", operationId: message.operationId, error: {
+      code: "semantic_locator_not_found", message: "No visible element matched the semantic locator",
+      details: { nextAction: "query_current_page_then_refine_locator", hiddenMatches: 2,
+        suggestions: [{ role: "button", name: "Post now", tag: "div", extra: "x".repeat(500) }, { role: "button", name: "Repost", tag: "button" }] } } });
+    return true;
+  } });
+  try {
+    const { client, session } = harness;
+    const result = await client.requestAuthorizedTransaction({ sessionId: session.sessionId, taskId: session.taskId,
+      runId: "near-miss", idempotencyKey: "near-miss", startUrl: "https://example.test/compose", allowedOrigins: ["https://example.test"],
+      actions: [{ method: "page.click", params: { locator: { role: "button", name: "Post" } } }] });
+    assert.equal(result.exact_blocker.code, "semantic_locator_not_found");
+    assert.equal(result.exact_blocker.details.hiddenMatches, 2);
+    assert.deepEqual(result.exact_blocker.details.suggestions[0], { role: "button", name: "Post now", tag: "div", testId: null });
+    assert.equal(result.exact_blocker.details.suggestions.length, 2);
+  } finally { await harness.close(); }
+});

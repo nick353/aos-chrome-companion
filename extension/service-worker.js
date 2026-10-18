@@ -3321,7 +3321,30 @@ async function injectedPageOperation(action, payload) {
   const find = (locator, options = {}) => {
     const { candidates, scanLimitReached } = locateAll(locator, options);
     if (scanLimitReached) throw operationError("semantic_locator_scan_limit", "The candidate scan reached its limit; narrow the outer CSS selector or testId before targeting one element", { nextAction: "refine_outer_css_or_test_id_then_read_again" });
-    if (candidates.length === 0) throw operationError("semantic_locator_not_found", "No visible element matched the semantic locator", { nextAction: "query_current_page_then_refine_locator" });
+    if (candidates.length === 0) {
+      // A miss used to say only "read the page again", and runs spent turns guessing the name a site
+      // gives a button (2026-10-18: 17 misses that day on Threads, Instagram and X). Return the
+      // visible controls whose name is close to the one asked for, and how many matches are only
+      // hidden (a closed menu, a collapsed section, behind a dialog).
+      const wanted = lower(locator.name ?? locator.text ?? locator.label ?? locator.placeholder ?? "");
+      const words = wanted.split(/[\s、。・:：|｜/()（）]+/u).filter((word) => word.length >= 2);
+      const roleOf = (element) => element.getAttribute("role") || implicitRole(element);
+      const suggestions = querySemantic("button,a[href],input,textarea,select,[role],[contenteditable='true']", 2_000)
+        .filter(visible)
+        .filter((element) => !locator.role || roleOf(element) === locator.role)
+        .filter((element) => {
+          if (!wanted) return true;
+          const name = lower(accessibleName(element));
+          return !!name && (name.includes(wanted) || wanted.includes(name) || words.some((word) => name.includes(word)));
+        })
+        .slice(0, 6)
+        .map((element) => ({ role: roleOf(element), name: accessibleName(element).slice(0, 80), tag: element.tagName.toLowerCase() }));
+      let hiddenMatches = 0;
+      try { hiddenMatches = locateAll(locator, { ...options, includeHidden: true }).candidates.length; } catch { /* keep the miss itself */ }
+      throw operationError("semantic_locator_not_found", "No visible element matched the semantic locator", {
+        nextAction: "query_current_page_then_refine_locator", suggestions, hiddenMatches,
+      });
+    }
     if (candidates.length > 1) throw operationError("semantic_locator_ambiguous", `Semantic locator matched ${candidates.length} visible elements`, { candidates: candidates.slice(0, 10).map(describe), nextAction: "refine_locator_role_name_label_then_read_again" });
     return candidates[0];
   };

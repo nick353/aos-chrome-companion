@@ -553,6 +553,12 @@ function semanticTargetStateDigest(secret, locator, inspection) {
   });
 }
 
+// One near-miss control in a locator error, cut to what a run needs to name it.
+function boundedControl(control) {
+  const field = (value, max) => (typeof value === "string" ? value.slice(0, max) : null);
+  return { role: field(control?.role, 40), name: field(control?.name, 80), tag: field(control?.tag, 20), testId: field(control?.testId, 80) };
+}
+
 function snapshotTargetDocument(snapshot, locator) {
   const frameId = Number.isSafeInteger(locator?.frameId) ? locator.frameId : 0;
   if (frameId === 0) {
@@ -5601,6 +5607,11 @@ export class CompanionBroker extends EventEmitter {
           ...(typeof error.details.nextAction === "string" ? { nextAction: error.details.nextAction.slice(0, 180) } : {}),
           ...(typeof error.details.mutationDispatchAttempted === "boolean" ? { mutationDispatchAttempted: error.details.mutationDispatchAttempted } : {}),
           ...(typeof error.details.operationEffectState === "string" ? { operationEffectState: error.details.operationEffectState.slice(0, 40) } : {}),
+          // A locator miss or an ambiguous one carries the controls it nearly matched, so the run can
+          // pick the right name instead of reading the whole page again (2026-10-18).
+          ...(Array.isArray(error.details.suggestions) ? { suggestions: error.details.suggestions.slice(0, 6).map(boundedControl) } : {}),
+          ...(Array.isArray(error.details.candidates) ? { candidates: error.details.candidates.slice(0, 6).map(boundedControl) } : {}),
+          ...(Number.isSafeInteger(error.details.hiddenMatches) ? { hiddenMatches: error.details.hiddenMatches } : {}),
         }
         : {};
       if (error?.code === "screenshot_target_changed" && error.details && typeof error.details === "object") {
