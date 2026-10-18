@@ -17,6 +17,7 @@ import {
   DEFAULT_CAPABILITIES,
   AUTHORIZED_TRANSACTION_METHODS,
   SESSION_TTL_MS,
+  STALE_IDLE_SESSION_MS,
   TARGET_METHODS,
 } from "../shared/constants.mjs";
 import {
@@ -2240,8 +2241,20 @@ export class CompanionBroker extends EventEmitter {
       .filter((operation) => operation.profileInstanceId === profileKey
         && timedOutNeedsReconciliation(operation)
         && timedOutOperationHasLiveTaskReference(operation, [...this.taskTabs.values()]));
+    // A session idle for STALE_IDLE_SESSION_MS with no lease, pending operation or queued work holds
+    // nothing in the browser; the installer already counts it as stale. Counting it here put every
+    // Companion update off until the 30-minute expiry, which a busy day never reached (2026-10-18: a run
+    // that ended without closing its session kept the new version waiting for over an hour). The reload
+    // leaves such a session on the old generation, as the expiry would.
+    const leasedSessionIds = new Set(leases.map((lease) => lease.sessionId));
+    const pendingSessionIds = new Set(pending.map((operation) => operation.sessionId));
+    const queueKeys = [...this.operationQueues.keys()];
     const activeSessions = [...this.sessions.values()]
-      .filter((entry) => entry.profileInstanceId === profileKey && entry.sessionId !== session.sessionId);
+      .filter((entry) => entry.profileInstanceId === profileKey && entry.sessionId !== session.sessionId)
+      .filter((entry) => leasedSessionIds.has(entry.sessionId) || pendingSessionIds.has(entry.sessionId)
+        || entry.leaseIds?.size > 0
+        || queueKeys.some((key) => key === `session:${entry.sessionId}` || key.startsWith(`session:${entry.sessionId}:`))
+        || !(Date.now() - entry.lastSeenAt >= STALE_IDLE_SESSION_MS));
     const profileTaskTabs = [...this.taskTabs.values()]
       .filter((entry) => entry.profileInstanceId === profileKey);
     const profileCapsules = this.taskLedger.listTaskCapsules()

@@ -186,3 +186,26 @@ test("BrokerClient refresh returns a no-replay timeout receipt when generation n
   assert.equal(result.exactBlocker, "extension_reload_generation_not_reflected");
   assert.equal(result.noReplay, true);
 });
+
+// 2026-10-18: a run that ended without closing its session held the new Companion version off for over an hour.
+test("a session idle for five minutes with no lease or pending work does not defer the refresh", () => {
+  const old = new Date(Date.now() - 6 * 60_000).toISOString();
+  const recent = new Date(Date.now() - 60_000).toISOString();
+  const options = { profileInstanceId: "profile-1", ignoreSessionId: "current", expectedBuildId: "install-1" };
+  const current = { sessionId: "current", profileInstanceId: "profile-1" };
+  const allowed = planExtensionRefreshBoundary(status({ sessions: [current,
+    { sessionId: "ended-run", profileInstanceId: "profile-1", lastSeenAt: old, leaseCount: 0 }] }), options);
+  assert.equal(allowed.disposition, "allowed");
+  for (const other of [
+    { sessionId: "thinking", profileInstanceId: "profile-1", lastSeenAt: recent, leaseCount: 0 },
+    { sessionId: "holding", profileInstanceId: "profile-1", lastSeenAt: old, leaseCount: 1 },
+    { sessionId: "legacy-without-last-seen", profileInstanceId: "profile-1" },
+  ]) {
+    const result = planExtensionRefreshBoundary(status({ sessions: [current, other] }), options);
+    assert.equal(result.exactBlocker, "active_browser_session", other.sessionId);
+  }
+  const pendingOwner = planExtensionRefreshBoundary({ ...status({ sessions: [current,
+    { sessionId: "pending-owner", profileInstanceId: "profile-1", lastSeenAt: old, leaseCount: 0 }] }),
+    pendingOperations: [{ sessionId: "pending-owner" }] }, options);
+  assert.ok(pendingOwner.blockers.some((item) => item.code === "active_browser_session"));
+});

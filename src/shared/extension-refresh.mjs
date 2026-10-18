@@ -8,6 +8,7 @@
  * acceptance receipt for a fresh runtime.
  */
 export const EXTENSION_REFRESH_BOUNDARY_SCHEMA = "aos.chrome_companion.extension_refresh_boundary.v1";
+import { STALE_IDLE_SESSION_MS } from "./constants.mjs";
 
 const ACTIVE_TASK_TAB_LIFECYCLES = new Set([
   "admitted",
@@ -40,12 +41,24 @@ function profileFor(status, profileInstanceId) {
 function activeCounts(status, profileInstanceId, ignoreSessionId) {
   const taskTabs = (Array.isArray(status?.taskTabs) ? status.taskTabs : [])
     .filter((tab) => tab?.profileInstanceId === profileInstanceId);
-  const sessions = (Array.isArray(status?.logicalSessions) ? status.logicalSessions : [])
-    .filter((session) => session?.profileInstanceId === profileInstanceId
-      && session?.sessionId !== ignoreSessionId);
-  const liveSessionIds = new Set(sessions.map((session) => session.sessionId).filter(Boolean));
   const leases = (Array.isArray(status?.exactTabLeases) ? status.exactTabLeases : [])
     .filter((lease) => lease?.profileInstanceId === profileInstanceId);
+  // Same rule as the broker and the installer: a session idle for STALE_IDLE_SESSION_MS with no lease
+  // and no pending operation holds nothing in the browser and does not defer the refresh. A session
+  // without lastSeenAt (older status producers) still counts.
+  const leasedSessionIds = new Set(leases.map((lease) => lease?.sessionId).filter(Boolean));
+  const pendingSessionIds = new Set((Array.isArray(status?.pendingOperations) ? status.pendingOperations : [])
+    .map((operation) => operation?.sessionId).filter(Boolean));
+  const staleIdle = (session) => {
+    const lastSeen = Date.parse(session?.lastSeenAt ?? "");
+    return Number.isFinite(lastSeen) && Date.now() - lastSeen >= STALE_IDLE_SESSION_MS
+      && !(Number(session?.leaseCount) > 0) && !leasedSessionIds.has(session?.sessionId)
+      && !pendingSessionIds.has(session?.sessionId);
+  };
+  const sessions = (Array.isArray(status?.logicalSessions) ? status.logicalSessions : [])
+    .filter((session) => session?.profileInstanceId === profileInstanceId
+      && session?.sessionId !== ignoreSessionId && !staleIdle(session));
+  const liveSessionIds = new Set(sessions.map((session) => session.sessionId).filter(Boolean));
   const leasedTabKeys = new Set(leases.map((lease) => `${lease.profileInstanceId}:${lease.tabId}`));
   const pendingOperations = Array.isArray(status?.pendingOperations) ? status.pendingOperations : [];
   const taskTabIsLive = (tab) => {

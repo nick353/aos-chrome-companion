@@ -34,6 +34,10 @@ export const MAX_EXTENSION_MESSAGE_BYTES = 64 * 1024 * 1024;
 export const DEFAULT_OPERATION_TIMEOUT_MS = 15_000;
 export const MAX_OPERATION_TIMEOUT_MS = 60_000;
 export const SESSION_TTL_MS = 30 * 60_000;
+// A session idle this long with no lease, pending operation or queued work holds nothing in the browser.
+// The installer and the Extension reload both treat it as stale, so a run that ended without closing its
+// session does not hold every Companion update off until SESSION_TTL_MS expires it.
+export const STALE_IDLE_SESSION_MS = 5 * 60_000;
 
 // Chrome's profile-global tab lifecycle can take longer than a normal
 // target-scoped read, especially while several logical sessions are opening

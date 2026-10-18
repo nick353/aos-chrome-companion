@@ -9,6 +9,7 @@
  * stale-generation reconciliation tab can remain retained while the broker
  * gains the rebind/readback implementation needed to resolve it.
  */
+import { STALE_IDLE_SESSION_MS } from "../src/shared/constants.mjs";
 import { access, chmod, cp, lstat, mkdir, open, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -40,7 +41,6 @@ const ACTIVE_TASK_TAB_STATES = new Set([
   "admitted",
   "awaiting_user",
 ]);
-const STALE_IDLE_SESSION_MS = 5 * 60_000;
 
 function isLedgerOnlyTaskTab(tab) {
   return tab?.retentionPolicy === "ledger_only" && tab.userHelpRequired !== true;

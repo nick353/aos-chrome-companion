@@ -5863,3 +5863,52 @@ test("a locator miss reaches the run with the controls it nearly matched and its
     assert.equal(result.exact_blocker.details.suggestions.length, 2);
   } finally { await harness.close(); }
 });
+
+test("an Extension reload is not held off by another session that has been idle for five minutes without a lease", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "aos-er-stale-session-"));
+  const env = {
+    ...process.env,
+    AOS_CHROME_COMPANION_DATA_DIR: dataDir,
+    AOS_CHROME_COMPANION_SOCKET: join(dataDir, "broker.sock"),
+    AOS_CHROME_COMPANION_SECRET_FILE: join(dataDir, "secret"),
+    AOS_CHROME_COMPANION_CODEX_MCP_ISSUER_SECRET_FILE: join(dataDir, "codex-issuer"),
+  };
+  const secret = await ensureBrokerSecret(env);
+  const issuerSecret = "extension-reload-stale-session-issuer-secret";
+  await writeFile(env.AOS_CHROME_COMPANION_CODEX_MCP_ISSUER_SECRET_FILE, `${issuerSecret}\n`, { mode: 0o600 });
+  const broker = new CompanionBroker({ socketPath: env.AOS_CHROME_COMPANION_SOCKET, secret, issuerSecrets: { codex_mcp: issuerSecret } });
+  await broker.listen();
+  const extension = await connectPeer({ role: "extension-relay", autoStart: false, env });
+  const helloAck = onceMessage(extension, (message) => message.kind === "extension.hello_ack");
+  extension.send({ kind: "extension.hello", protocolVersion: PROTOCOL_VERSION, profileInstanceId: "profile_extension_reload_stale",
+    extensionRuntimeId: "runtime_extension_reload_stale", buildId: INSTALL_BUILD_ID, capabilities: DEFAULT_CAPABILITIES });
+  await helloAck;
+  const reloadCommands = [];
+  extension.onMessage((message) => {
+    if (message.kind === "command.request" && message.method === "extension.reload") reloadCommands.push(message);
+  });
+  const client = await BrokerClient.connect({ autoStart: false, env });
+  const owner = await client.request("session.open", { label: "reload owner", taskId: "task-reload-stale-owner" });
+  const thinking = await client.request("session.open", { label: "recently used", taskId: "task-recently-used" });
+  try {
+    // A session used a minute ago may be between two steps: it still holds the reload off.
+    await assert.rejects(client.requestExtensionReload({ sessionId: owner.sessionId, taskId: "task-reload-stale-owner",
+      runId: "run-reload-recent", idempotencyKey: "idem-reload-recent" }),
+    (error) => error.code === "extension_reload_busy" && error.details.activeSessionCount === 1);
+    assert.equal(reloadCommands.length, 0);
+    // Six minutes later, with no lease and nothing pending, it is a leftover of an ended run.
+    broker.sessions.get(thinking.sessionId).lastSeenAt = Date.now() - 6 * 60_000;
+    const reload = client.requestExtensionReload({ sessionId: owner.sessionId, taskId: "task-reload-stale-owner",
+      runId: "run-reload-stale", idempotencyKey: "idem-reload-stale" });
+    await new Promise((resolve) => { const check = () => reloadCommands.length > 0 ? resolve() : setTimeout(check, 5); check(); });
+    extension.send({ kind: "command.result", operationId: reloadCommands[0].operationId,
+      result: { accepted: true, scheduled: true, buildId: INSTALL_BUILD_ID } });
+    await reload;
+    assert.equal(reloadCommands.length, 1);
+  } finally {
+    client.close();
+    extension.close();
+    await broker.close();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
