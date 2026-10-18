@@ -1,4 +1,46 @@
+import { randomBytes } from "node:crypto";
+import { mkdirSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { resolveDataDir } from "../shared/paths.mjs";
+
 const fields = (value, names) => Object.fromEntries(names.filter(name => Object.hasOwn(value ?? {}, name)).map(name => [name, value[name]]));
+
+// Screenshots are also kept as files for a while, so a task can hand the very screen it saw to a
+// second reader (AOS's aos_check_screen: Claude looks before a button that cannot be taken back,
+// 2026-10-18). Only the newest 200 and none older than two days stay. Test runs keep none unless a
+// folder is named.
+const SCREENSHOT_KEEP = 200;
+const SCREENSHOT_MAX_AGE_MS = 2 * 24 * 3600_000;
+export function defaultScreenshotDir(env = process.env) {
+  return env.AOS_CHROME_COMPANION_SCREENSHOT_DIR ?? (env.NODE_TEST_CONTEXT ? null : join(resolveDataDir(env), "screenshots"));
+}
+
+// The task's session goes into the name ("s" + its first 8 hex digits), so the screens one run saw can
+// be found again from the session ids in its steps (AOS's check of a finished run).
+export function sessionTag(sessionId) {
+  const m = /^session_([0-9a-f]{8})/.exec(String(sessionId ?? ""));
+  return m ? `s${m[1]}` : null;
+}
+
+export function saveScreenshot(dataBase64, mimeType, dir, now = Date.now(), tag = null) {
+  try {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const ext = /png/.test(mimeType) ? "png" : /webp/.test(mimeType) ? "webp" : "jpg";
+    const label = /^s[0-9a-f]{8}$/.test(tag ?? "") ? `${tag}-` : "";
+    const path = join(dir, `shot-${now}-${label}${randomBytes(3).toString("hex")}.${ext}`);
+    writeFileSync(path, Buffer.from(dataBase64, "base64"), { mode: 0o600 });
+    // Names start with the time, so they sort oldest first.
+    const shots = readdirSync(dir).filter(name => /^shot-\d+-/.test(name)).sort();
+    shots.forEach((name, index) => {
+      if (shots.length - index > SCREENSHOT_KEEP || now - Number(name.split("-")[1]) > SCREENSHOT_MAX_AGE_MS) {
+        try { unlinkSync(join(dir, name)); } catch { /* already gone */ }
+      }
+    });
+    return path;
+  } catch {
+    return null; // a full or unwritable disk must not break the screenshot itself
+  }
+}
 
 // The native MCP structured result remains complete for existing callers.
 // Text-only clients can request the legacy full JSON with responseDetail:full.
@@ -31,18 +73,20 @@ export function transactionTextSummary(value) {
 }
 
 /** Keep browser evidence small and expose screenshots as native MCP images. */
-export function toolResult(value, { textDetail = 'full', detail = 'full' } = {}) {
+export function toolResult(value, { textDetail = 'full', detail = 'full', screenshotDir = null, screenshotTag = null } = {}) {
   const images = [];
-  const seen = new Set();
+  const seen = new Map(); // picture → the file it was saved to (null when not saved)
   function visit(item) {
     if (Array.isArray(item)) return item.map(visit);
     if (!item || typeof item !== 'object') return item;
     const screenshot = item.kind === 'screenshot' && typeof item.dataBase64 === 'string' && typeof item.mimeType === 'string';
     if (screenshot && !seen.has(item.dataBase64)) {
-      seen.add(item.dataBase64);
+      seen.set(item.dataBase64, screenshotDir ? saveScreenshot(item.dataBase64, item.mimeType, screenshotDir, Date.now(), screenshotTag) : null);
       images.push({ type: 'image', data: item.dataBase64, mimeType: item.mimeType });
     }
-    return Object.fromEntries(Object.entries(item).filter(([key]) => !(screenshot && key === 'dataBase64')).map(([key, entry]) => [key, visit(entry)]));
+    const savedPath = screenshot ? seen.get(item.dataBase64) : null;
+    const kept = Object.entries(item).filter(([key]) => !(screenshot && key === 'dataBase64')).map(([key, entry]) => [key, visit(entry)]);
+    return Object.fromEntries(savedPath ? [...kept, ['savedPath', savedPath]] : kept);
   }
   const metadata = visit(value);
   if (metadata?.visual_readback_verified === true && metadata?.visualProof

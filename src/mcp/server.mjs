@@ -7,7 +7,7 @@ import { PRODUCT_VERSION, PROTOCOL_VERSION, OPERATION_SCHEMA_DIGEST } from "../s
 import { INSTALL_BUILD_ID } from "../shared/build-info.mjs";
 import { transactionActionSchema } from "./action-schema.mjs";
 import { validateLocatorTree } from "./locator-validation.mjs";
-import { toolResult, taskStatus } from "./result.mjs";
+import { defaultScreenshotDir, sessionTag, toolResult, taskStatus } from "./result.mjs";
 import { normalizeError, CompanionError } from "../shared/errors.mjs";
 import { materializeTransactionActions } from "./action-materializer.mjs";
 import { bindCodexTaskId, McpTaskBindingRegistry, resolveCodexTaskId } from "./task-context.mjs";
@@ -115,12 +115,17 @@ async function recoverSessionForPrepareResume(client, { previousSessionId, runId
   return session;
 }
 
+// Where screenshots are kept as files (result.mjs), so their path can be handed on.
+const SCREENSHOT_DIR = defaultScreenshotDir();
+
 function guarded(handler, { summarizeTransactionText = false } = {}) {
   return async (args, extra) => {
     try {
       return toolResult(await withBrokerRequestSignal(extra?.signal, () => handler(args, extra)), {
         textDetail: summarizeTransactionText && args.responseDetail !== "full" ? "summary" : "full",
         detail: args.responseDetail === "compact" ? "compact" : "full",
+        screenshotDir: SCREENSHOT_DIR,
+        screenshotTag: sessionTag(args?.sessionId),
       });
     } catch (error) {
       return toolError(error);
@@ -444,7 +449,7 @@ server.registerTool("companion_list_page_assets", {
 }));
 
 server.registerTool("companion_screenshot", {
-  description: "Capture the exact leased tab. Default viewport capture temporarily activates the tab and restores it. fullPage or clip (document CSS pixels) uses the existing debugger opt-in without changing viewport or active tab; choose only one. Outputs a native image with capture bounds.",
+  description: "Capture the exact leased tab. Default viewport capture temporarily activates the tab and restores it. fullPage or clip (document CSS pixels) uses the existing debugger opt-in without changing viewport or active tab; choose only one. Outputs a native image with capture bounds. The picture is also saved as a file for two days; its path is returned as savedPath (hand it to a second reader such as AOS's aos_check_screen).",
   inputSchema: {
     sessionId,
     leaseId,
