@@ -2058,6 +2058,16 @@ async function runTypeWithVerifiedPhysicalFallback(tabId, payload, params) {
       { operationEffectState: "unknown", mutationDispatchAttempted: true },
     );
   }
+  // Physically retyping the whole text puts every line into one Draft.js block; X's own lines
+  // come only from a paste or a real Enter between the lines.
+  if (semantic?.draftEditor === true && String(payload.text).includes("\n")) {
+    throw companionError(
+      "draft_editor_multiline_physical_fallback_unsupported",
+      "The Draft.js editor did not take the pasted lines; type each line with visual.typeText and press Enter with visual.pressKey between them",
+      { operationEffectState: "none", mutationDispatchAttempted: true, semanticNoEffectVerified: true,
+        nextAction: "visual_typeText_each_line_then_visual_pressKey_Enter" },
+    );
+  }
   if (Number.isSafeInteger(payload.locator.frameId) && payload.locator.frameId !== 0) {
     throw companionError(
       "physical_fallback_iframe_coordinate_space_unsupported",
@@ -5460,7 +5470,35 @@ async function injectedPageOperation(action, payload) {
     const beforeValue = readValue();
     const inputText = String(payload.text).replace(/\r\n?/gu, "\n");
     const expectedValue = payload.clear ? inputText : `${beforeValue}${inputText}`;
-    if (element.isContentEditable) {
+    // X's post box is a Draft.js editor. It keeps every line as one block in its own state and does
+    // not read a direct DOM edit: the box then showed the lines, yet X published its state as one
+    // paragraph (AOS run 8184, 2026-10-18), and lines appended after a page Enter left no line blocks
+    // at all (run 8424). Draft.js takes text the way a paste delivers it and makes one block per
+    // line, so it gets a paste, and only the same blocks as the requested lines count as committed.
+    const draftEditor = element.isContentEditable === true
+      && (element.matches?.(".public-DraftEditor-content") === true || element.querySelector?.("[data-contents='true']") != null);
+    const draftLines = () => [...element.querySelectorAll("[data-block='true']")]
+      .map((block) => String(block.textContent ?? "").replace(/[​-‍﻿]/gu, "").replace(/ /gu, " ").replace(/[ \t]+$/u, ""));
+    const expectedDraftLines = draftEditor
+      ? (payload.clear ? inputText : `${draftLines().join("\n")}${inputText}`).split("\n").map((line) => line.replace(/[ \t]+$/u, ""))
+      : null;
+    let draftPasteHandled = null;
+    if (draftEditor) {
+      const selection = globalThis.getSelection?.();
+      if (!selection) throw operationError("contenteditable_selection_unavailable", "The editor did not expose a selection range for safe text input");
+      // Draft.js pastes over its own selection, which follows the page selection on selectionchange.
+      const range = document.createRange();
+      range.selectNodeContents(element);
+      if (!payload.clear) range.collapse(false);
+      selection.removeAllRanges();
+      selection.addRange(range);
+      await wait(120);
+      const data = new DataTransfer();
+      data.setData("text/plain", inputText);
+      const paste = new ClipboardEvent("paste", { clipboardData: data, bubbles: true, cancelable: true, composed: true });
+      element.dispatchEvent(paste);
+      draftPasteHandled = paste.defaultPrevented === true;
+    } else if (element.isContentEditable) {
       const selection = globalThis.getSelection?.();
       if (selection) {
         const range = document.createRange();
@@ -5489,8 +5527,10 @@ async function injectedPageOperation(action, payload) {
       if (setter) setter.call(element, expectedValue);
       else element.value = expectedValue;
     }
-    element.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText", data: payload.text }));
-    element.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+    if (!draftEditor) {
+      element.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText", data: payload.text }));
+      element.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+    }
     if (payload.verifyCommit === true) await wait(180);
     let afterValue = readValue();
     // Same rule as verifyTypeValue: a rich editor keeps each line as its own block, so text added
@@ -5498,8 +5538,9 @@ async function injectedPageOperation(action, payload) {
     // the same non-empty lines in the same order count as committed; plain inputs match exactly.
     const editorLines = (value) => value.replace(/\r\n?/gu, "\n").replace(/[​-‍﻿]/gu, "").replace(/ /gu, " ")
       .split("\n").map((line) => line.replace(/[ \t]+$/u, "")).filter((line) => line.trim() !== "").join("\n");
-    const holdsExpected = (value) => value === expectedValue
-      || (element.isContentEditable === true && editorLines(value) === editorLines(expectedValue));
+    const holdsExpected = (value) => draftEditor
+      ? (() => { const shown = draftLines(); return shown.length === expectedDraftLines.length && shown.every((line, index) => line === expectedDraftLines[index]); })()
+      : value === expectedValue || (element.isContentEditable === true && editorLines(value) === editorLines(expectedValue));
     let semanticCommitted = holdsExpected(afterValue);
     // A framework editor (Lexical on Threads) takes the inserted nodes out and renders the same text
     // from its own state a moment later, so a read right after the input event sees a half-rebuilt
@@ -5523,6 +5564,8 @@ async function injectedPageOperation(action, payload) {
       beforeValueLength: beforeValue.length,
       expectedValueLength: expectedValue.length,
       valueLength: afterValue.length,
+      ...(draftEditor ? { draftEditor: true, draftPasteHandled, draftLinesVerified: semanticCommitted,
+        lineCount: draftLines().length, expectedLineCount: expectedDraftLines.length } : {}),
       // The frame-origin check after a frame-scoped operation reads this URL (frame 0 can fall back
       // to the tab URL, a nested frame cannot). Without it typing into a same-site iframe was always
       // refused as target_frame_origin_not_allowed (doda's certificate picker, 2026-10-18).

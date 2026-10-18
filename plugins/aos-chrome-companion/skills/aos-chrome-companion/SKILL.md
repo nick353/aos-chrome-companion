@@ -206,6 +206,13 @@ semantic plus visual preflight; it must never take over a Companion lease.
    editor and must be explicitly intended. To insert at the selected range,
    use `clear=false`; to format existing text, use the selection and toolbar
    path below. Omitting `clear` must never authorize whole-editor replacement.
+   Draft.js editors (X's post box, `.public-DraftEditor-content`) keep each
+   line as one block in their own state, and a site publishes that state, not
+   the DOM. `page.type` hands them the text as a paste and commits only when
+   every requested line is its own block (`draftLinesVerified`, `lineCount`,
+   `expectedLineCount`). `page.pressKey` sends an untrusted Enter that Draft.js
+   ignores, so never build lines with it; without `page.type`, use
+   `visual.typeText` per line and `visual.pressKey` Enter between lines.
    For contenteditable rich-text editors, use `page.selectText` with one exact
    editor locator and the exact visible text range before clicking a semantic
    formatting toolbar control. Omit `occurrence` when the text is unique; when
