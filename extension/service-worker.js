@@ -5478,7 +5478,7 @@ async function injectedPageOperation(action, payload) {
     const draftEditor = element.isContentEditable === true
       && (element.matches?.(".public-DraftEditor-content") === true || element.querySelector?.("[data-contents='true']") != null);
     const draftLines = () => [...element.querySelectorAll("[data-block='true']")]
-      .map((block) => String(block.textContent ?? "").replace(/[​-‍﻿]/gu, "").replace(/ /gu, " ").replace(/[ \t]+$/u, ""));
+      .map((block) => String(block.textContent ?? "").replace(/[\u200b-\u200d\ufeff]/gu, "").replace(/\u00a0/gu, " ").replace(/[ \t]+$/u, ""));
     const expectedDraftLines = draftEditor
       ? (payload.clear ? inputText : `${draftLines().join("\n")}${inputText}`).split("\n").map((line) => line.replace(/[ \t]+$/u, ""))
       : null;
