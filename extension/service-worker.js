@@ -739,6 +739,20 @@ function originOf(value) {
   try { return new URL(value).origin; } catch { return null; }
 }
 
+// The same service under another name; keep equal to GROUPS in src/shared/site-aliases.mjs (a test
+// compares them). A tab sent to doda.jp that lands on app.doda.jp, or a Greenhouse board that now
+// redirects to job-boards.greenhouse.io, is still the task's own target: both were stopped as
+// target_origin_mismatch (2026-10-18: 10 in a day). Any other origin still has to match exactly.
+const SITE_ALIAS_GROUPS = [
+  ["https://www.threads.com", "https://threads.com", "https://www.threads.net", "https://threads.net"],
+  ["https://doda.jp", "https://www.doda.jp", "https://app.doda.jp"],
+  ["https://boards.greenhouse.io", "https://job-boards.greenhouse.io"],
+];
+
+function sameSiteOrigin(expected, actual) {
+  return expected === actual || SITE_ALIAS_GROUPS.some((group) => group.includes(expected) && group.includes(actual));
+}
+
 function allowedOriginsOf(value) {
   if (!Array.isArray(value) || value.length === 0) return null;
   return new Set(value.map((entry) => originOf(entry)).filter(Boolean));
@@ -752,7 +766,7 @@ async function assertLiveOrigin(tabId, params, { allowBlank = false } = {}) {
   if (!allowed || !origin || (!allowBlank && !allowed.has(origin))) {
     throw companionError("target_origin_not_allowed", "Live tab origin is outside the signed allowlist");
   }
-  if (params.targetOrigin && params.targetOrigin !== "*" && params.targetOrigin !== origin) {
+  if (params.targetOrigin && params.targetOrigin !== "*" && !sameSiteOrigin(params.targetOrigin, origin)) {
     throw companionError("target_origin_mismatch", "Live tab origin does not match authority targetOrigin");
   }
   return tab;
@@ -3034,9 +3048,39 @@ async function injectedPageOperation(action, payload) {
     }
     return output;
   };
+  // A control can have no box of its own while its icon and label are painted by its children:
+  // Threads draws its side links (/search, /@account) as 0x0 anchors around a sized icon, so every
+  // semantic click on them was refused as not found and runs fell back to coordinate clicks that
+  // then stopped as moved (2026-10-18). Measure such an element by its rendered descendants,
+  // unless it clips them (a zero-size box with overflow hidden really shows nothing).
+  const boxOf = (element) => {
+    const own = element.getBoundingClientRect();
+    if (own.width > 0 && own.height > 0) return own;
+    const style = getComputedStyle(element);
+    if (style.display === "none" || (style.display !== "contents"
+      && (style.overflowX !== "visible" || style.overflowY !== "visible"))) return own;
+    let left = Infinity; let top = Infinity; let right = -Infinity; let bottom = -Infinity;
+    const descendants = element.querySelectorAll("*");
+    for (let index = 0; index < descendants.length && index < 64; index += 1) {
+      const childStyle = getComputedStyle(descendants[index]);
+      if (childStyle.display === "none" || childStyle.visibility === "hidden") continue;
+      const rect = descendants[index].getBoundingClientRect();
+      if (!(rect.width > 0 && rect.height > 0)) continue;
+      left = Math.min(left, rect.left); top = Math.min(top, rect.top);
+      right = Math.max(right, rect.right); bottom = Math.max(bottom, rect.bottom);
+    }
+    return right > left && bottom > top ? new DOMRect(left, top, right - left, bottom - top) : own;
+  };
+  // scrollIntoView does nothing for an element without its own box; scroll its first sized descendant.
+  const scrollTargetOf = (element) => {
+    const own = element.getBoundingClientRect();
+    if (own.width > 0 && own.height > 0) return element;
+    return [...element.querySelectorAll("*")].slice(0, 64)
+      .find((child) => { const rect = child.getBoundingClientRect(); return rect.width > 0 && rect.height > 0; }) ?? element;
+  };
   const visible = (element) => {
     const style = getComputedStyle(element);
-    const rect = element.getBoundingClientRect();
+    const rect = boxOf(element);
     return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
   };
   const implicitRole = (element) => {
@@ -3086,6 +3130,17 @@ async function injectedPageOperation(action, payload) {
       })
       .join(" "),
   );
+  // An icon-only control takes its name from its icon, as a screen reader reads it: Instagram's
+  // like and comment buttons are a div[role=button] around an svg whose aria-label (and <title>) is
+  // "いいね！" / "コメント", and innerText leaves svg text out, so they had no name and every
+  // semantic click on them was refused as not found (2026-10-18).
+  const iconName = (element) => {
+    if (!element.querySelector) return "";
+    const icon = element.querySelector("svg[aria-label], [role='img'][aria-label], img[alt]:not([alt='']), svg title");
+    if (!icon) return "";
+    return icon.tagName?.toLowerCase() === "title" ? icon.textContent
+      : icon.getAttribute("aria-label") || icon.getAttribute("alt") || "";
+  };
   const accessibleName = (element) => normalize(
     element.getAttribute("aria-label")
       || referencedText(element, "aria-labelledby")
@@ -3094,7 +3149,8 @@ async function injectedPageOperation(action, payload) {
       || labelText(element)
       || element.innerText
       || (element instanceof HTMLInputElement && !["button", "submit", "reset"].includes(element.type) ? "" : element.getAttribute("value"))
-      || element.getAttribute("placeholder"),
+      || element.getAttribute("placeholder")
+      || iconName(element),
   );
   const parentSemanticNode = (node) => {
     if (!node) return null;
@@ -3164,7 +3220,7 @@ async function injectedPageOperation(action, payload) {
     focused: document.activeElement === element,
   });
   const describe = (element) => {
-    const rect = element.getBoundingClientRect?.();
+    const rect = typeof element.getBoundingClientRect === "function" ? boxOf(element) : undefined;
     const state = { ...elementState(element), ...controlState(element) };
     return {
     tag: element.tagName.toLowerCase(),
@@ -3324,6 +3380,22 @@ async function injectedPageOperation(action, payload) {
     }
     return { candidates, scanLimitReached };
   };
+  // A label inside its own link or button carries the same name as the control, so a locator by
+  // name matched both and stopped as ambiguous (doda's "入力内容を確認する" is a <p> inside an <a>,
+  // 2026-10-18). When exactly one candidate is a control and every other candidate is inside it or
+  // wraps it, they are one target: the control. Separate controls (time slots, list rows) still stop.
+  const CONTROL_ROLES = new Set(["button", "link", "menuitem", "tab", "checkbox", "radio", "option", "switch", "combobox", "textbox"]);
+  const isControl = (element) => {
+    const tag = element.tagName?.toLowerCase();
+    return tag === "button" || tag === "select" || tag === "textarea" || tag === "input"
+      || (tag === "a" && element.hasAttribute?.("href")) || CONTROL_ROLES.has(element.getAttribute?.("role"));
+  };
+  const oneControlAmong = (candidates) => {
+    const controls = candidates.filter(isControl);
+    if (controls.length !== 1) return null;
+    const [control] = controls;
+    return candidates.every((element) => element === control || control.contains(element) || element.contains(control)) ? control : null;
+  };
   const find = (locator, options = {}) => {
     const { candidates, scanLimitReached } = locateAll(locator, options);
     if (scanLimitReached) throw operationError("semantic_locator_scan_limit", "The candidate scan reached its limit; narrow the outer CSS selector or testId before targeting one element", { nextAction: "refine_outer_css_or_test_id_then_read_again" });
@@ -3351,6 +3423,10 @@ async function injectedPageOperation(action, payload) {
         nextAction: "query_current_page_then_refine_locator", suggestions, hiddenMatches,
       });
     }
+    if (candidates.length > 1) {
+      const control = oneControlAmong(candidates);
+      if (control) return control;
+    }
     if (candidates.length > 1) throw operationError("semantic_locator_ambiguous", `Semantic locator matched ${candidates.length} visible elements`, { candidates: candidates.slice(0, 10).map(describe), nextAction: "refine_locator_role_name_label_then_read_again" });
     return candidates[0];
   };
@@ -3361,7 +3437,7 @@ async function injectedPageOperation(action, payload) {
     host.id = hostId;
     host.style.cssText = "all:initial;position:fixed;inset:0;z-index:2147483647;pointer-events:none";
     const root = host.attachShadow({ mode: "closed" });
-    const rect = element.getBoundingClientRect();
+    const rect = boxOf(element);
     const x = Math.max(12, Math.min(innerWidth - 12, rect.left + rect.width / 2));
     const y = Math.max(12, Math.min(innerHeight - 12, rect.top + rect.height / 2));
     const prior = window.__aosCompanionVisualCursorPosition
@@ -3535,7 +3611,7 @@ async function injectedPageOperation(action, payload) {
       { operationEffectState: afterFocus ? "unknown" : "none", mutationDispatchAttempted: afterFocus }); };
     if (!record || record.expiresAt <= Date.now() || record.element !== element
       || record.pageInstanceId !== pageInstanceId || record.url !== location.href || !element.isConnected) reject();
-    const rect = element.getBoundingClientRect();
+    const rect = boxOf(element);
     const point = { x: Math.round((Math.max(0, rect.left) + Math.min(innerWidth, rect.right)) / 2),
       y: Math.round((Math.max(0, rect.top) + Math.min(innerHeight, rect.bottom)) / 2) };
     const state = JSON.stringify({ element: describe(element), mapping: frameCoordinateMap(point),
@@ -3903,7 +3979,7 @@ async function injectedPageOperation(action, payload) {
       .filter((entry) => !needle || lower(entry.text).includes(needle));
     const candidates = matching.slice(offset, offset + limit)
       .map(({ element, text }) => {
-        const rect = element.getBoundingClientRect();
+        const rect = boxOf(element);
         const identities = globalThis.__aosCompanionQueryNodeIdentitiesV1 ??= new WeakMap();
         if (!identities.has(element)) identities.set(element, crypto.randomUUID());
         return {
@@ -4220,7 +4296,7 @@ async function injectedPageOperation(action, payload) {
       throw operationError("element_crop_frame_unsupported", "Element crops currently use the main frame; use a verified whole-tab region for a child frame");
     }
     const element = find(payload.locator);
-    const rect = element.getBoundingClientRect();
+    const rect = boxOf(element);
     return { element: describe(element), documentRect: { x: rect.x + scrollX, y: rect.y + scrollY, width: rect.width, height: rect.height },
       url: location.href, pageInstanceId, frameId: 0 };
   }
@@ -4232,9 +4308,9 @@ async function injectedPageOperation(action, payload) {
       // Use a synchronous scroll/layout read instead of a page timer, which
       // may be throttled for a background task tab. The broker still verifies
       // this geometry against the screenshot and again before input.
-      element.scrollIntoView({ behavior: "instant", block: "center", inline: "center" });
+      scrollTargetOf(element).scrollIntoView({ behavior: "instant", block: "center", inline: "center" });
     }
-    const rect = element.getBoundingClientRect();
+    const rect = boxOf(element);
     const clipped = {
       left: Math.max(0, rect.left),
       top: Math.max(0, rect.top),
@@ -4418,7 +4494,7 @@ async function injectedPageOperation(action, payload) {
       && new Set(["submit", "image"]).has(element.type)
       && Boolean(element.form)
     );
-    element.scrollIntoView({ block: "center", inline: "center" });
+    scrollTargetOf(element).scrollIntoView({ block: "center", inline: "center" });
     visualize(element, "click");
     activateControl(element, guard);
     return {
@@ -4433,7 +4509,7 @@ async function injectedPageOperation(action, payload) {
   }
   if (action === "doubleClick") {
     const element = find(payload.locator);
-    element.scrollIntoView({ block: "center", inline: "center" });
+    scrollTargetOf(element).scrollIntoView({ block: "center", inline: "center" });
     element.focus();
     await visualize(element, "double click");
     const options = { bubbles: true, composed: true, cancelable: true, view: window, detail: 2 };
@@ -4448,9 +4524,9 @@ async function injectedPageOperation(action, payload) {
   }
   if (action === "hover") {
     const element = find(payload.locator);
-    element.scrollIntoView({ block: "center", inline: "center" });
+    scrollTargetOf(element).scrollIntoView({ block: "center", inline: "center" });
     await visualize(element, "hover");
-    const rect = element.getBoundingClientRect();
+    const rect = boxOf(element);
     const mouse = { bubbles: true, composed: true, cancelable: true, view: window, clientX: rect.left + rect.width / 2, clientY: rect.top + rect.height / 2 };
     element.dispatchEvent(new PointerEvent("pointerover", { ...mouse, pointerId: 1, pointerType: "mouse", isPrimary: true }));
     element.dispatchEvent(new MouseEvent("mouseover", mouse));
@@ -4466,7 +4542,7 @@ async function injectedPageOperation(action, payload) {
       throw operationError("checked_control_required", "Matched element is not a checkbox, radio, or switch");
     }
     const requested = payload.checked !== false;
-    element.scrollIntoView({ block: "center", inline: "center" });
+    scrollTargetOf(element).scrollIntoView({ block: "center", inline: "center" });
     await visualize(element, requested ? "check" : "uncheck");
     const before = element instanceof HTMLInputElement ? element.checked : element.getAttribute("aria-checked") === "true";
     if (before !== requested) activateControl(element);
@@ -4610,7 +4686,7 @@ async function injectedPageOperation(action, payload) {
     const rawEndOffset = nodes.find(entry => entry.node === endPoint.node).start + endPoint.offset;
     const selection = globalThis.getSelection();
     if (!selection) throw operationError("selection_api_unavailable", "The page did not expose a document selection");
-    element.scrollIntoView({ block: "center", inline: "center" });
+    scrollTargetOf(element).scrollIntoView({ block: "center", inline: "center" });
     element.focus();
     await visualize(element, "select text");
     if (!element.isConnected || JSON.stringify(structure(element)) !== originalStructure
@@ -5041,7 +5117,7 @@ async function injectedPageOperation(action, payload) {
     const amount = Math.min(Math.max(Number.isFinite(Number(payload.amount)) ? Math.round(Math.abs(Number(payload.amount))) : 600, 1), 10_000);
     const element = targetOrActive(payload.locator);
     if (payload.locator) {
-      element.scrollIntoView({ block: "center", inline: "center" });
+      scrollTargetOf(element).scrollIntoView({ block: "center", inline: "center" });
       await visualize(element, `scroll ${direction}`);
     }
     const horizontal = direction === "left" || direction === "right";
@@ -5470,7 +5546,7 @@ async function injectedPageOperation(action, payload) {
         "page.type replaces the entire editor, not the selected text. Use the formatting toolbar for partial edits; only pass clear:true for an authorized whole-editor replacement.",
         { operationEffectState: "none", mutationDispatchAttempted: false });
     }
-    element.scrollIntoView({ block: "center", inline: "center" });
+    scrollTargetOf(element).scrollIntoView({ block: "center", inline: "center" });
     element.focus();
     await visualize(element, "type");
     if (element instanceof HTMLSelectElement) {
@@ -5779,7 +5855,7 @@ async function injectedPageOperation(action, payload) {
   if (action === "submit") {
     const element = find(payload.locator);
     consumeSemanticGuard(element);
-    element.scrollIntoView({ block: "center", inline: "center" });
+    scrollTargetOf(element).scrollIntoView({ block: "center", inline: "center" });
     visualize(element, "submit");
     if (!(element instanceof HTMLFormElement)) {
       const form = element.closest("form");

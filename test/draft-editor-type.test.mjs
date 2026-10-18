@@ -54,7 +54,7 @@ function draftEnv({ onPaste = "split", before = [""], clear = true, text = body,
   const env = {
     action: "type", payload: { locator: {}, text, clear, clearExplicit: clear, verifyCommit: true },
     find: () => element, HTMLInputElement: Input, HTMLTextAreaElement: Input, HTMLSelectElement: class {},
-    operationError: (code, message) => Object.assign(new Error(message), { code }), describe: () => ({}),
+    operationError: (code, message) => Object.assign(new Error(message), { code }), describe: () => ({}), boxOf: (element) => element.getBoundingClientRect(), scrollTargetOf: (element) => element, 
     visualize: async () => {}, wait: async () => {}, DataTransfer, ClipboardEvent,
     InputEvent: class { constructor(type) { this.type = type; } }, Event: class { constructor(type) { this.type = type; } },
     globalThis: { getSelection: () => ({ removeAllRanges() {}, addRange() {} }) },

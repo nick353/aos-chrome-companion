@@ -111,7 +111,7 @@ function selectionFixture(source, { text = "alpha beta", children, focus, afterS
     },
   };
   const context = {
-    NodeFilter: { SHOW_TEXT: 4 }, find: () => editor, describe: () => ({}), location: { href: "https://editor.test/" },
+    NodeFilter: { SHOW_TEXT: 4 }, find: () => editor, describe: () => ({}), boxOf: (element) => element.getBoundingClientRect(), scrollTargetOf: (element) => element,  location: { href: "https://editor.test/" },
     getSelection: () => selection, getComputedStyle: () => ({ display: "block", visibility: "visible" }),
     visualize: async () => {}, wait: async () => afterSelection?.(api),
     operationError: (code, message) => Object.assign(new Error(message), { code }),

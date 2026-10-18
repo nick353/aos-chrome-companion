@@ -13,7 +13,7 @@ test('visual inspection reads committed scroll geometry without a throttled page
   const ctx={crypto:globalThis.crypto,action:'inspectVisualTarget',payload:{locator:{label:'target'}},find:()=>element,
     wait:()=>{throw Error('hidden page timer was awaited');},innerWidth:500,innerHeight:300,
     devicePixelRatio:1,scrollX:0,scrollY:0,pageInstanceId:'page',location:{href:'https://owned.test/'},
-    describe:()=>({name:'target'}),frameCoordinateMap:point=>({supported:true,point,framePath:[],viewport:{width:500,height:300}})};
+    describe:()=>({name:'target'}),boxOf:element=>element.getBoundingClientRect(),scrollTargetOf:element=>element,frameCoordinateMap:point=>({supported:true,point,framePath:[],viewport:{width:500,height:300}})};
   const result=await vm.runInNewContext('(async()=>{'+source.slice(a,b)+'})()',ctx);
   assert.equal(scrollOptions.behavior,'instant');
   assert.equal(result.point.y,50);

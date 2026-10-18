@@ -81,7 +81,7 @@ for(const hitKind of ['exact','descendant','shadow-descendant','upload-label','s
  else if(hitKind==='shadow-descendant'){
   const root={host:element,getRootNode:()=>root};const leaf={parentNode:root};element.shadowRoot={elementFromPoint:()=>leaf};hit=element;
  }else if(hitKind==='none')hit=null;else hit={parentNode:null,getRootNode:()=>({})};
- const ctx={crypto:globalThis.crypto,action:'inspectVisualTarget',payload:{locator:before.locator,scroll:false,requireHitOwner:true},find:()=>element,innerWidth:714,innerHeight:635,devicePixelRatio:2,scrollX:0,scrollY:0,pageInstanceId:'doc',location:{href:before.pageUrl},document:{elementFromPoint:()=>hit},describe:()=>({name:'Library'}),operationError:error,frameCoordinateMap:point=>({supported:true,point,framePath:[],coordinateSpace:'top-level-viewport',viewport:before.viewport,scroll:before.scroll})};
+ const ctx={boxOf:element=>element.getBoundingClientRect(),scrollTargetOf:element=>element,crypto:globalThis.crypto,action:'inspectVisualTarget',payload:{locator:before.locator,scroll:false,requireHitOwner:true},find:()=>element,innerWidth:714,innerHeight:635,devicePixelRatio:2,scrollX:0,scrollY:0,pageInstanceId:'doc',location:{href:before.pageUrl},document:{elementFromPoint:()=>hit},describe:()=>({name:'Library'}),operationError:error,frameCoordinateMap:point=>({supported:true,point,framePath:[],coordinateSpace:'top-level-viewport',viewport:before.viewport,scroll:before.scroll})};
  if(['upload-label','sticky-generate','none'].includes(hitKind))await assert.rejects(vm.runInNewContext('(async()=>{'+inspect+'})()',ctx),e=>e.code==='visual_target_not_at_point');
  else{const r=await vm.runInNewContext('(async()=>{'+inspect+'})()',ctx);assert.equal(r.supported,true);assert.equal(r.point.y,400);}
 });

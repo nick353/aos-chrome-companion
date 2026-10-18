@@ -25,7 +25,7 @@ function fixture({ editable = true, original = "本文を保持する", clear = 
   const env = { action: "type", payload: { locator: {}, text: "見出し", clear, clearExplicit },
     find: () => element, HTMLInputElement: Input, HTMLTextAreaElement: TextArea, HTMLSelectElement: Select,
     operationError(code, message, details) { return Object.assign(new Error(message), { code, details }); },
-    visualize: async () => {}, describe: () => ({}),
+    visualize: async () => {}, describe: () => ({}), boxOf: (element) => element.getBoundingClientRect(), scrollTargetOf: (element) => element, 
     document: { createRange: () => range,
       createElement: () => ({ set innerText(text) { this.firstChild = text ? { text, parent: this } : null; } }),
       createDocumentFragment: () => ({ text: "", appendChild(node) { this.text += node.text; this.lastChild = node; node.parent.firstChild = null; } }) },

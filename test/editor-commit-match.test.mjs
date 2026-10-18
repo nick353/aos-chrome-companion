@@ -17,7 +17,7 @@ class TextArea extends Input {}
 const env = (element, expectedText) => ({
   action: "verifyTypeValue", payload: { point: { x: 1, y: 1 }, expectedText },
   focusedTextInputAtPoint: () => element, find: () => element, HTMLInputElement: Input, HTMLTextAreaElement: TextArea,
-  operationError: (code, message) => Object.assign(new Error(message), { code }), describe: () => ({}),
+  operationError: (code, message) => Object.assign(new Error(message), { code }), describe: () => ({}), boxOf: (element) => element.getBoundingClientRect(), scrollTargetOf: (element) => element, 
   location: { href: "https://www.linkedin.com/feed/" }, pageInstanceId: "doc-1",
 });
 const editor = (innerText) => ({ isContentEditable: true, innerText });
@@ -70,7 +70,7 @@ const appendEnv = (before, shownAfter, text = "Google launched Argon.") => {
   return {
     action: "type", payload: { locator: {}, text, clear: false, verifyCommit: true },
     find: () => element, HTMLInputElement: Input, HTMLTextAreaElement: TextArea, HTMLSelectElement: class {},
-    operationError: (code, message) => Object.assign(new Error(message), { code }), describe: () => ({}),
+    operationError: (code, message) => Object.assign(new Error(message), { code }), describe: () => ({}), boxOf: (element) => element.getBoundingClientRect(), scrollTargetOf: (element) => element, 
     visualize: async () => {}, wait: async () => {}, InputEvent: class {}, Event: class {},
     globalThis: { getSelection: () => ({ removeAllRanges() {}, addRange() {} }) },
     document: { createRange: () => range, createElement: () => ({ firstChild: null }), createDocumentFragment: () => ({ lastChild: null, appendChild() {} }) },

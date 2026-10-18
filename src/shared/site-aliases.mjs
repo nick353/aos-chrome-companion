@@ -5,7 +5,11 @@
 const GROUPS = [
   ["https://www.threads.com", "https://threads.com", "https://www.threads.net", "https://threads.net"],
   ["https://doda.jp", "https://www.doda.jp", "https://app.doda.jp"],
+  // Greenhouse moved its hosted job boards: boards.greenhouse.io answers 301 to job-boards.greenhouse.io
+  // (2026-10-18, a Datadog application stopped as target_origin_mismatch).
+  ["https://boards.greenhouse.io", "https://job-boards.greenhouse.io"],
 ];
+export const SITE_ALIAS_GROUPS = GROUPS;
 const MAX_ORIGINS = 32;
 
 export function withSiteAliases(origins) {

@@ -16,3 +16,19 @@ test('the list never grows past 32 origins', () => {
   const many = Array.from({ length: 31 }, (_, i) => `https://site${i}.example`);
   assert.equal(withSiteAliases([...many, 'https://www.threads.com']).length, 32);
 });
+
+// The extension checks a live tab against the authority's targetOrigin with its own copy of the groups.
+test('the extension keeps the same alias groups and accepts only a member of the same group', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const vm = await import('node:vm');
+  const { SITE_ALIAS_GROUPS } = await import('../src/shared/site-aliases.mjs');
+  const source = await readFile(new URL('../extension/service-worker.js', import.meta.url), 'utf8');
+  const block = source.slice(source.indexOf('const SITE_ALIAS_GROUPS = ['), source.indexOf('async function assertLiveOrigin('));
+  const { groups, sameSiteOrigin } = vm.runInNewContext(`${block}\n({ groups: SITE_ALIAS_GROUPS, sameSiteOrigin })`, {});
+  assert.deepEqual(JSON.parse(JSON.stringify(groups)), SITE_ALIAS_GROUPS);
+  assert.equal(sameSiteOrigin('https://doda.jp', 'https://app.doda.jp'), true);
+  assert.equal(sameSiteOrigin('https://boards.greenhouse.io', 'https://job-boards.greenhouse.io'), true);
+  assert.equal(sameSiteOrigin('https://doda.jp', 'https://www.threads.com'), false);
+  assert.equal(sameSiteOrigin('https://www.etsy.com', 'https://evil.example'), false);
+  assert.ok(withSiteAliases(['https://boards.greenhouse.io']).includes('https://job-boards.greenhouse.io'));
+});
