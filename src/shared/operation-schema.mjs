@@ -132,7 +132,7 @@ export const AUTHORIZED_TRANSACTION_METHODS = Object.freeze([
   "visual.pointerMove", "visual.click", "visual.doubleClick", "visual.drag", "visual.scroll", "visual.pressKey", "visual.keyDown", "visual.keyUp",
   "visual.typeText",
   "page.download", "clipboard.write", "page.handleDialog",
-  "page.webMcpCall", "page.nativeChooser", "tabs.claimExisting", "recording.startAuto", "recording.stopAuto",
+  "page.webMcpCall", "page.nativeChooser", "tabs.claimExisting", "tabs.activate", "recording.startAuto", "recording.stopAuto",
   "page.query",
   "page.selectOption", "page.type", "page.upload", "page.uploadMultiple", "page.submit", "page.richText", "page.waitFor", "page.delay",
 ]);

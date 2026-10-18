@@ -34,6 +34,9 @@ export function transactionActionSchema(locator) {
       expectedCaret: z.object({ path: z.array(z.number().int().min(0)).max(32), offset: z.number().int().min(0) }).optional().describe('splitParagraph: exact editor-relative childNodes path and DOM offset; signed with the action'), expectedEditorHtml: text.max(100_000).optional().describe('splitParagraph with BR children: exact current editor innerHTML; binds line-break boundaries'), expectedBody: text.max(100_000).optional().describe('splitParagraph: exact full editor textContent, using UTF-16 offsets'), expectedFullBody: text.max(100_000).optional().describe('splitParagraph preserves all textContent; must equal expectedBody'), expectedSelection: z.object({ start: z.number().int().min(0), end: z.number().int().min(0) }).optional() },
     'tabs.navigate': { url: z.string().url() },
     'tabs.back': {}, 'tabs.forward': {},
+    // Brings the task's own tab and its window to the front, so a native recording (which captures
+    // the frontmost Chrome window) records the task's page and never the owner's own Chrome window.
+    'tabs.activate': {},
     'tabs.reload': { bypassCache: z.boolean().optional() },
     'tabs.configure': { pinned: z.boolean().optional(), muted: z.boolean().optional(), index: z.number().int().min(-1).optional(), destinationWindowId: z.number().int().nonnegative().optional().describe('An existing window returned by companion_list_windows; source identity stays bound separately') },
     'page.bookmark': { title: text.max(500).optional(), parentId: text.min(1).optional() },

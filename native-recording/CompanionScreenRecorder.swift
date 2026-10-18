@@ -1,9 +1,54 @@
 import AVFoundation
 import AppKit
+import CoreAudio
 import CoreMedia
+import CoreMediaIO
 import CoreGraphics
 import Foundation
 @preconcurrency import ScreenCaptureKit
+
+// `--presence` only reports whether a camera or a microphone is in use somewhere on this Mac, so
+// Companion never brings Chrome to the front during a video call (owner, 2026-10-19: record only
+// while the owner is not using the Mac). It reads device state and captures nothing.
+private func cameraInUse() -> Bool {
+    var address = CMIOObjectPropertyAddress(
+        mSelector: CMIOObjectPropertySelector(kCMIOHardwarePropertyDevices),
+        mScope: CMIOObjectPropertyScope(kCMIOObjectPropertyScopeGlobal),
+        mElement: CMIOObjectPropertyElement(kCMIOObjectPropertyElementMain))
+    var size: UInt32 = 0
+    guard CMIOObjectGetPropertyDataSize(CMIOObjectID(kCMIOObjectSystemObject), &address, 0, nil, &size) == 0, size > 0 else { return false }
+    var devices = [CMIOObjectID](repeating: 0, count: Int(size) / MemoryLayout<CMIOObjectID>.size)
+    var used: UInt32 = 0
+    guard CMIOObjectGetPropertyData(CMIOObjectID(kCMIOObjectSystemObject), &address, 0, nil, size, &used, &devices) == 0 else { return false }
+    for device in devices {
+        var running = CMIOObjectPropertyAddress(
+            mSelector: CMIOObjectPropertySelector(kCMIODevicePropertyDeviceIsRunningSomewhere),
+            mScope: CMIOObjectPropertyScope(kCMIOObjectPropertyScopeWildcard),
+            mElement: CMIOObjectPropertyElement(kCMIOObjectPropertyElementWildcard))
+        var value: UInt32 = 0
+        var got: UInt32 = 0
+        if CMIOObjectGetPropertyData(device, &running, 0, nil, UInt32(MemoryLayout<UInt32>.size), &got, &value) == 0, value != 0 { return true }
+    }
+    return false
+}
+
+private func microphoneInUse() -> Bool {
+    var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDevices, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+    var size: UInt32 = 0
+    guard AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size) == noErr, size > 0 else { return false }
+    var devices = [AudioDeviceID](repeating: 0, count: Int(size) / MemoryLayout<AudioDeviceID>.size)
+    guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &devices) == noErr else { return false }
+    for device in devices {
+        var streams = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyStreams, mScope: kAudioObjectPropertyScopeInput, mElement: kAudioObjectPropertyElementMain)
+        var streamSize: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(device, &streams, 0, nil, &streamSize) == noErr, streamSize > 0 else { continue }
+        var running = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyDeviceIsRunningSomewhere, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        var value: UInt32 = 0
+        var valueSize = UInt32(MemoryLayout<UInt32>.size)
+        if AudioObjectGetPropertyData(device, &running, 0, nil, &valueSize, &value) == noErr, value != 0 { return true }
+    }
+    return false
+}
 
 private final class StopSignal: @unchecked Sendable {
     private let lock = NSLock()
@@ -56,12 +101,14 @@ private enum RecorderError: Error, CustomStringConvertible {
 
 private struct Arguments {
     let output: URL
+    let presence: Bool
     static func parse(_ raw: [String]) throws -> Arguments {
+        if raw == ["--presence"] { return Arguments(output: URL(fileURLWithPath: "/dev/null"), presence: true) }
         guard raw.count == 2, raw[0] == "--output" else { throw RecorderError.invalidArguments }
         let output = URL(fileURLWithPath: raw[1]).standardizedFileURL
         guard !FileManager.default.fileExists(atPath: output.path) else { throw RecorderError.failed("output_exists") }
         try FileManager.default.createDirectory(at: output.deletingLastPathComponent(), withIntermediateDirectories: true)
-        return Arguments(output: output)
+        return Arguments(output: output, presence: false)
     }
 }
 
@@ -138,17 +185,24 @@ private struct CompanionScreenRecorder {
             _ = NSApplication.shared
             NSApplication.shared.setActivationPolicy(.prohibited)
             let arguments = try Arguments.parse(Array(CommandLine.arguments.dropFirst()))
+            if arguments.presence {
+                FileHandle.standardOutput.write(Data("{\"camera\":\(cameraInUse()),\"microphone\":\(microphoneInUse())}\n".utf8))
+                return
+            }
             let (windowID, ownerPID) = try frontmostChromeWindow()
             let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
             guard let window = content.windows.first(where: { $0.windowID == windowID && $0.owningApplication?.processID == ownerPID }) else {
                 throw RecorderError.permissionOrContentUnavailable
             }
             let filter = SCContentFilter(desktopIndependentWindow: window)
-            let scale = CGFloat(max(1.0, filter.pointPixelScale))
+            // Point size at 15 frames a second is enough to read a page or watch a short video, and
+            // keeps the H.264 work off this Intel Mac's integrated GPU, which crashed under load
+            // (2026-10-18). Retina 2x at 30 frames a second was four times the pixels and twice the rate.
+            let scale: CGFloat = 1.0
             let configuration = SCStreamConfiguration()
             configuration.width = max(2, Int(window.frame.width * scale) / 2 * 2)
             configuration.height = max(2, Int(window.frame.height * scale) / 2 * 2)
-            configuration.minimumFrameInterval = CMTime(value: 1, timescale: 30)
+            configuration.minimumFrameInterval = CMTime(value: 1, timescale: 15)
             configuration.queueDepth = 8
             configuration.pixelFormat = kCVPixelFormatType_32BGRA
             configuration.showsCursor = true
@@ -181,7 +235,10 @@ private struct CompanionScreenRecorder {
                 stop.request()
             }
             FileHandle.standardOutput.write(Data("native_recording_started window_id=\(windowID) target=frontmost_chrome_window audio_requested=1\n".utf8))
-            while !stop.requested() { try await Task.sleep(nanoseconds: 100_000_000) }
+            // A recording never outlives eleven minutes even if Companion forgets to stop it (the limit
+            // offered to the AI is ten), so a lost stop cannot keep Chrome capturing all night.
+            let deadline = Date().addingTimeInterval(660)
+            while !stop.requested() && Date() < deadline { try await Task.sleep(nanoseconds: 100_000_000) }
             FileHandle.standardInput.readabilityHandler = nil
             try stream.removeRecordingOutput(recordingOutput)
             for _ in 0..<50 {

@@ -15,13 +15,14 @@ export function replayFolderName(createdAt, tag, label = null) {
   return `replay-${stamp}-${tag ?? "session"}${name ? `-${name}` : ""}`;
 }
 
-// Only folders named by replayFolderName are considered; their creation time is read from the name.
+// Only folders named by replayFolderName or recordFolderName (recording.mjs) are considered; their
+// creation time is read from the name.
 export function pruneReplays(root, { now = Date.now(), keepDays = REPLAY_KEEP_DAYS, keepCount = REPLAY_KEEP_COUNT, except = null } = {}) {
   let names;
   try { names = readdirSync(root); } catch { return []; }
   const replays = names
     .map(name => {
-      const match = /^replay-(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})-/u.exec(name);
+      const match = /^(?:replay|record)-(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})-/u.exec(name);
       return match ? { name, path: join(root, name), at: Date.UTC(+match[1], +match[2] - 1, +match[3], +match[4], +match[5], +match[6]) } : null;
     })
     .filter(Boolean)

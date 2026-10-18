@@ -1,7 +1,7 @@
 {
   "schema": "aos.chrome_companion.operation_schema.v1",
   "version": 1,
-  "schemaDigest": "a288211c5de286783d2fb0bf3b0aed306f2c05046605e11d6615ea8fd92bb7e4",
+  "schemaDigest": "cfe45da2fb130910fb465dbd38b575bc3fc78ee49264044908324951debe6613",
   "methods": [
     {
       "method": "extension.reload",
@@ -562,6 +562,7 @@
     "page.webMcpCall",
     "page.nativeChooser",
     "tabs.claimExisting",
+    "tabs.activate",
     "recording.startAuto",
     "recording.stopAuto",
     "page.query",
