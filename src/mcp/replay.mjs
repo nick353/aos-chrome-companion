@@ -1,6 +1,42 @@
 import { spawn } from "node:child_process";
-import { copyFileSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { extname, join, relative } from "node:path";
+
+// Replays are for looking back at recent work. AOS makes one at the end of every Mac run, a few MB
+// each, so ones nobody uses any more are removed (owner, 2026-10-19: 「使わなくなったら動画は消すように」):
+// older than a week (the weekly review still sees them) or beyond the newest 300. A replay folder
+// holding a file named "keep" is never removed.
+export const REPLAY_KEEP_DAYS = 7;
+export const REPLAY_KEEP_COUNT = 300;
+
+export function replayFolderName(createdAt, tag, label = null) {
+  const stamp = new Date(createdAt).toISOString().replace(/\.\d+Z$/u, "").replace(/[-:]/gu, "").replace("T", "-");
+  const name = typeof label === "string" ? label.normalize("NFC").replace(/[^\p{L}\p{N}_-]+/gu, "_").replace(/^_+|_+$/gu, "").slice(0, 40) : "";
+  return `replay-${stamp}-${tag ?? "session"}${name ? `-${name}` : ""}`;
+}
+
+// Only folders named by replayFolderName are considered; their creation time is read from the name.
+export function pruneReplays(root, { now = Date.now(), keepDays = REPLAY_KEEP_DAYS, keepCount = REPLAY_KEEP_COUNT, except = null } = {}) {
+  let names;
+  try { names = readdirSync(root); } catch { return []; }
+  const replays = names
+    .map(name => {
+      const match = /^replay-(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})-/u.exec(name);
+      return match ? { name, path: join(root, name), at: Date.UTC(+match[1], +match[2] - 1, +match[3], +match[4], +match[5], +match[6]) } : null;
+    })
+    .filter(Boolean)
+    .sort((left, right) => right.at - left.at);
+  const removed = [];
+  replays.forEach((replay, index) => {
+    if (replay.path === except || existsSync(join(replay.path, "keep"))) return;
+    if (index < keepCount && now - replay.at <= keepDays * 86_400_000) return;
+    try {
+      rmSync(replay.path, { recursive: true, force: true });
+      removed.push(replay.name);
+    } catch { /* left for the next run */ }
+  });
+  return removed;
+}
 
 // A replay of what a task did, built from what Companion already keeps: the task's operation
 // history and the screens saved after each operation (result.mjs). Nothing new is captured, so

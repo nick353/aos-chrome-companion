@@ -16,7 +16,7 @@ import { readUrls } from "./read-urls.mjs";
 import { withSiteAliases } from "../shared/site-aliases.mjs";
 import { settleUnknownSend } from "./settle-unknown-send.mjs";
 import { MAX_SPLIT_ACTIONS, runSplitTransaction } from "./split-transaction.mjs";
-import { buildReplayTimeline, listSessionScreenshots, writeReplay } from "./replay.mjs";
+import { buildReplayTimeline, listSessionScreenshots, pruneReplays, replayFolderName, writeReplay } from "./replay.mjs";
 import { resolveDataDir } from "../shared/paths.mjs";
 import { join } from "node:path";
 
@@ -775,10 +775,10 @@ server.registerTool("companion_operation_history", {
 }));
 
 server.registerTool("companion_replay", {
-  description: "Build a replay of what this task did, to review the work or show the owner: this task's operation history joined by time with the screens Companion already saved after each operation in this session. Nothing new is captured and the browser is not touched. Writes timeline.json, a Japanese timeline.md and (video:true) a slideshow replay.mp4 with operation subtitles in a new folder under the Companion Recordings folder, and returns each step with its saved frame paths to open. Saved screens last only for the newest 200 or two days, so call it during or right after the work; screens between operations and other sessions' screens are not included.",
+  description: "Build a replay of what this task did, to review the work or show the owner: this task's operation history joined by time with the screens Companion already saved after each operation in this session. Nothing new is captured and the browser is not touched. Writes timeline.json, a Japanese timeline.md and (video:true) a slideshow replay.mp4 with operation subtitles in a new folder under the Companion Recordings folder, and returns each step with its saved frame paths to open. Saved screens last only for the newest 200 or two days, so call it during or right after the work; screens between operations and other sessions' screens are not included. Replays older than seven days or beyond the newest 300 are removed when a new one is made, unless their folder holds a file named keep.",
   inputSchema: { sessionId, runId: z.string().min(1).max(256).optional().describe("Only this run's operations; otherwise the last sinceMinutes"),
     sinceMinutes: z.number().int().min(1).max(2_880).default(60), secondsPerFrame: z.number().min(0.5).max(10).default(1.5),
-    video: z.boolean().default(true) },
+    video: z.boolean().default(true), label: z.string().min(1).max(80).optional().describe("Short name added to the folder, such as the task name") },
   annotations: { readOnlyHint: true },
 }, guarded(async (args, extra) => {
   assertSession(args, extra);
@@ -802,11 +802,12 @@ server.registerTool("companion_replay", {
   if (!rows.length && !shots.length) {
     return { kind: "companion_replay", outDir: null, operationCount: 0, frameCount: 0, note: "No operations or saved screens in this range" };
   }
-  const stamp = new Date().toISOString().replace(/\.\d+Z$/u, "").replace(/[-:]/gu, "").replace("T", "-");
-  return writeReplay({ steps: buildReplayTimeline(rows, shots),
-    outDir: join(resolveDataDir(), "Recordings", `replay-${stamp}-${tag ?? "session"}`),
+  const root = join(resolveDataDir(), "Recordings");
+  const outDir = join(root, replayFolderName(Date.now(), tag, args.label));
+  const replay = await writeReplay({ steps: buildReplayTimeline(rows, shots), outDir,
     secondsPerFrame: args.secondsPerFrame, video: args.video,
-    meta: { sessionTag: tag, runId: args.runId ?? null, since: new Date(since).toISOString() } });
+    meta: { sessionTag: tag, runId: args.runId ?? null, label: args.label ?? null, since: new Date(since).toISOString() } });
+  return { ...replay, removedOldReplays: pruneReplays(root, { except: outDir }).length };
 }));
 
 server.registerTool("companion_transaction_status", {

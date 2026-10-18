@@ -4,7 +4,8 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { buildReplayTimeline, listSessionScreenshots, operationLabel, writeReplay } from '../src/mcp/replay.mjs';
+import { mkdirSync } from 'node:fs';
+import { buildReplayTimeline, listSessionScreenshots, operationLabel, pruneReplays, replayFolderName, writeReplay } from '../src/mcp/replay.mjs';
 
 // A replay joins the task's operation history with the screens already saved after each
 // operation, so the owner and the AI can see afterwards what the AI did (2026-10-19).
@@ -111,5 +112,48 @@ test('screens of different sizes become one subtitled slideshow', { skip: !ffmpe
     assert.match(subtitles, /#2 クリック（完了）/u);
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a replay folder is named by its UTC time, session and a cleaned task name', () => {
+  const at = Date.UTC(2026, 9, 19, 1, 2, 3);
+  assert.equal(replayFolderName(at, 'sabcdef12'), 'replay-20261019-010203-sabcdef12');
+  assert.equal(replayFolderName(at, 'sabcdef12', '求人応募／Daijob: 送信'), 'replay-20261019-010203-sabcdef12-求人応募_Daijob_送信');
+  assert.equal(replayFolderName(at, null, '../..'), 'replay-20261019-010203-session');
+});
+
+// Unused replays are removed (owner, 2026-10-19: 「使わなくなったら動画は消すように」).
+test('replays older than a week or beyond the newest count are removed unless kept', () => {
+  const root = mkdtempSync(join(tmpdir(), 'replay-prune-'));
+  try {
+    const now = Date.UTC(2026, 9, 19, 12, 0, 0);
+    const day = 86_400_000;
+    const make = (ms, extra = '') => {
+      const name = replayFolderName(now - ms, 'sabcdef12') + extra;
+      mkdirSync(join(root, name), { recursive: true });
+      writeFileSync(join(root, name, 'timeline.md'), 'x');
+      return name;
+    };
+    const fresh = make(1 * day);
+    const old = make(8 * day);
+    const kept = make(30 * day, '-keepme');
+    writeFileSync(join(root, kept, 'keep'), '');
+    const current = make(9 * day, '-current');
+    writeFileSync(join(root, 'companion-1789988199224.mov'), 'old native recording');
+    mkdirSync(join(root, 'something-else'));
+
+    const removed = pruneReplays(root, { now, except: join(root, current) });
+    assert.deepEqual(removed, [old]);
+    for (const name of [fresh, kept, current, 'companion-1789988199224.mov', 'something-else']) assert.ok(existsSync(join(root, name)), name);
+    assert.ok(!existsSync(join(root, old)));
+
+    const many = [0, 1, 2].map(hours => make(hours * 3_600_000, `-n${hours}`));
+    // Without `except`, the nine-day-old one goes too; the kept one stays even beyond the count.
+    const overCount = pruneReplays(root, { now, keepCount: 2 });
+    assert.deepEqual(overCount.sort(), [current, fresh, many[2]].sort());
+    assert.ok(existsSync(join(root, kept)));
+    assert.deepEqual(pruneReplays(join(root, 'missing')), []);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
 });
