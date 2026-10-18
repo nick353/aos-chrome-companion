@@ -4195,7 +4195,7 @@ for (const [name, details, expected, code = 'screenshot_target_changed'] of [
       assert.equal(result.continuation.allowed, false);
       assert.equal(commands.filter(command => command.method === 'page.query').length, 1);
       // target_frame_unavailable also uses the existing per-operation read retry.
-      const expectedCaptureCount = code === 'target_frame_unavailable' ? 6 : 3;
+      const expectedCaptureCount = code === 'target_frame_unavailable' ? 10 : 5;
       assert.equal(errorResponses, expectedCaptureCount);
       assert.equal(commands.filter(command => command.method === 'page.screenshot').length, expectedCaptureCount);
       const projected = JSON.stringify(result.exact_blocker);
