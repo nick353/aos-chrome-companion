@@ -79,3 +79,20 @@ test('partial success carries remaining actions and readback recovery to every c
   assert.equal(result.next_action, 'read_same_target_then_continue_remaining_actions');
   assert.equal(result.visual_readback, 'unavailable');
 });
+
+test('a page still loading after a submit gets five captures with a growing wait', async () => {
+  let captures = 0;
+  const waits = [];
+  const realSetTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = (fn, ms, ...rest) => { waits.push(ms); return realSetTimeout(fn, 0, ...rest); };
+  try {
+    const done = { ...initial, url: 'https://example.test/received', pageInstanceId: 'document-2' };
+    const result = await captureTransactionReadback({ initialSnapshot: initial, allowedOrigins,
+      readSnapshot: async () => done,
+      takeScreenshot: async () => { if (++captures < 5) throw Object.assign(new Error('loading'), { code: 'screenshot_target_changed' }); return image(done); } });
+    assert.equal(result.attempts, 5);
+    assert.deepEqual(waits.filter((ms) => ms > 0), [250, 500, 750, 1000]);
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+  }
+});

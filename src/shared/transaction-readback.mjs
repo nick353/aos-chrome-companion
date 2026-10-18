@@ -48,7 +48,10 @@ export async function readSubmissionTransition({ before, readSnapshot, allowedOr
   return { after, transitionObserved: false, attempts };
 }
 
-export async function captureTransactionReadback({ initialSnapshot, readSnapshot, takeScreenshot, allowedOrigins, maxAttempts = 3, intervalMs = 100 }) {
+// A page still loading after a submit (a new URL arriving) changes under the capture. Three tries
+// 0.1 s apart were too short for that and stopped 40 transactions in three days (2026-10-18), so the
+// wait grows each time: five tries over about 2.5 s.
+export async function captureTransactionReadback({ initialSnapshot, readSnapshot, takeScreenshot, allowedOrigins, maxAttempts = 5, intervalMs = 250 }) {
   let after = initialSnapshot;
   let lastError;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
@@ -65,7 +68,7 @@ export async function captureTransactionReadback({ initialSnapshot, readSnapshot
     } catch (error) {
       lastError = error;
       if (!TRANSIENT_READ_ERRORS.has(error?.code) || attempt === maxAttempts) throw error;
-      await delay(intervalMs);
+      await delay(intervalMs * attempt);
     }
   }
   throw lastError;
