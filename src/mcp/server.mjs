@@ -16,6 +16,9 @@ import { readUrls } from "./read-urls.mjs";
 import { withSiteAliases } from "../shared/site-aliases.mjs";
 import { settleUnknownSend } from "./settle-unknown-send.mjs";
 import { MAX_SPLIT_ACTIONS, runSplitTransaction } from "./split-transaction.mjs";
+import { buildReplayTimeline, listSessionScreenshots, writeReplay } from "./replay.mjs";
+import { resolveDataDir } from "../shared/paths.mjs";
+import { join } from "node:path";
 
 let brokerClientPromise;
 function broker() {
@@ -769,6 +772,41 @@ server.registerTool("companion_operation_history", {
 }, guarded(async (args, extra) => {
   assertSession(args, extra);
   return (await broker()).request("task.history", args);
+}));
+
+server.registerTool("companion_replay", {
+  description: "Build a replay of what this task did, to review the work or show the owner: this task's operation history joined by time with the screens Companion already saved after each operation in this session. Nothing new is captured and the browser is not touched. Writes timeline.json, a Japanese timeline.md and (video:true) a slideshow replay.mp4 with operation subtitles in a new folder under the Companion Recordings folder, and returns each step with its saved frame paths to open. Saved screens last only for the newest 200 or two days, so call it during or right after the work; screens between operations and other sessions' screens are not included.",
+  inputSchema: { sessionId, runId: z.string().min(1).max(256).optional().describe("Only this run's operations; otherwise the last sinceMinutes"),
+    sinceMinutes: z.number().int().min(1).max(2_880).default(60), secondsPerFrame: z.number().min(0.5).max(10).default(1.5),
+    video: z.boolean().default(true) },
+  annotations: { readOnlyHint: true },
+}, guarded(async (args, extra) => {
+  assertSession(args, extra);
+  const client = await broker();
+  const since = args.runId ? 0 : Date.now() - args.sinceMinutes * 60_000;
+  const rows = [];
+  let cursor;
+  for (let page = 0; page < 20; page += 1) {
+    const result = await client.request("task.history", { sessionId: args.sessionId, limit: 100,
+      ...(args.runId ? { runId: args.runId } : {}), ...(cursor ? { cursor } : {}) });
+    const pageRows = Array.isArray(result.rows) ? result.rows : [];
+    const fresh = pageRows.filter(row => Date.parse(row.preparedAt) >= since);
+    rows.push(...fresh);
+    cursor = result.nextCursor;
+    // History comes newest first: once a page reaches past `since`, older pages add nothing.
+    if (!cursor || fresh.length < pageRows.length) break;
+  }
+  const tag = sessionTag(args.sessionId);
+  const firstAt = rows.length ? Math.min(...rows.map(row => Date.parse(row.preparedAt))) : since;
+  const shots = listSessionScreenshots(SCREENSHOT_DIR, tag, { since: args.runId ? firstAt - 60_000 : since });
+  if (!rows.length && !shots.length) {
+    return { kind: "companion_replay", outDir: null, operationCount: 0, frameCount: 0, note: "No operations or saved screens in this range" };
+  }
+  const stamp = new Date().toISOString().replace(/\.\d+Z$/u, "").replace(/[-:]/gu, "").replace("T", "-");
+  return writeReplay({ steps: buildReplayTimeline(rows, shots),
+    outDir: join(resolveDataDir(), "Recordings", `replay-${stamp}-${tag ?? "session"}`),
+    secondsPerFrame: args.secondsPerFrame, video: args.video,
+    meta: { sessionTag: tag, runId: args.runId ?? null, since: new Date(since).toISOString() } });
 }));
 
 server.registerTool("companion_transaction_status", {
