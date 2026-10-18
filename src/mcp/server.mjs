@@ -13,6 +13,7 @@ import { materializeTransactionActions } from "./action-materializer.mjs";
 import { bindCodexTaskId, McpTaskBindingRegistry, resolveCodexTaskId } from "./task-context.mjs";
 import { normalizeBinaryClipboardRequest } from "../shared/peripheral-policy.mjs";
 import { readUrls } from "./read-urls.mjs";
+import { withSiteAliases } from "../shared/site-aliases.mjs";
 import { settleUnknownSend } from "./settle-unknown-send.mjs";
 import { MAX_SPLIT_ACTIONS, runSplitTransaction } from "./split-transaction.mjs";
 
@@ -746,7 +747,7 @@ server.registerTool("companion_authorized_transaction", {
   const targetOrigin = args.targetOrigin ?? new URL(args.startUrl).origin;
   const client = await broker();
   return runSplitTransaction((params) => client.requestAuthorizedTransaction(params, { timeoutMs: 120_000 }),
-    { ...args, taskId, targetOrigin, precondition: args.precondition ?? null, capsule: args.capsule ?? null }, actions);
+    { ...args, allowedOrigins: withSiteAliases(args.allowedOrigins), taskId, targetOrigin, precondition: args.precondition ?? null, capsule: args.capsule ?? null }, actions);
 }, { summarizeTransactionText: true }));
 
 server.registerTool("companion_read_urls", {
