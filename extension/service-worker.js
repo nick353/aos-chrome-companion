@@ -5526,7 +5526,7 @@ async function injectedPageOperation(action, payload) {
       // The frame-origin check after a frame-scoped operation reads this URL (frame 0 can fall back
       // to the tab URL, a nested frame cannot). Without it typing into a same-site iframe was always
       // refused as target_frame_origin_not_allowed (doda's certificate picker, 2026-10-18).
-      url: location.href,
+      url: typeof location === "undefined" ? null : location.href,
     };
   }
   if (action === "verifyTypeValue") {
