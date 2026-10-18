@@ -5492,14 +5492,26 @@ async function injectedPageOperation(action, payload) {
     element.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText", data: payload.text }));
     element.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
     if (payload.verifyCommit === true) await wait(180);
-    const afterValue = readValue();
+    let afterValue = readValue();
     // Same rule as verifyTypeValue: a rich editor keeps each line as its own block, so text added
     // after Enter shows extra blank lines in innerText (LinkedIn, AOS run 619 on 2026-10-15). There
     // the same non-empty lines in the same order count as committed; plain inputs match exactly.
     const editorLines = (value) => value.replace(/\r\n?/gu, "\n").replace(/[​-‍﻿]/gu, "").replace(/ /gu, " ")
       .split("\n").map((line) => line.replace(/[ \t]+$/u, "")).filter((line) => line.trim() !== "").join("\n");
-    const semanticCommitted = afterValue === expectedValue
-      || (element.isContentEditable === true && editorLines(afterValue) === editorLines(expectedValue));
+    const holdsExpected = (value) => value === expectedValue
+      || (element.isContentEditable === true && editorLines(value) === editorLines(expectedValue));
+    let semanticCommitted = holdsExpected(afterValue);
+    // A framework editor (Lexical on Threads) takes the inserted nodes out and renders the same text
+    // from its own state a moment later, so a read right after the input event sees a half-rebuilt
+    // field. Every Threads caption since 2026-10-06 stopped here although the text was in the box
+    // exactly once (checked 2026-10-18). Read again until the editor settles (at most 15 reads,
+    // 1.5 s); the same exact rule applies, so a doubled or changed text still never counts.
+    const settleBy = Date.now() + 1500;
+    for (let reads = 0; !semanticCommitted && element.isContentEditable === true && reads < 15 && Date.now() < settleBy; reads++) {
+      await wait(100);
+      afterValue = readValue();
+      semanticCommitted = holdsExpected(afterValue);
+    }
     const semanticNoEffectVerified = payload.verifyCommit === true && afterValue === beforeValue;
     return {
       typed: semanticCommitted,

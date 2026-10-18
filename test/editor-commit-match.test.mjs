@@ -59,13 +59,16 @@ const typeStart = source.indexOf('  if (action === "type") {');
 const typeEnd = source.indexOf('  if (action === "verifyTypeValue") {', typeStart);
 assert.ok(typeStart > 0 && typeEnd > typeStart);
 const pageType = new AsyncFunction("env", `with (env) { ${source.slice(typeStart, typeEnd)} }`);
-const appendEnv = (before, shownAfter) => {
+// shownAfter is what the field holds after the input; a list gives one value per later read (a
+// framework editor rebuilding itself), the last one repeating.
+const appendEnv = (before, shownAfter, text = "Google launched Argon.") => {
   const element = { isContentEditable: true, innerText: before, textContent: before, scrollIntoView() {}, focus() {}, dispatchEvent() {} };
+  const later = Array.isArray(shownAfter) ? shownAfter : [shownAfter];
   let reads = 0;
-  Object.defineProperty(element, "innerText", { get: () => (reads++ === 0 ? before : shownAfter), set() {} });
+  Object.defineProperty(element, "innerText", { get: () => (reads++ === 0 ? before : later[Math.min(reads - 2, later.length - 1)]), set() {} });
   const range = { selectNodeContents() {}, collapse() {}, deleteContents() {}, insertNode() {}, setStartAfter() {} };
   return {
-    action: "type", payload: { locator: {}, text: "Google launched Argon.", clear: false, verifyCommit: true },
+    action: "type", payload: { locator: {}, text, clear: false, verifyCommit: true },
     find: () => element, HTMLInputElement: Input, HTMLTextAreaElement: TextArea, HTMLSelectElement: class {},
     operationError: (code, message) => Object.assign(new Error(message), { code }), describe: () => ({}),
     visualize: async () => {}, wait: async () => {}, InputEvent: class {}, Event: class {},
@@ -84,4 +87,19 @@ test("page.type never counts a changed line as committed", async () => {
   const before = "Gemini 4 Argon brings AI work beyond the chat window.\n\n";
   const result = await pageType(appendEnv(before, `${before}\nGoogle launch Argon.`));
   assert.equal(result.semanticCommitted, false);
+});
+
+// Threads (Lexical, 2026-10-18): right after the input the field reads empty while the editor
+// rebuilds it, then it holds the caption once.
+const caption = "雨もう上がってるのに、この子は認めてないみたいです🐈";
+
+test("page.type waits for a framework editor that rebuilds the field after the input", async () => {
+  const result = await pageType(appendEnv("\n", ["", "\n", `${caption}\n`], caption));
+  assert.equal(result.semanticCommitted, true);
+  assert.equal(result.valueLength, `${caption}\n`.length);
+});
+
+test("page.type never counts a doubled or vanished caption, however long it waits", async () => {
+  assert.equal((await pageType(appendEnv("\n", ["", `${caption}\n${caption}`], caption))).semanticCommitted, false);
+  assert.equal((await pageType(appendEnv("\n", [""], caption))).semanticCommitted, false);
 });
