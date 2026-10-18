@@ -4918,12 +4918,24 @@ export class CompanionBroker extends EventEmitter {
         // exact document/frame.
         if (SEMANTIC_TARGET_MUTATION_METHODS.has(method)) {
           const locator = requireObject(action.params?.locator, `actions[${index}].params.locator`);
-          let inspection = await this.#executeOperation(peer, {
+          const inspectTarget = (scroll) => this.#executeOperation(peer, {
             sessionId: session.sessionId,
             leaseId: lease.leaseId,
             method: "visual.inspectTarget",
-            params: { tabId: taskTab.id, locator, scroll: false, allowedOrigins },
+            params: { tabId: taskTab.id, locator, scroll, allowedOrigins },
           });
+          let inspection;
+          try {
+            inspection = await inspectTarget(false);
+          } catch (error) {
+            // A target below the fold was refused here, before the action itself could scroll to
+            // it, so every click on a button further down needed its own page.scroll first
+            // (2026-10-18: 32 stops in three days). Bring it into view once (a scroll inside the
+            // page; nothing leaves it) and inspect again without moving.
+            if (error?.code !== "visual_target_outside_viewport") throw error;
+            await inspectTarget(true);
+            inspection = await inspectTarget(false);
+          }
           const targetDocument = snapshotTargetDocument(before, locator);
           inspection = await this.#bindSemanticInspectionToDocument(peer, {
             sessionId: session.sessionId,

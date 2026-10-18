@@ -5820,3 +5820,25 @@ test("evidence from another site is refused", async () => {
       found: true, evidenceDigest: "x" }), { code: "evidence_origin_not_allowed" });
   } finally { await harness.close(); }
 });
+
+test("a click target below the fold is brought into view once instead of stopping the transaction", async () => {
+  let scrolled = false;
+  const harness = await createCapsuleHarness({ interceptCommand: ({ message, extension }) => {
+    if (message.method !== "visual.inspectTarget" || message.params?.locator?.testId !== "below-fold") return false;
+    if (message.params.scroll === true) { scrolled = true; return false; }
+    if (scrolled) return false;
+    extension.send({ kind: "command.error", operationId: message.operationId,
+      error: { code: "visual_target_outside_viewport", message: "The semantic target is not visibly intersecting the current viewport" } });
+    return true;
+  } });
+  try {
+    const { client, session, commands } = harness;
+    const result = await client.requestAuthorizedTransaction({ sessionId: session.sessionId, taskId: session.taskId,
+      runId: "below-fold", idempotencyKey: "below-fold", startUrl: "https://example.test/form", allowedOrigins: ["https://example.test"],
+      actions: [{ method: "page.click", params: { locator: { testId: "below-fold" } } }] });
+    assert.equal(result.result, "verified");
+    const reads = commands.filter((c) => c.method === "visual.inspectTarget" && c.params?.locator?.testId === "below-fold");
+    assert.deepEqual(reads.slice(0, 3).map((c) => c.params.scroll), [false, true, false]);
+    assert.equal(commands.filter((c) => c.method === "page.click").length, 1);
+  } finally { await harness.close(); }
+});
