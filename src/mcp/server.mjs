@@ -875,6 +875,12 @@ function finishRecording(state, stoppedBy) {
     finishedRecordings.set(state.sessionId, result);
     return result;
   })();
+  // A stop asked while the recording is already stopping by itself waits for the same result
+  // (2026-10-19: it answered "No recording was started" during the time-limit stop).
+  if (!state.finishingListed) {
+    state.finishingListed = true;
+    finishedRecordings.set(state.sessionId, state.finishing);
+  }
   return state.finishing;
 }
 
@@ -972,7 +978,7 @@ server.registerTool("companion_record_stop", {
   assertSession(args, extra);
   if (activeRecording?.sessionId === args.sessionId) return finishRecording(activeRecording, "requested");
   const finished = finishedRecordings.get(args.sessionId);
-  if (finished) return finished;
+  if (finished) return await finished;
   return { kind: "companion_recording", folder: null, note: "No recording was started in this session" };
 }));
 
