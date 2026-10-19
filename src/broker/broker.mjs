@@ -4466,7 +4466,7 @@ export class CompanionBroker extends EventEmitter {
     const steps = compileTransactionSteps(actions);
     for (const step of steps) validateExpectedActionEvent(step.method, step.params?.expectEvent);
     const authority = params.authority;
-    const initialUrl = params.startUrl ?? "about:blank";
+    let initialUrl = params.startUrl ?? "about:blank";
     const exactTabId = params.tabId;
     if (exactTabId !== undefined && (!Number.isSafeInteger(exactTabId) || exactTabId < 0 || params.reuseTaskTab === false)) {
       throw new CompanionError("transaction_tab_id_invalid", "tabId must be a nonnegative integer and cannot be combined with reuseTaskTab:false");
@@ -4793,9 +4793,15 @@ export class CompanionBroker extends EventEmitter {
         // or ambiguous target still stops above, and a dialog answer still needs its exact tab.
         let exactTabReplaced = false;
         if (exactTabId !== undefined && resolution.status !== "resolved") {
-          let startOrigin = null;
-          try { startOrigin = /^https?:$/u.test(new URL(initialUrl).protocol) ? new URL(initialUrl).origin : null; } catch { startOrigin = null; }
-          if (dialogOnly || !startOrigin || !allowedOrigins.includes(startOrigin)) {
+          const allowedWebOrigin = (url) => {
+            try { return /^https?:$/u.test(new URL(url).protocol) && allowedOrigins.includes(new URL(url).origin); } catch { return false; }
+          };
+          // The start page is often the page the named tab was on, another site (a job on one
+          // board, the next on another: 20:26 job applications stopped three times, 2026-10-19).
+          // When the first action moves to an allowed page, the new tab opens there instead.
+          const firstNavigation = steps[0]?.method === "tabs.navigate" ? String(steps[0].params?.url ?? "") : "";
+          if (!allowedWebOrigin(initialUrl) && allowedWebOrigin(firstNavigation)) initialUrl = firstNavigation;
+          if (dialogOnly || !allowedWebOrigin(initialUrl)) {
             throw new CompanionError(resolution.exactBlocker ?? "task_target_unavailable", "The requested exact task tab is unavailable; no replacement was opened", { tabId: exactTabId });
           }
           exactTabReplaced = true;

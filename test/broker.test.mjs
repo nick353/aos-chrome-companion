@@ -2017,6 +2017,12 @@ test("a tab id that is not this task's live tab opens a new task tab at an allow
     assert.notEqual(opened.tab.id, 987654);
     assert.equal(commands.filter((command) => command.method === "tabs.create").length >= 1, true);
     assert.equal(commands.some((command) => command.params?.tabId === 987654), false, "the named tab is never touched");
+    // The start page is another site (the page the named tab was on), but the first step moves to
+    // an allowed page: the new task tab opens at that page (2026-10-19, job applications at 20:26).
+    const moved = await client.requestAuthorizedTransaction({ ...base, startUrl: "https://elsewhere.test/job/1", tabId: 987654, runId: "replace-tab-move",
+      idempotencyKey: "replace-tab-move", actions: [{ method: "tabs.navigate", params: { url: origin + "/job/2" } }] });
+    assert.equal(moved.result, "verified", JSON.stringify(moved.exact_blocker));
+    assert.equal(moved.target_replacement.start_url, origin + "/job/2");
     for (const startUrl of ["chrome://newtab/", "https://elsewhere.test/"]) {
       const stopped = await client.requestAuthorizedTransaction({ ...base, startUrl, tabId: 987654, runId: "replace-tab-no", idempotencyKey: `replace-tab-no-${startUrl}`,
         actions: [{ method: "page.query", params: { query: "ready" } }] }).catch((error) => ({ exact_blocker: { code: error.code } }));

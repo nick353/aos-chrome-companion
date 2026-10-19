@@ -935,18 +935,25 @@ async function ensureTaskGroup(tab, { taskId, taskLabel, collapsed = false } = {
       groupId = null;
     }
   }
-  if (!Number.isSafeInteger(groupId)) {
-    // In the tab's own window: Chrome's default is the last focused window, which moved a task's
-    // new tab into a recording window (2026-10-19).
-    groupId = await chrome.tabs.group({ tabIds: [tab.id], createProperties: { windowId: tab.windowId } });
-  } else if (tab.groupId !== groupId) {
-    await chrome.tabs.group({ groupId, tabIds: [tab.id] });
-  }
-  await chrome.tabGroups.update(groupId, {
+  // In the tab's own window: Chrome's default is the last focused window, which moved a task's
+  // new tab into a recording window (2026-10-19).
+  const newGroup = () => chrome.tabs.group({ tabIds: [tab.id], createProperties: { windowId: tab.windowId } });
+  const style = (id) => chrome.tabGroups.update(id, {
     title: taskGroupTitle(taskId, taskLabel),
     color: taskGroupColor(taskId),
     collapsed: collapsed === true,
   });
+  try {
+    if (!Number.isSafeInteger(groupId)) groupId = await newGroup();
+    else if (tab.groupId !== groupId) await chrome.tabs.group({ groupId, tabIds: [tab.id] });
+    await style(groupId);
+  } catch (error) {
+    // The task's group can close with its last tab between the check above and the join: 13
+    // tab openings stopped as "No group with id" at 20:05 (2026-10-19). Start a new group then.
+    if (!/No group with id/iu.test(String(error?.message ?? error))) throw error;
+    groupId = await newGroup();
+    await style(groupId);
+  }
   await chrome.storage.local.set({ [key]: { groupId, windowId: tab.windowId, updatedAt: new Date().toISOString() } });
   return groupId;
 }

@@ -96,3 +96,32 @@ test("only controls that close or postpone a window may be pressed", () => {
     assert.equal(dismissesOnly(name), false, name);
   }
 });
+
+// 2026-10-19 20:05: a task's tab group closed with its last tab between the check and the join, and
+// 13 tab openings stopped as "No group with id". A new group is started instead.
+test("a task group that vanished before the join is replaced by a new group", async () => {
+  const groupSource = slice("async function ensureTaskGroup(", "function requireVisualPoint(");
+  const calls = [];
+  const stored = { "taskGroup:task-1": { groupId: 5 } };
+  const chrome = {
+    storage: { local: { get: async (key) => ({ [key]: stored[key] }), set: async (value) => Object.assign(stored, value) } },
+    tabGroups: {
+      get: async (id) => ({ id, windowId: 2 }),
+      update: async (id) => { calls.push(["update", id]); },
+    },
+    tabs: { group: async (options) => {
+      calls.push(["group", options.groupId ?? "new"]);
+      if (options.groupId === 5) throw new Error("No group with id: 5.");
+      return 9;
+    } },
+  };
+  const ensure = vm.runInNewContext(`${groupSource}\nensureTaskGroup`, { chrome, companionError: error,
+    taskGroupTitle: () => "AOS", taskGroupColor: () => "blue" });
+  const groupId = await ensure({ id: 11, windowId: 2, groupId: -1 }, { taskId: "task-1" });
+  assert.equal(groupId, 9);
+  assert.deepEqual(JSON.parse(JSON.stringify(calls)), [["group", 5], ["group", "new"], ["update", 9]]);
+  assert.equal(stored["taskGroup:task-1"].groupId, 9);
+  // Any other failure still stops.
+  chrome.tabs.group = async () => { throw new Error("Tabs cannot be edited right now"); };
+  await assert.rejects(ensure({ id: 12, windowId: 2, groupId: -1 }, { taskId: "task-2" }), /cannot be edited/u);
+});
