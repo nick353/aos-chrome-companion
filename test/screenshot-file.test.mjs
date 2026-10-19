@@ -100,3 +100,15 @@ test('a call is from Codex when its metadata or its process carries a Codex thre
   assert.equal(calledByCodex({ _meta: { 'openai/threadId': '01a15440' } }, {}), true);
   assert.equal(calledByCodex({ _meta: { 'openai/threadId': 'a', codexThreadId: 'b' } }, {}), true, 'conflicting ids are still Codex');
 });
+
+test('for Codex a transaction keeps only the total of its per-operation timings', () => {
+  const tx = () => ({ schema: 'aos.chrome_companion.transaction.v1', result: 'verified', actions: [],
+    operation_timing: { schema: 'x', operations: [
+      { method: 'tabs.create', timings_ms: { total: 120.5, queue: 1 } },
+      { method: 'page.click', timings_ms: { total: 30 }, error_code: 'semantic_locator_not_found' }] } });
+  const codex = toolResult(tx(), { inlineImages: false }).structuredContent.result;
+  assert.deepEqual(codex.operation_timing, { total_ms: 150.5, operations: 2, errors: [{ method: 'page.click', error_code: 'semantic_locator_not_found' }] });
+  assert.equal(codex.result, 'verified');
+  const other = toolResult(tx()).structuredContent.result;
+  assert.equal(other.operation_timing.operations.length, 2, 'other clients keep every timing');
+});

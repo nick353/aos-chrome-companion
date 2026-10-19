@@ -129,12 +129,15 @@ const SCREENSHOT_DIR = defaultScreenshotDir();
 function guarded(handler, { summarizeTransactionText = false } = {}) {
   return async (args, extra) => {
     try {
+      const codex = calledByCodex(extra);
       return toolResult(await withBrokerRequestSignal(extra?.signal, () => handler(args, extra)), {
         textDetail: summarizeTransactionText && args.responseDetail !== "full" ? "summary" : "full",
-        detail: args.responseDetail === "compact" ? "compact" : "full",
+        // A Codex task prints the whole result and re-reads it on every model call: compact unless it
+        // asks for full (2026-10-19). Results, progress, unknown effects and cleanup stay in every mode.
+        detail: args.responseDetail === "compact" || (codex && args.responseDetail !== "full") ? "compact" : "full",
         screenshotDir: SCREENSHOT_DIR,
         screenshotTag: sessionTag(args?.sessionId),
-        inlineImages: !calledByCodex(extra),
+        inlineImages: !codex,
       });
     } catch (error) {
       return toolError(error);

@@ -139,6 +139,16 @@ export function toolResult(value, { textDetail = 'full', detail = 'full', screen
   }
   if (metadata?.schema === 'aos.chrome_companion.transaction.v1') {
     if (detail === 'compact') compactTransaction(metadata);
+    // Per-operation timings are diagnostics (30% of a transaction's text on 2026-10-19) that a Codex
+    // task prints and then re-reads on every model call; it gets the total only. The broker keeps them.
+    if (!inlineImages && metadata.operation_timing) {
+      const operations = metadata.operation_timing.operations ?? [];
+      metadata.operation_timing = {
+        total_ms: operations.reduce((sum, op) => sum + (Number(op?.timings_ms?.total) || 0), 0),
+        operations: operations.length,
+        errors: operations.filter(op => op?.error_code).map(op => ({ method: op.method, error_code: op.error_code })),
+      };
+    }
     metadata.detail = detail === 'compact' ? 'compact' : 'full';
   }
   const textValue = textDetail === 'summary' ? transactionTextSummary(metadata) : metadata;
