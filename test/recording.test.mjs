@@ -82,3 +82,20 @@ test('a finished movie gets its own folder with frames every two seconds and the
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// macOS stops sending frames while a page stands still, so the video track can end long before the
+// sound (2026-10-19: 4.4 s of video in an 8.3 s recording). Frames still cover the whole recording.
+test('a still page still gets a frame every two seconds to the end of the recording', { skip: !ffmpegReady && 'ffmpeg is not installed' }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'record-still-'));
+  try {
+    const movie = join(dir, 'recording-still.mov');
+    execFileSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', 'testsrc=size=640x400:rate=15:duration=3',
+      '-f', 'lavfi', '-i', 'sine=frequency=440:duration=9', '-c:v', 'libx264', '-c:a', 'aac', movie]);
+    const result = await prepareRecordingForAnalysis({ moviePath: movie, outDir: join(dir, 'out') });
+    assert.ok(result.durationSeconds > 8.5, String(result.durationSeconds));
+    assert.equal(result.frames.length, 5, String(result.frames.length));
+    assert.equal(result.frames.at(-1).atSeconds, 8);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

@@ -63,8 +63,14 @@ export async function prepareRecordingForAnalysis({ moviePath, outDir, frameEver
     hasAudio = (probe.streams ?? []).some(stream => stream.codec_type === "audio");
   } catch { /* frames below still tell what the video shows */ }
   let framesError = null;
+  // macOS sends a new video frame only when the window changes, so a still page leaves the video track
+  // shorter than the recording (2026-10-19: 4.4 s of video in an 8.3 s recording gave 2 frames instead
+  // of 5). Hold the last picture to the full length so there is a frame every few seconds to the end.
+  const hold = durationSeconds ? [`tpad=stop_mode=clone:stop_duration=${Math.ceil(durationSeconds) + 1}`] : [];
   try {
-    await exec(ffmpeg, ["-y", "-hide_banner", "-loglevel", "error", "-i", video, "-vf", `fps=1/${frameEverySeconds},scale='min(960,iw)':-2`,
+    await exec(ffmpeg, ["-y", "-hide_banner", "-loglevel", "error", "-i", video,
+      "-vf", [...hold, `fps=1/${frameEverySeconds}`, "scale='min(960,iw)':-2"].join(","),
+      ...(durationSeconds ? ["-t", String(durationSeconds)] : []),
       "-frames:v", String(maxFrames), "-q:v", "4", join(outDir, "frames", "%04d.jpg")], { timeout: 300_000 });
   } catch (error) { framesError = String(error?.stderr || error?.message || error).slice(-300); }
   let audio = null;
