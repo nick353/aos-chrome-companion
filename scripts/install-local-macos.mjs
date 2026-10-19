@@ -540,7 +540,8 @@ if (!autoSetupReceipt && autoSetupRun.code === 0) autoSetupReceipt = { setup_com
 // receipt and leaves the existing runtime untouched.
 const runtimeSyncRun = await run(
   process.execPath,
-  [join(sourceRoot, "scripts", "sync-control-plane-macos.mjs"), "--apply", "--restart-broker", "--extension-id", extensionId],
+  // The installer is run on purpose; only the every-minute setup waits for committed sources.
+  [join(sourceRoot, "scripts", "sync-control-plane-macos.mjs"), "--apply", "--restart-broker", "--allow-uncommitted-source", "--extension-id", extensionId],
   { cwd: sourceRoot, allowFailure: true },
 );
 let runtimeSyncReceipt = null;

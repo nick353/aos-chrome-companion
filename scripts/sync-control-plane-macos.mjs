@@ -10,6 +10,8 @@
  * gains the rebind/readback implementation needed to resolve it.
  */
 import { STALE_IDLE_SESSION_MS } from "../src/shared/constants.mjs";
+import { resolveBrokerSocketPath } from "../src/shared/paths.mjs";
+import { saveRefreshContractHistory, verifyInstalledRefreshContract } from "../src/shared/refresh-contract-history.mjs";
 import { access, chmod, cp, lstat, mkdir, open, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -58,6 +60,7 @@ function parseArgs(argv) {
     if (value === "--apply") result.apply = true;
     else if (value === "--restart-broker") result.restartBroker = true;
     else if (value === "--skip-extension-refresh") result.refreshExtension = false;
+    else if (value === "--allow-uncommitted-source") result.allowUncommittedSource = true;
     else if (value === "--extension-id") result.extensionId = argv[++index] ?? "";
     else if (value === "--help") result.help = true;
   }
@@ -335,6 +338,37 @@ async function waitForProcessExit(pid, timeoutMs = 8_000) {
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
   }
   return false;
+}
+
+// The every-minute setup copies the checkout into the running app. On 2026-10-19 it copied a
+// half-edited checkout whose operation list had just been regenerated: the broker restarted with
+// the new list while Chrome still ran the old Extension, which could not connect for 11 minutes.
+// Only committed control-plane files are copied by the setup tick; the installer, run on purpose,
+// may still pass --allow-uncommitted-source. The stamped build-info files always differ.
+const STAMPED_FILES = new Set(["extension/build-info.js", "src/shared/build-info.mjs"]);
+function uncommittedControlPlaneChanges(sourceRoot, exec = execFileSync) {
+  let output;
+  try {
+    output = exec("git", ["-C", sourceRoot, "status", "--porcelain", "--untracked-files=all", "--", "src", "extension"],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+  } catch {
+    return [];
+  }
+  return String(output).split("\n").map((line) => line.slice(3).trim()).filter((path) => path && !STAMPED_FILES.has(path));
+}
+
+// Before the running app is replaced, keep its exact contract so the Extension Chrome still runs
+// can reconnect and be told to reload. Without it the old Extension was refused as a schema
+// mismatch and the reload could never be sent (2026-10-19).
+async function captureRunningContract(appDir) {
+  try {
+    const manifest = JSON.parse(await readFile(join(appDir, "build-manifest.json"), "utf8"));
+    const contract = await verifyInstalledRefreshContract(appDir, { expectedBuildId: manifest.buildId });
+    await saveRefreshContractHistory(join(dirname(resolveBrokerSocketPath()), "refresh-contract-history.json"), contract);
+    return { captured: true, exactBlocker: null };
+  } catch (error) {
+    return { captured: false, exactBlocker: error?.code ?? errorText(error) };
+  }
 }
 
 async function stageControlPlane({ sourceRoot, appDir, stagingDir, extensionStagingDir }) {
@@ -627,7 +661,14 @@ try {
     receipt.result = "already_current";
   }
 
+  const uncommitted = receipt.changed && !args.allowUncommittedSource ? uncommittedControlPlaneChanges(sourceRoot) : [];
+  if (uncommitted.length > 0 && exitCode === 0) {
+    receipt.result = "deferred";
+    receipt.exactBlockers = [`source_tree_has_uncommitted_changes:${uncommitted.slice(0, 5).join(",")}`];
+    exitCode = 3;
+  }
   if (receipt.changed && exitCode === 0) {
+    receipt.runningContractCapture = await captureRunningContract(appDir);
     await stageControlPlane({ sourceRoot, appDir, stagingDir, extensionStagingDir });
     await atomicSwapSource({ appDir, stagingDir, backupDir, extensionStagingDir, extensionBackupDir });
     for (const relative of criticalFiles) receipt.installedHashesAfter[relative] = await exists(join(appDir, relative)) ? await sha256(join(appDir, relative)) : null;

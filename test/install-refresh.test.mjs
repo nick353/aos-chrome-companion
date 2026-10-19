@@ -179,3 +179,23 @@ test("idle schema upgrade restarts only for a failed hello matching the installe
   assert.equal(canRestartResidentBroker({ ...status, profiles: [{ profileInstanceId: "other", connected: false }] }, installed), false);
   assert.equal(canRestartResidentBroker({ ...status, expectedBuildId: "other" }, installed), false);
 });
+
+// 2026-10-19: the every-minute setup copied a half-edited checkout (a regenerated operation list)
+// into the running app; the broker restarted with the new list while Chrome ran the old Extension,
+// which could not connect for 11 minutes, and no record of its contract existed to let it reload.
+test("the setup tick waits for committed sources and records the running contract before copying", async () => {
+  const source = await readFile(new URL("../scripts/sync-control-plane-macos.mjs", import.meta.url), "utf8");
+  const helper = source.slice(source.indexOf("const STAMPED_FILES = "), source.indexOf("// Before the running app is replaced"));
+  const changes = (output, fail = false) => runInNewContext(`${helper}\nuncommittedControlPlaneChanges`, {})("/repo",
+    () => { if (fail) throw new Error("not a repository"); return output; });
+  assert.deepEqual([...changes(" M extension/build-info.js\n M src/shared/build-info.mjs\n")], []);
+  assert.deepEqual([...changes(" M extension/service-worker.js\n M extension/build-info.js\n?? src/shared/new.mjs\n")],
+    ["extension/service-worker.js", "src/shared/new.mjs"]);
+  assert.deepEqual([...changes("", true)], []);
+  const flow = source.slice(source.indexOf("const uncommitted = receipt.changed"), source.indexOf("await atomicSwapSource("));
+  assert.match(flow, /!args\.allowUncommittedSource/u);
+  assert.match(flow, /source_tree_has_uncommitted_changes/u);
+  assert.ok(flow.indexOf("captureRunningContract(appDir)") < flow.indexOf("stageControlPlane("), "record before the copy");
+  const installer = await readFile(new URL("../scripts/install-local-macos.mjs", import.meta.url), "utf8");
+  assert.match(installer, /"--allow-uncommitted-source"/u);
+});
