@@ -539,7 +539,7 @@ test('local browser edits are not labelled as an externally completed action', (
 test('label matching excludes siblings that merely share the same question context', () => {
   const a=source.indexOf('  const matchesSimpleLocator =');
   const b=source.indexOf('  const matchesLocator =',a);
-  const context={lower:x=>String(x??'').toLowerCase(),accessibleName:x=>x.name,implicitRole:x=>x.role,matchesState:()=>true,semanticContext:()=>true};
+  const context={lower:x=>String(x??'').toLowerCase(),accessibleName:x=>x.name,implicitRole:x=>x.role,matchesState:()=>true,semanticContext:()=>true,looseNames:false,RISKY_NAME:/取り?消|削除/u};
   const matches=vm.runInNewContext(`(()=>{${source.slice(a,b)}return matchesSimpleLocator;})()`,context);
   const field=(name,role)=>({name,role,getAttribute:()=>null});
   const choice=field('Audit choice','combobox'),name=field('Audit name','textbox');
@@ -563,10 +563,13 @@ test('injected locator errors survive serialization with their actionable code',
 test('page-operation runner unwraps a serialized locator error before target binding', async () => {
   const a=source.indexOf('async function runPageOperation(');
   const b=source.indexOf('\nasync function injectedPageOperation(',a);
-  const context={READ_ONLY_PAGE_ACTIONS:new Set(['inspectVisualTarget']),executePageScriptWithReadRetry:async()=>[{frameId:0,result:{__aosCompanionError:{code:'semantic_locator_not_found',message:'No matching button',details:{nextAction:'refine_locator'}}}}],bindInjectionDocumentIdentity:x=>x,companionError:(code,message,details)=>Object.assign(new Error(message),{code,details})};
+  let reads=0;
+  const context={setTimeout,READ_ONLY_PAGE_ACTIONS:new Set(['inspectVisualTarget']),executePageScriptWithReadRetry:async()=>{reads++;return [{frameId:0,result:{__aosCompanionError:{code:'semantic_locator_not_found',message:'No matching button',details:{nextAction:'refine_locator'}}}}];},bindInjectionDocumentIdentity:x=>x,companionError:(code,message,details)=>Object.assign(new Error(message),{code,details})};
   context.PAGE_MUTATION_EXECUTION_TIMEOUT_MS=30_000;
   vm.createContext(context);vm.runInContext(source.slice(a,b),context);
   await assert.rejects(context.runPageOperation(1,'inspectVisualTarget',{locator:{role:'button'}}),error=>error.code==='semantic_locator_not_found'&&error.details.nextAction==='refine_locator');
+  // A late-drawn target is looked up again for up to 2 seconds before the miss is returned (2026-10-19).
+  assert.ok(reads>1);
 });
 
 test('upload execution has a bounded longer wait and a timeout never retries or reports no effect', async () => {

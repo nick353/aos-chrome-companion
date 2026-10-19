@@ -8,6 +8,8 @@ const source=await readFile(new URL('../extension/service-worker.js',import.meta
 const input=source.slice(source.indexOf('async function runTrustedVisualInput('),source.indexOf('\nfunction sameVisualTargetState('));
 const mouse=source.slice(source.indexOf('async function dispatchMouseClick('),source.indexOf('\nconst TRUSTED_VISUAL_KEYS'));
 const inspect=source.slice(source.indexOf('  if (action === "inspectVisualTarget") {'),source.indexOf('  if (action === "inspectVisualPoint") {'));
+// The hit search and the remembered-element helpers the inspection uses (2026-10-19).
+const hitHelpers=source.slice(source.indexOf('  const ownsPoint = (element, x, y) => {'),source.indexOf('  const stillMatches = (element, locator) => {'));
 const before={kind:'target',locator:{role:'button',name:'参考画像ライブラリ'},point:{x:293,y:400},rect:{x:238.625,y:391.359375,width:108,height:17.140625},viewport:{width:714,height:635,devicePixelRatio:2,scale:1},scroll:{x:0,y:0},pageUrl:'https://owned.test/pose',pageInstanceId:'doc',frameId:0,framePath:[],coordinateSpace:'top-level-viewport'};
 const error=(code,message,details)=>Object.assign(new Error(message),{code,details});
 
@@ -81,7 +83,8 @@ for(const hitKind of ['exact','descendant','shadow-descendant','upload-label','s
  else if(hitKind==='shadow-descendant'){
   const root={host:element,getRootNode:()=>root};const leaf={parentNode:root};element.shadowRoot={elementFromPoint:()=>leaf};hit=element;
  }else if(hitKind==='none')hit=null;else hit={parentNode:null,getRootNode:()=>({})};
- const ctx={boxOf:element=>element.getBoundingClientRect(),scrollTargetOf:element=>element,crypto:globalThis.crypto,action:'inspectVisualTarget',payload:{locator:before.locator,scroll:false,requireHitOwner:true},find:()=>element,innerWidth:714,innerHeight:635,devicePixelRatio:2,scrollX:0,scrollY:0,pageInstanceId:'doc',location:{href:before.pageUrl},document:{elementFromPoint:()=>hit},describe:()=>({name:'Library'}),operationError:error,frameCoordinateMap:point=>({supported:true,point,framePath:[],coordinateSpace:'top-level-viewport',viewport:before.viewport,scroll:before.scroll})};
- if(['upload-label','sticky-generate','none'].includes(hitKind))await assert.rejects(vm.runInNewContext('(async()=>{'+inspect+'})()',ctx),e=>e.code==='visual_target_not_at_point');
- else{const r=await vm.runInNewContext('(async()=>{'+inspect+'})()',ctx);assert.equal(r.supported,true);assert.equal(r.point.y,400);}
+ const ctx={boxOf:element=>element.getBoundingClientRect(),scrollTargetOf:element=>element,crypto:globalThis.crypto,action:'inspectVisualTarget',payload:{locator:before.locator,scroll:false,requireHitOwner:true},find:()=>element,innerWidth:714,innerHeight:635,devicePixelRatio:2,scrollX:0,scrollY:0,pageInstanceId:'doc',location:{href:before.pageUrl},document:{elementFromPoint:()=>hit},describe:()=>({name:'Library'}),operationError:error,frameCoordinateMap:point=>({supported:true,point,framePath:[],coordinateSpace:'top-level-viewport',viewport:before.viewport,scroll:before.scroll}),
+  recallVisualRef:()=>null,rememberVisualRef:()=>'ref-1',lastFind:null,markOperated:()=>{}};
+ if(['upload-label','sticky-generate','none'].includes(hitKind))await assert.rejects(vm.runInNewContext('(async()=>{'+hitHelpers+inspect+'})()',ctx),e=>e.code==='visual_target_not_at_point');
+ else{const r=await vm.runInNewContext('(async()=>{'+hitHelpers+inspect+'})()',ctx);assert.equal(r.supported,true);assert.equal(r.point.y,400);}
 });

@@ -1782,7 +1782,7 @@ async function runTrustedVisualInput(tabId, method, params) {
         clipboardUsed: false, fullBodyVerified: true, bodySha256: after.bodySha256, selection: after.selection,
         pageInstanceId: after.pageInstanceId, url: after.url, osCursorMoved: false, foregroundActivated: true };
     }
-    const point = requireVisualPoint(params.point);
+    let point = requireVisualPoint(params.point);
     // This is deliberately an in-page overlay only. Chrome debugger input
     // events do not move the user's macOS cursor, and the overlay has
     // pointer-events:none so it cannot intercept the page or the user's own
@@ -1808,47 +1808,83 @@ async function runTrustedVisualInput(tabId, method, params) {
           operationEffectState: "none", mutationDispatchAttempted: false,
         });
       }
+      // Same-element mode (2026-10-19, owner: the safety checks may be relaxed): the page keeps
+      // moving while the run looks at the screenshot and the tab comes to the front, so a click
+      // that required identical geometry stopped 56 times a day. When the broker allows it, the
+      // click goes to the same element (the remembered DOM object, or one unique element with the
+      // same tag, role, name and test id), visible and owning the pressed point, at its current
+      // position. The page, document, frame and coordinate space must still be the same.
+      const sameElementMode = guard.allowMovedTarget === true && guard.canvas !== true;
       let current;
       try {
         current = await runPageOperation(tabId, guard.kind === "target" ? "inspectVisualTarget" : "inspectVisualPoint", {
           locator: guard.locator, point, frameId: guard.frameId,
           scroll: false, requireHitOwner: guard.kind === "target",
+          ...(sameElementMode ? { elementRef: guard.elementRef ?? null, allowShift: true, markOperated: true } : {}),
         }, { allowedOrigins: params.allowedOrigins });
       } catch (error) {
         throw companionError(error?.code ?? "visual_target_proof_stale_geometry", error?.message ?? "The click target cannot be verified after activation", {
           operationEffectState: "none", mutationDispatchAttempted: false,
         });
       }
-      const samePoint = Number(current?.point?.x) === Number(guard.point?.x)
-        && Number(current?.point?.y) === Number(guard.point?.y);
-      // Native debugger attachment can change the content height. For an
-      // exact target, identical clipped geometry and hit ownership prove the
-      // same click despite a height-only extent change. Explicit point proofs
-      // have no target identity, so they retain the full viewport boundary.
-      const sameViewport = ["width", "devicePixelRatio"].every(key => Number(current?.viewport?.[key]) === Number(guard.viewport?.[key]))
-        && Number(current?.viewport?.scale ?? 1) === Number(guard.viewport?.scale ?? 1)
-        && (guard.kind === "target" || Number(current?.viewport?.height) === Number(guard.viewport?.height));
-      const sameScroll = !guard.scroll || ["x", "y"].every(key => Number(current?.scroll?.[key]) === Number(guard.scroll?.[key]));
-      const sameRect = guard.kind === "point" || ["x", "y", "width", "height"].every(key => Number(current?.clippedRect?.[key]) === Number(guard.rect?.[key]));
-      const sameFrame = guard.kind === "point" || (JSON.stringify(current?.framePath ?? []) === JSON.stringify(guard.framePath ?? [])
-        && String(current?.coordinateSpace ?? "viewport") === String(guard.coordinateSpace ?? "viewport"));
-      const samePage = String(current?.topLevelUrl || current?.url || "") === String(guard.pageUrl || "")
-        && (guard.pageInstanceId === null || current?.pageInstanceId === guard.pageInstanceId);
-      const targetWithinViewport = guard.kind === "point" || (Number(current?.clippedRect?.x) >= 0 && Number(current?.clippedRect?.y) >= 0
-        && Number(current?.clippedRect?.x) + Number(current?.clippedRect?.width) <= Number(current?.viewport?.width)
-        && Number(current?.clippedRect?.y) + Number(current?.clippedRect?.height) <= Number(current?.viewport?.height));
-      const checks = { supported: current?.supported !== false, samePage, samePoint, sameViewport, sameScroll, sameRect, sameFrame, targetWithinViewport };
-      if (Object.values(checks).some(matched => !matched)) {
-        throw companionError("visual_target_proof_stale_geometry", "The inspected click target moved or changed after foreground activation", {
-          operationEffectState: "none", mutationDispatchAttempted: false,
-          mismatches: Object.keys(checks).filter(key => !checks[key]),
-          expectedViewport: guard.viewport, observedViewport: current?.viewport,
-        });
+      if (sameElementMode) {
+        const samePage = String(current?.topLevelUrl || current?.url || "") === String(guard.pageUrl || "")
+          && (guard.pageInstanceId === null || current?.pageInstanceId === guard.pageInstanceId);
+        const sameFrame = guard.kind === "point" || (JSON.stringify(current?.framePath ?? []) === JSON.stringify(guard.framePath ?? [])
+          && String(current?.coordinateSpace ?? "viewport") === String(guard.coordinateSpace ?? "viewport"));
+        const sameElement = current?.elementRefMatched === true
+          || (current?.elementRefMatched !== false
+            && sameVisualIdentity(guard.kind === "target" ? current?.element : current?.hitElement, guard.kind === "target" ? guard.element : guard.hitElement)
+            && !current?.targetChoice?.disambiguatedBy);
+        const freshPoint = current?.point;
+        const pointInViewport = Number.isFinite(Number(freshPoint?.x)) && Number.isFinite(Number(freshPoint?.y))
+          && Number(freshPoint.x) >= 0 && Number(freshPoint.y) >= 0
+          && Number(freshPoint.x) <= Number(current?.viewport?.width) && Number(freshPoint.y) <= Number(current?.viewport?.height);
+        const checks = { supported: current?.supported !== false, samePage, sameFrame, sameElement, pointInViewport };
+        if (Object.values(checks).some(matched => !matched)) {
+          throw companionError("visual_target_proof_stale_geometry", "The inspected click target is no longer the same visible element", {
+            operationEffectState: "none", mutationDispatchAttempted: false,
+            mismatches: Object.keys(checks).filter(key => !checks[key]),
+          });
+        }
+        const moved = Number(freshPoint.x) !== Number(point.x) || Number(freshPoint.y) !== Number(point.y);
+        clickGuardReadback = { verified: true, kind: guard.kind, mode: "same_element", expectedViewport: guard.viewport, observedViewport: current.viewport,
+          elementRefMatched: current.elementRefMatched === true, targetMoved: moved,
+          ...(moved ? { from: point, to: { x: Number(freshPoint.x), y: Number(freshPoint.y) } } : {}),
+          hitOwnerVerified: guard.kind === "target" || current.elementRefMatched === true };
+        point = { x: Number(freshPoint.x), y: Number(freshPoint.y) };
+      } else {
+        const samePoint = Number(current?.point?.x) === Number(guard.point?.x)
+          && Number(current?.point?.y) === Number(guard.point?.y);
+        // Native debugger attachment can change the content height. For an
+        // exact target, identical clipped geometry and hit ownership prove the
+        // same click despite a height-only extent change. Explicit point proofs
+        // have no target identity, so they retain the full viewport boundary.
+        const sameViewport = ["width", "devicePixelRatio"].every(key => Number(current?.viewport?.[key]) === Number(guard.viewport?.[key]))
+          && Number(current?.viewport?.scale ?? 1) === Number(guard.viewport?.scale ?? 1)
+          && (guard.kind === "target" || Number(current?.viewport?.height) === Number(guard.viewport?.height));
+        const sameScroll = !guard.scroll || ["x", "y"].every(key => Number(current?.scroll?.[key]) === Number(guard.scroll?.[key]));
+        const sameRect = guard.kind === "point" || ["x", "y", "width", "height"].every(key => Number(current?.clippedRect?.[key]) === Number(guard.rect?.[key]));
+        const sameFrame = guard.kind === "point" || (JSON.stringify(current?.framePath ?? []) === JSON.stringify(guard.framePath ?? [])
+          && String(current?.coordinateSpace ?? "viewport") === String(guard.coordinateSpace ?? "viewport"));
+        const samePage = String(current?.topLevelUrl || current?.url || "") === String(guard.pageUrl || "")
+          && (guard.pageInstanceId === null || current?.pageInstanceId === guard.pageInstanceId);
+        const targetWithinViewport = guard.kind === "point" || (Number(current?.clippedRect?.x) >= 0 && Number(current?.clippedRect?.y) >= 0
+          && Number(current?.clippedRect?.x) + Number(current?.clippedRect?.width) <= Number(current?.viewport?.width)
+          && Number(current?.clippedRect?.y) + Number(current?.clippedRect?.height) <= Number(current?.viewport?.height));
+        const checks = { supported: current?.supported !== false, samePage, samePoint, sameViewport, sameScroll, sameRect, sameFrame, targetWithinViewport };
+        if (Object.values(checks).some(matched => !matched)) {
+          throw companionError("visual_target_proof_stale_geometry", "The inspected click target moved or changed after foreground activation", {
+            operationEffectState: "none", mutationDispatchAttempted: false,
+            mismatches: Object.keys(checks).filter(key => !checks[key]),
+            expectedViewport: guard.viewport, observedViewport: current?.viewport,
+          });
+        }
+        clickGuardReadback = { verified: true, kind: guard.kind, expectedViewport: guard.viewport, observedViewport: current.viewport,
+          viewportHeightChanged: Number(current.viewport.height) !== Number(guard.viewport.height),
+          sameTargetGeometry: guard.kind === "target" && sameRect && samePoint,
+          hitOwnerVerified: guard.kind === "target" };
       }
-      clickGuardReadback = { verified: true, kind: guard.kind, expectedViewport: guard.viewport, observedViewport: current.viewport,
-        viewportHeightChanged: Number(current.viewport.height) !== Number(guard.viewport.height),
-        sameTargetGeometry: guard.kind === "target" && sameRect && samePoint,
-        hitOwnerVerified: guard.kind === "target" };
     }
     if (method === "visual.pointerMove") {
       const from = params.from ? requireVisualPoint(params.from, "from") : point;
@@ -1975,6 +2011,13 @@ async function runTrustedVisualInput(tabId, method, params) {
       }
     }
   }
+}
+
+// One element when its tag, role, name and test id all agree and it has a tag or role at all.
+function sameVisualIdentity(current, expected) {
+  if (!current || !expected || typeof current !== "object" || typeof expected !== "object") return false;
+  if (!expected.tag && !expected.role) return false;
+  return ["tag", "role", "name", "testId"].every((key) => String(current[key] ?? "") === String(expected[key] ?? ""));
 }
 
 function sameVisualTargetState(before, after) {
@@ -2420,10 +2463,12 @@ async function executeCommand(method, params) {
       return runPageOperation(requireTabId(params.tabId), "inspectVisualTarget", {
         locator: params.locator,
         scroll: params.scroll !== false,
+        ...(params.elementRef !== undefined ? { elementRef: params.elementRef } : {}),
       }, { allowedOrigins: params.allowedOrigins });
     case "visual.inspectPoint":
       return runPageOperation(requireTabId(params.tabId), "inspectVisualPoint", {
         point: params.point,
+        ...(params.elementRef !== undefined ? { elementRef: params.elementRef, allowShift: params.allowShift === true } : {}),
       }, { allowedOrigins: params.allowedOrigins });
     case "visual.pointerMove":
     case "visual.click":
@@ -2862,7 +2907,27 @@ async function runNativeFileUpload(tabId, payload, params) {
   };
 }
 
-async function runPageOperation(tabId, action, payload, { allowedOrigins } = {}) {
+async function runPageOperation(tabId, action, payload, options = {}) {
+  const deadline = Date.now() + LATE_TARGET_WAIT_MS;
+  for (;;) {
+    try {
+      return await runPageOperationOnce(tabId, action, payload, options);
+    } catch (error) {
+      if (error?.code !== "semantic_locator_not_found" || !LATE_TARGET_ACTIONS.has(action)
+        || error?.details?.mutationDispatchAttempted === true || Date.now() + LATE_TARGET_STEP_MS > deadline) throw error;
+      await new Promise((resolve) => setTimeout(resolve, LATE_TARGET_STEP_MS));
+    }
+  }
+}
+
+// Feeds draw their buttons after the post (Threads' 返信, Instagram's comment field, TikTok's side
+// bar), so the first look often finds nothing (2026-10-19). These actions look up their target
+// before anything else and stop with nothing done when it is missing, so looking again is safe.
+const LATE_TARGET_ACTIONS = new Set(["click", "doubleClick", "hover", "setChecked", "inspectVisualTarget", "measureScreenshotTarget"]);
+const LATE_TARGET_WAIT_MS = 2_000;
+const LATE_TARGET_STEP_MS = 500;
+
+async function runPageOperationOnce(tabId, action, payload, { allowedOrigins } = {}) {
   const mutationTimeoutMs = action === "upload" || action === "uploadMultiple"
     ? 45_000 : PAGE_MUTATION_EXECUTION_TIMEOUT_MS;
   const requestedFrameId = Number.isSafeInteger(payload?.locator?.frameId)
@@ -3152,6 +3217,52 @@ async function injectedPageOperation(action, payload) {
       || element.getAttribute("placeholder")
       || iconName(element),
   );
+  // Runs name a control by what they expect, not by the one name the page exposes first: a label
+  // hidden in a collapsed side bar (Instagram/TikTok "プロフィール" while only the avatar's alt is
+  // read), an svg <title> next to an aria-label, "いいね" for "いいね！", the English word on a
+  // Japanese page, role "button" for a menu item (2026-10-19: 39 misses a day, 17 on Threads and
+  // Instagram, and the run then fell back to coordinate clicks). When the plain match finds
+  // nothing, a second pass compares every name a control carries, ignoring width, case, spaces and
+  // punctuation, with a few Japanese/English pairs. That pass never picks a control whose name
+  // undoes, deletes, buys or pays unless the request itself asked for it.
+  const looseKey = (value) => String(value ?? "").normalize("NFKC").toLocaleLowerCase().replace(/[\s\p{P}\p{S}]+/gu, "");
+  const NAME_SYNONYMS = [
+    ["いいね", "like"], ["コメント", "comment", "コメントする"], ["返信", "reply", "返信する"],
+    ["シェア", "share", "共有", "共有する"], ["送信", "send"], ["投稿", "post", "投稿する"],
+    ["プロフィール", "profile"], ["検索", "search"], ["ホーム", "home"], ["通知", "notifications", "notification"],
+    ["アクティビティ", "activity"], ["保存", "save"], ["フォロー", "follow", "フォローする"], ["閉じる", "close"],
+    ["次へ", "next"], ["戻る", "back"], ["リポスト", "repost", "retweet"], ["引用", "quote"],
+    ["その他", "more", "more options", "その他のオプション"], ["もっと見る", "see more", "show more", "続きを読む"],
+    ["作成", "create"], ["新規投稿", "new post"], ["メッセージ", "messages", "message"], ["見る", "view"],
+  ].map((group) => group.map(looseKey));
+  const RISKY_NAME = /取り?消|解除|削除|退会|解約|購入|支払|注文|ブロック|報告|unlike|unfollow|undo|remove|delete|block|report|purchase|checkout|\bbuy\b|\bpay\b|\border\b/iu;
+  const CLICK_ROLE_FAMILY = new Set(["button", "link", "menuitem", "menuitemradio", "menuitemcheckbox", "tab", "option", "submit"]);
+  let looseNames = false;
+  const otherNames = (element) => {
+    const values = [accessibleName(element), element.getAttribute("aria-label"), element.getAttribute("title"),
+      referencedText(element, "aria-labelledby"), element.getAttribute("alt"), element.innerText,
+      String(element.textContent ?? "").slice(0, 500), iconName(element)];
+    const icons = element.querySelectorAll?.("[aria-label],[title],svg title,img[alt]") ?? [];
+    for (let index = 0; index < icons.length && index < 8; index += 1) {
+      const icon = icons[index];
+      values.push(icon.tagName?.toLowerCase() === "title" ? icon.textContent
+        : icon.getAttribute("aria-label") || icon.getAttribute("title") || icon.getAttribute("alt"));
+    }
+    return [...new Set(values.map(normalize).filter(Boolean))];
+  };
+  const looseNameMatches = (element, expected, exact) => {
+    const wantedKey = looseKey(expected);
+    if (!wantedKey) return false;
+    const wanted = NAME_SYNONYMS.find((group) => group.includes(wantedKey)) ?? [wantedKey];
+    const riskyRequest = RISKY_NAME.test(lower(expected));
+    return otherNames(element).some((name) => {
+      if (!riskyRequest && RISKY_NAME.test(lower(name))) return false;
+      const key = looseKey(name);
+      return !!key && wanted.some((word) => (exact ? key === word : key.includes(word)));
+    });
+  };
+  const sameRoleFamily = (element, requested) => CLICK_ROLE_FAMILY.has(lower(requested))
+    && CLICK_ROLE_FAMILY.has(lower(element.getAttribute("role") || implicitRole(element)));
   const parentSemanticNode = (node) => {
     if (!node) return null;
     if (node.parentElement) return node.parentElement;
@@ -3257,10 +3368,16 @@ async function injectedPageOperation(action, payload) {
       try { if (!element.matches(locator.css)) return false; }
       catch { throw operationError("semantic_selector_invalid", "The CSS selector is invalid"); }
     }
-    if (locator.role && lower(element.getAttribute("role") || implicitRole(element)) !== lower(locator.role)) return false;
+    if (locator.role && lower(element.getAttribute("role") || implicitRole(element)) !== lower(locator.role)
+      && !(looseNames && sameRoleFamily(element, locator.role))) return false;
     if (locator.testId && element.getAttribute("data-testid") !== String(locator.testId)) return false;
     const expectedName = locator.name ?? locator.text;
-    if (expectedName && !textMatches(accessibleName(element), expectedName)) return false;
+    // A partial name never reaches an undo, delete, purchase or payment control it did not ask
+    // for ("いいね" must not press "「いいね！」を取り消す" on a post already liked).
+    const partialNameMatches = (actual, expected) => textMatches(actual, expected)
+      && (locator.exact === true || !RISKY_NAME.test(lower(actual)) || RISKY_NAME.test(lower(expected)));
+    if (expectedName && !(looseNames ? looseNameMatches(element, expectedName, locator.exact === true)
+      : partialNameMatches(accessibleName(element), expectedName))) return false;
     if (locator.nameRegex && !matchesRegex(accessibleName(element), locator.nameRegex)) return false;
     if (locator.textRegex && !matchesRegex(element.innerText || element.textContent, locator.textRegex)) return false;
     const content = lower(element.innerText || element.textContent);
@@ -3275,7 +3392,8 @@ async function injectedPageOperation(action, payload) {
     }
     // A label names this control. Broad question/container context belongs
     // to locator.question; applying it here matches unrelated sibling fields.
-    if (locator.label && !textMatches(accessibleName(element), locator.label)) return false;
+    if (locator.label && !(looseNames ? looseNameMatches(element, locator.label, locator.exact === true)
+      : partialNameMatches(accessibleName(element), locator.label))) return false;
     if (locator.question && !semanticContext(element, locator.question)) return false;
     return matchesState(element, locator.state);
   };
@@ -3356,9 +3474,25 @@ async function injectedPageOperation(action, payload) {
     if (fileInputOnly) candidates = candidates.filter(element => element instanceof HTMLInputElement && element.type === "file");
     candidates = candidates.filter((element) => includeHidden || visible(element)
       || (allowHiddenFile && element instanceof HTMLInputElement && element.type === "file"));
-    candidates = candidates.filter((element) => matchesLocator(element, locator));
+    const pool = candidates;
+    candidates = pool.filter((element) => matchesLocator(element, locator));
     const expectedName = locator.name ?? locator.text;
-    if (expectedName && locator.exact === undefined) {
+    let looseName = false;
+    if (candidates.length === 0 && (expectedName || locator.label || locator.role)) {
+      // Only controls take part, so a whole post or list never matches by its text.
+      const roleIsControl = !locator.role || CLICK_ROLE_FAMILY.has(lower(locator.role));
+      looseNames = true;
+      try {
+        candidates = pool.filter((element) => (!roleIsControl || isControl(element) || element.hasAttribute("tabindex")
+          || CLICK_ROLE_FAMILY.has(lower(element.getAttribute("role")))) && matchesLocator(element, locator));
+        if (expectedName && candidates.length > 1) {
+          const keyed = candidates.filter((element) => looseNameMatches(element, expectedName, true));
+          if (keyed.length > 0) candidates = keyed;
+        }
+      } finally { looseNames = false; }
+      looseName = candidates.length > 0;
+    }
+    if (expectedName && locator.exact === undefined && !looseName) {
       const exact = candidates.filter((element) => lower(accessibleName(element)) === lower(expectedName));
       if (exact.length > 0) candidates = exact;
     }
@@ -3378,7 +3512,7 @@ async function injectedPageOperation(action, payload) {
       }
       candidates = [candidates[index]];
     }
-    return { candidates, scanLimitReached };
+    return { candidates, scanLimitReached, looseName };
   };
   // A label inside its own link or button carries the same name as the control, so a locator by
   // name matched both and stopped as ambiguous (doda's "入力内容を確認する" is a <p> inside an <a>,
@@ -3396,8 +3530,47 @@ async function injectedPageOperation(action, payload) {
     const [control] = controls;
     return candidates.every((element) => element === control || control.contains(element) || element.contains(control)) ? control : null;
   };
+  // Feeds repeat the same control in every post (いいね, 返信, the author's two links), so a
+  // locator by name alone stopped as ambiguous (2026-10-19: 28 a day). Pick one only when the
+  // page itself says which: every match opens the same link; one is inside the open dialog; one
+  // is in the post the run operated on last; or only one is fully on screen. Never when any match
+  // is named like an undo, delete, purchase or payment.
+  const fullyInViewport = (element) => {
+    const rect = boxOf(element);
+    return rect.width > 0 && rect.height > 0 && rect.left >= 0 && rect.top >= 0 && rect.right <= innerWidth && rect.bottom <= innerHeight;
+  };
+  const preferAmong = (candidates) => {
+    if (candidates.some((element) => RISKY_NAME.test(lower(accessibleName(element))))) return null;
+    const hrefs = candidates.map((element) => element.closest?.("a[href]")?.href ?? "");
+    if (hrefs.every((href) => href && href === hrefs[0] && !/^javascript:|#$/iu.test(href))) {
+      return { element: candidates.find(fullyInViewport) ?? candidates[0], by: "same_link" };
+    }
+    let pool = candidates;
+    const dialogs = querySemantic("[role='dialog'],[aria-modal='true'],dialog[open]", 50).filter(visible);
+    if (dialogs.length > 0) {
+      const inDialog = pool.filter((element) => dialogs.some((dialog) => dialog !== element && dialog.contains(element)));
+      if (inDialog.length === 1) return { element: inDialog[0], by: "open_dialog" };
+      if (inDialog.length > 1) pool = inDialog;
+    }
+    const last = globalThis.__aosCompanionLastTargetV1?.deref?.();
+    if (last?.isConnected) {
+      let scope = last;
+      for (let depth = 0; scope && depth < 12; depth += 1, scope = parentSemanticNode(scope)) {
+        const near = pool.filter((element) => scope === element || scope.contains?.(element));
+        if (near.length === 1) return { element: near[0], by: "last_operated" };
+        if (near.length > 1) break;
+      }
+    }
+    const shown = pool.filter(fullyInViewport);
+    return shown.length === 1 ? { element: shown[0], by: "only_one_in_view" } : null;
+  };
+  const markOperated = (element) => {
+    try { globalThis.__aosCompanionLastTargetV1 = new WeakRef(element); } catch { /* keep the previous one */ }
+  };
+  let lastFind = null;
   const find = (locator, options = {}) => {
-    const { candidates, scanLimitReached } = locateAll(locator, options);
+    const { candidates, scanLimitReached, looseName } = locateAll(locator, options);
+    lastFind = { looseName: looseName === true, disambiguatedBy: null, matchedCount: candidates.length };
     if (scanLimitReached) throw operationError("semantic_locator_scan_limit", "The candidate scan reached its limit; narrow the outer CSS selector or testId before targeting one element", { nextAction: "refine_outer_css_or_test_id_then_read_again" });
     if (candidates.length === 0) {
       // A miss used to say only "read the page again", and runs spent turns guessing the name a site
@@ -3417,15 +3590,27 @@ async function injectedPageOperation(action, payload) {
         })
         .slice(0, 6)
         .map((element) => ({ role: roleOf(element), name: accessibleName(element).slice(0, 80), tag: element.tagName.toLowerCase() }));
+      // Nothing named alike: show the controls on screen instead, with every name they answer to.
+      const onScreen = suggestions.length > 0 ? [] : querySemantic("button,a[href],[role='button'],[role='link'],[role='menuitem'],[role='tab']", 2_000)
+        .filter((element) => visible(element) && fullyInViewport(element))
+        .slice(0, 12)
+        .map((element) => ({ role: roleOf(element), name: accessibleName(element).slice(0, 80), tag: element.tagName.toLowerCase(),
+          otherNames: otherNames(element).filter((name) => name !== accessibleName(element) && name.length <= 80).slice(0, 2) }));
       let hiddenMatches = 0;
       try { hiddenMatches = locateAll(locator, { ...options, includeHidden: true }).candidates.length; } catch { /* keep the miss itself */ }
       throw operationError("semantic_locator_not_found", "No visible element matched the semantic locator", {
         nextAction: "query_current_page_then_refine_locator", suggestions, hiddenMatches,
+        ...(onScreen.length ? { controlsOnScreen: onScreen } : {}),
       });
     }
     if (candidates.length > 1) {
       const control = oneControlAmong(candidates);
       if (control) return control;
+      const preferred = preferAmong(candidates);
+      if (preferred) {
+        lastFind.disambiguatedBy = preferred.by;
+        return preferred.element;
+      }
     }
     if (candidates.length > 1) throw operationError("semantic_locator_ambiguous", `Semantic locator matched ${candidates.length} visible elements`, { candidates: candidates.slice(0, 10).map(describe), nextAction: "refine_locator_role_name_label_then_read_again" });
     return candidates[0];
@@ -3621,6 +3806,62 @@ async function injectedPageOperation(action, payload) {
     // old node after such a handler; no page timer runs between these checks.
     return () => { if (!element.isConnected || record.url !== location.href) reject(true); };
   };
+  // A visual proof remembers the exact DOM object it showed (2026-10-19). Feeds keep moving between
+  // the screenshot and the click (images load, counts update, the tab comes to the front), and a
+  // click that required identical pixels stopped 56 times a day as moved. The click now asks for the
+  // same object, still connected, still matching the locator, and owning the point it presses.
+  const nodeIdentityOf = (element) => {
+    const identities = globalThis.__aosCompanionQueryNodeIdentitiesV1 ??= new WeakMap();
+    if (!identities.has(element)) identities.set(element, crypto.randomUUID());
+    return identities.get(element);
+  };
+  const rememberVisualRef = (element) => {
+    const refs = globalThis.__aosCompanionVisualRefsV1 ??= new Map();
+    const id = nodeIdentityOf(element), now = Date.now(), rect = boxOf(element);
+    refs.delete(id);
+    for (const [key, record] of refs) if (record.expiresAt <= now) refs.delete(key);
+    while (refs.size >= 256) refs.delete(refs.keys().next().value);
+    refs.set(id, { ref: new WeakRef(element), rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }, expiresAt: now + 300_000 });
+    return id;
+  };
+  const recallVisualRef = (id) => {
+    if (typeof id !== "string" || !id) return null;
+    const record = globalThis.__aosCompanionVisualRefsV1?.get(id);
+    if (!record || record.expiresAt <= Date.now()) return null;
+    const element = record.ref.deref();
+    return element?.isConnected ? { element, rect: record.rect } : null;
+  };
+  const ownsPoint = (element, x, y) => {
+    let hit = document.elementFromPoint(x, y);
+    while (hit?.shadowRoot) {
+      const child = hit.shadowRoot.elementFromPoint?.(x, y);
+      if (!child || child === hit) break;
+      hit = child;
+    }
+    let owner = hit;
+    while (owner && owner !== element) owner = owner.parentNode || owner.getRootNode?.().host;
+    return owner === element;
+  };
+  // The center can sit under a sticky bar or a badge while the rest of the control is clear.
+  const hitOwnedPoint = (element, clipped) => {
+    const width = clipped.right - clipped.left, height = clipped.bottom - clipped.top;
+    for (const [fx, fy] of [[0.5, 0.5], [0.3, 0.5], [0.7, 0.5], [0.5, 0.3], [0.5, 0.7], [0.3, 0.3], [0.7, 0.3], [0.3, 0.7], [0.7, 0.7]]) {
+      const point = { x: Math.round(clipped.left + width * fx), y: Math.round(clipped.top + height * fy) };
+      if (ownsPoint(element, point.x, point.y)) return point;
+    }
+    return null;
+  };
+  const stillMatches = (element, locator) => {
+    if (!visible(element)) return false;
+    if (matchesLocator(element, locator)) return true;
+    looseNames = true;
+    try { return matchesLocator(element, locator); } finally { looseNames = false; }
+  };
+  const visualIdentity = (element) => {
+    const described = describe(element);
+    return { tag: described.tag, role: described.role, name: described.name, testId: described.testId };
+  };
+  const CLICKABLE_SELECTOR = "button,a[href],input,select,textarea,label,summary,[role='button'],[role='link'],[role='menuitem'],[role='tab'],[role='option'],[role='checkbox'],[role='radio'],[role='switch'],[tabindex]";
   const activateControl = (element, guardAfterFocus = null) => {
     element.focus();
     if (guardAfterFocus) guardAfterFocus();
@@ -3982,8 +4223,13 @@ async function injectedPageOperation(action, payload) {
         const rect = boxOf(element);
         const identities = globalThis.__aosCompanionQueryNodeIdentitiesV1 ??= new WeakMap();
         if (!identities.has(element)) identities.set(element, crypto.randomUUID());
+        const described = describe(element);
+        // The other names a control answers to (its icon's label, a hidden side-bar label), so a
+        // run can copy one into its locator instead of guessing.
+        const aliases = isControl(element) ? otherNames(element).filter((name) => name !== described.name && name.length <= 120).slice(0, 4) : [];
         return {
-          ...describe(element),
+          ...described,
+          ...(aliases.length ? { otherNames: aliases } : {}),
           nodeIdentity: identities.get(element),
           text: text.slice(0, 500),
           rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
@@ -4303,7 +4549,16 @@ async function injectedPageOperation(action, payload) {
   if (action === "inspectViewport") return { width: innerWidth, height: innerHeight, devicePixelRatio,
     scale: Number(globalThis.visualViewport?.scale ?? 1), url: location.href, pageInstanceId };
   if (action === "inspectVisualTarget") {
-    const element = find(payload.locator);
+    // A proof's own element wins while it is still connected and still matches the locator, even
+    // if the locator alone would now match a second post that scrolled in.
+    const remembered = recallVisualRef(payload.elementRef);
+    let element;
+    if (remembered && stillMatches(remembered.element, payload.locator)) {
+      element = remembered.element;
+      lastFind = null;
+    } else element = find(payload.locator);
+    const elementRefMatched = payload.elementRef === undefined ? undefined
+      : remembered ? remembered.element === element : null;
     if (payload.scroll !== false) {
       // Use a synchronous scroll/layout read instead of a page timer, which
       // may be throttled for a background task tab. The broker still verifies
@@ -4320,11 +4575,11 @@ async function injectedPageOperation(action, payload) {
     if (clipped.right <= clipped.left || clipped.bottom <= clipped.top) {
       throw operationError("visual_target_outside_viewport", "The semantic target is not visibly intersecting the current viewport");
     }
-    const point = {
+    let point = {
       x: Math.round((clipped.left + clipped.right) / 2),
       y: Math.round((clipped.top + clipped.bottom) / 2),
     };
-    const mapping = frameCoordinateMap(point);
+    let mapping = frameCoordinateMap(point);
     if (!mapping.supported) {
       return {
         supported: false,
@@ -4342,18 +4597,16 @@ async function injectedPageOperation(action, payload) {
       };
     }
     if (payload.requireHitOwner === true) {
-      let hit = document.elementFromPoint(point.x, point.y);
-      while (hit?.shadowRoot) {
-        const child = hit.shadowRoot.elementFromPoint?.(point.x, point.y);
-        if (!child || child === hit) break;
-        hit = child;
-      }
-      let owner = hit;
-      while (owner && owner !== element) owner = owner.parentNode || owner.getRootNode?.().host;
-      if (owner !== element) {
+      const owned = hitOwnedPoint(element, clipped);
+      if (!owned) {
         throw operationError("visual_target_not_at_point", "The inspected point is covered by another element");
       }
+      if (owned.x !== point.x || owned.y !== point.y) {
+        point = owned;
+        mapping = frameCoordinateMap(point);
+      }
     }
+    if (payload.markOperated === true) markOperated(element);
     // This token remains in the isolated world and identifies this exact DOM
     // object, not a selector that could silently resolve to a replacement.
     const semanticGuards = globalThis.__aosCompanionSemanticGuardsV1
@@ -4380,6 +4633,10 @@ async function injectedPageOperation(action, payload) {
       frameViewport: { width: innerWidth, height: innerHeight, devicePixelRatio, scale: Number(globalThis.visualViewport?.scale ?? 1) },
       frameScroll: { x: Math.round(scrollX), y: Math.round(scrollY) },
       semanticGuard: { id: guardId, expiresAt, methods: ["page.click", "page.submit"] },
+      elementRef: rememberVisualRef(element),
+      ...(elementRefMatched !== undefined ? { elementRefMatched } : {}),
+      targetChoice: { looseNameMatch: lastFind?.looseName === true, disambiguatedBy: lastFind?.disambiguatedBy ?? null,
+        matchedCount: lastFind?.matchedCount ?? 1 },
       external_action_executed: false,
       operation_effect_state: "none",
     };
@@ -4416,14 +4673,37 @@ async function injectedPageOperation(action, payload) {
         mutation_dispatch_attempted: false,
       };
     }
+    // A point proof remembers the control under it. Before the click, the same control must still
+    // own the point, or own it after following its own small move (at most 64 px).
+    let chosen = point, elementRefMatched, pointShift = null, remembered = null;
+    if (payload.elementRef !== undefined && !canvas) {
+      remembered = recallVisualRef(payload.elementRef);
+      elementRefMatched = remembered ? ownsPoint(remembered.element, point.x, point.y) : null;
+      if (remembered && !elementRefMatched && payload.allowShift === true) {
+        const now = boxOf(remembered.element);
+        const dx = Math.round(now.x - remembered.rect.x), dy = Math.round(now.y - remembered.rect.y);
+        const shifted = { x: point.x + dx, y: point.y + dy };
+        if (Math.hypot(dx, dy) <= 64 && shifted.x >= 0 && shifted.y >= 0 && shifted.x <= viewport.width && shifted.y <= viewport.height
+          && ownsPoint(remembered.element, shifted.x, shifted.y)) {
+          chosen = shifted; elementRefMatched = true; pointShift = { dx, dy };
+        }
+      }
+    }
+    const chosenHit = chosen === point ? hit : document.elementFromPoint(chosen.x, chosen.y);
+    const hitControl = chosenHit ? (chosenHit.closest?.(CLICKABLE_SELECTOR) ?? chosenHit) : null;
+    const refElement = remembered && elementRefMatched ? remembered.element : hitControl;
+    if (refElement && payload.markOperated === true) markOperated(refElement);
     return {
       supported: true,
       url: location.href,
       pageInstanceId,
-      point,
+      point: chosen,
       viewport,
       scroll: { x: Math.round(scrollX), y: Math.round(scrollY) },
       rect: null,
+      ...(refElement && !canvas ? { elementRef: rememberVisualRef(refElement), hitElement: visualIdentity(refElement) } : {}),
+      ...(elementRefMatched !== undefined ? { elementRefMatched } : {}),
+      ...(pointShift ? { pointShift } : {}),
       surfaceKind: canvas ? "canvas" : "dom",
       ...(canvasRect ? { surfaceRect: { x: canvasRect.x, y: canvasRect.y, width: canvasRect.width, height: canvasRect.height } } : {}),
       frameId: 0,
@@ -4497,6 +4777,7 @@ async function injectedPageOperation(action, payload) {
     scrollTargetOf(element).scrollIntoView({ block: "center", inline: "center" });
     visualize(element, "click");
     activateControl(element, guard);
+    markOperated(element);
     return {
       clicked: true,
       visualized: true,
@@ -4504,6 +4785,7 @@ async function injectedPageOperation(action, payload) {
       formSubmitControl,
       mutationDispatchAttempted: true,
       element: describe(element),
+      ...(lastFind && (lastFind.looseName || lastFind.disambiguatedBy) ? { targetChoice: { ...lastFind } } : {}),
       url: location.href,
     };
   }

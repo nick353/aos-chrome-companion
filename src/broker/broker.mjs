@@ -94,6 +94,27 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+// A target proof lives three minutes (was one): runs look at the screenshot and write before they
+// click, and the click itself now checks that the element is still the same one (2026-10-19).
+// A point proof keeps one minute; the viewport cleanup readback relies on that bound.
+const VISUAL_PROOF_TTL_MS = 180_000;
+
+function visualIdentity(element) {
+  if (!element || typeof element !== "object" || Array.isArray(element)) return null;
+  const identity = {
+    tag: String(element.tag ?? "").slice(0, 40),
+    role: String(element.role ?? "").slice(0, 60),
+    name: String(element.name ?? "").slice(0, 300),
+    testId: element.testId == null ? null : String(element.testId).slice(0, 200),
+  };
+  return identity.tag || identity.role ? identity : null;
+}
+
+function sameVisualIdentity(current, expected) {
+  const left = visualIdentity(current), right = visualIdentity(expected);
+  return Boolean(left && right) && ["tag", "role", "name", "testId"].every((key) => left[key] === right[key]);
+}
+
 // No-effect blockers scoped to one target that the same task may recover
 // from by reading the target again, with the concrete next step.
 const RECOVERABLE_NO_EFFECT_TARGET_BLOCKERS = new Map([
@@ -557,7 +578,10 @@ function semanticTargetStateDigest(secret, locator, inspection) {
 // One near-miss control in a locator error, cut to what a run needs to name it.
 function boundedControl(control) {
   const field = (value, max) => (typeof value === "string" ? value.slice(0, max) : null);
-  return { role: field(control?.role, 40), name: field(control?.name, 80), tag: field(control?.tag, 20), testId: field(control?.testId, 80) };
+  const otherNames = Array.isArray(control?.otherNames)
+    ? control.otherNames.filter((name) => typeof name === "string").slice(0, 2).map((name) => name.slice(0, 80)) : [];
+  return { role: field(control?.role, 40), name: field(control?.name, 80), tag: field(control?.tag, 20), testId: field(control?.testId, 80),
+    ...(otherNames.length ? { otherNames } : {}) };
 }
 
 function snapshotTargetDocument(snapshot, locator) {
@@ -3814,6 +3838,9 @@ export class CompanionBroker extends EventEmitter {
     const expiresAt = new Date(Date.parse(capturedAt) + 60_000).toISOString();
     const proofPayload = {
       schema: "aos.chrome_companion.visual_point_proof.v1",
+      // The control under the point, so a click can follow it when the feed moves a little.
+      elementRef: typeof inspection.elementRef === "string" ? inspection.elementRef : null,
+      hitElement: visualIdentity(inspection.hitElement),
       canvasPatch: await readCanvasVisualPatch({ inspection, secret: this.ledgerSecret,
         capture: options => this.#executeOperation(peer, { sessionId: session.sessionId, leaseId,
           method: "page.screenshot", params: { tabId, ...options } }) }),
@@ -3880,7 +3907,8 @@ export class CompanionBroker extends EventEmitter {
       });
       const current = await this.#executeOperation(peer, {
         sessionId: session.sessionId, leaseId, method: "visual.inspectTarget",
-        params: { tabId, locator, scroll: false },
+        params: { tabId, locator, scroll: false,
+          ...(typeof inspection?.elementRef === "string" ? { elementRef: inspection.elementRef } : {}) },
       });
       if (visual?.kind !== "screenshot" || !visual.dataBase64 || visual.tabId !== tabId
         || String(visual.url || "") !== approvedPageUrl
@@ -3907,9 +3935,12 @@ export class CompanionBroker extends EventEmitter {
     const visualPageUrl = approvedPageUrl;
     const capturedAtCandidate = String(visual.capturedAt || "");
     const capturedAt = Number.isFinite(Date.parse(capturedAtCandidate)) ? capturedAtCandidate : nowIso();
-    const expiresAt = new Date(Date.parse(capturedAt) + 60_000).toISOString();
+    const expiresAt = new Date(Date.parse(capturedAt) + VISUAL_PROOF_TTL_MS).toISOString();
     const proofPayload = {
       schema: "aos.chrome_companion.visual_target_proof.v1",
+      // Which element this is, so a click can find the same one after the page moved.
+      element: visualIdentity(inspection.element),
+      elementRef: typeof inspection.elementRef === "string" ? inspection.elementRef : null,
       sessionId: session.sessionId,
       leaseId,
       taskId: session.taskId ?? null,
@@ -3995,11 +4026,13 @@ export class CompanionBroker extends EventEmitter {
       || expiresAt <= Date.now()) {
       throw new CompanionError("visual_target_proof_invalid", "Visual target proof is stale, consumed, or does not match the exact session, lease, tab, generation, page, and viewport");
     }
-    if (consume) {
-      this.consumedVisualProofs.set(signature, expiresAt);
-      for (const [key, expiry] of this.consumedVisualProofs) if (expiry <= Date.now()) this.consumedVisualProofs.delete(key);
-    }
+    if (consume) this.#consumeVisualTargetProof({ signature, expiresAt });
     return {
+      signature,
+      expiresAt,
+      element: targetProof ? visualIdentity(payload.element) : null,
+      hitElement: pointProof ? visualIdentity(payload.hitElement) : null,
+      elementRef: typeof payload.elementRef === "string" ? payload.elementRef : null,
       kind: pointProof ? "point" : "target",
       point: { x: Number(point.x), y: Number(point.y) },
       rect: payload.rect,
@@ -4014,7 +4047,21 @@ export class CompanionBroker extends EventEmitter {
     };
   }
 
-  async #revalidateVisualTargetProof(peer, { session, lease, tabId, verified, currentUrl }) {
+  // A proof is spent once its input passes the checks before dispatch, not when a check before
+  // any input stops it: a run may retry the same proof after the page settles (2026-10-19).
+  #consumeVisualTargetProof({ signature, expiresAt }) {
+    if (typeof signature !== "string" || this.consumedVisualProofs.has(signature)) {
+      throw new CompanionError("visual_target_proof_invalid", "Visual target proof is stale, consumed, or does not match the exact session, lease, tab, generation, page, and viewport");
+    }
+    this.consumedVisualProofs.set(signature, expiresAt);
+    for (const [key, expiry] of this.consumedVisualProofs) if (expiry <= Date.now()) this.consumedVisualProofs.delete(key);
+  }
+
+  // allowMovedTarget (visual.click and visual.doubleClick only, never canvas): the target may have
+  // moved or the viewport changed size, as long as the same element is still there on the same
+  // page; the click then uses the element's current position. The Extension checks the same again
+  // after bringing the tab to the front, right before the mouse input.
+  async #revalidateVisualTargetProof(peer, { session, lease, tabId, verified, currentUrl, allowMovedTarget = false }) {
     if (verified?.kind === "point") {
       const snapshot = await this.#executeOperation(peer, {
         sessionId: session.sessionId,
@@ -4022,12 +4069,29 @@ export class CompanionBroker extends EventEmitter {
         method: "page.snapshot",
         params: { tabId, maxTextChars: 1_000 },
       });
+      const followElement = allowMovedTarget && !verified.canvasPatch && Boolean(verified.elementRef || verified.hitElement);
       const inspection = await this.#executeOperation(peer, {
         sessionId: session.sessionId,
         leaseId: lease.leaseId,
         method: "visual.inspectPoint",
-        params: { tabId, point: verified.point },
+        params: { tabId, point: verified.point,
+          ...(followElement ? { elementRef: verified.elementRef ?? null, allowShift: true } : {}) },
       });
+      const samePageNow = String(snapshot?.url || "") === String(currentUrl || "")
+        && String(inspection?.url || "") === String(currentUrl || "")
+        && (verified.pageInstanceId === null || inspection?.pageInstanceId === verified.pageInstanceId);
+      // An Extension that does not report the element yet keeps the exact-geometry check below.
+      if (followElement && inspection?.surfaceKind !== "canvas"
+        && (inspection?.elementRefMatched !== undefined || inspection?.hitElement)) {
+        const sameElement = inspection?.elementRefMatched === true
+          || (inspection?.elementRefMatched !== false && sameVisualIdentity(inspection?.hitElement, verified.hitElement));
+        if (inspection?.supported === false || !samePageNow || !sameElement) {
+          throw new CompanionError("visual_target_proof_stale_geometry", "The screenshot-bound visual point no longer lies on the same element of the approved page");
+        }
+        return { point: { x: Number(inspection.point.x), y: Number(inspection.point.y) },
+          viewport: inspection.viewport ?? verified.viewport, scroll: inspection.scroll ?? verified.scroll,
+          moved: Number(inspection.point.x) !== Number(verified.point.x) || Number(inspection.point.y) !== Number(verified.point.y) };
+      }
       const samePoint = Number(inspection?.point?.x) === Number(verified.point?.x)
         && Number(inspection?.point?.y) === Number(verified.point?.y);
       const sameViewport = Number(inspection?.viewport?.width) === Number(verified.viewport?.width)
@@ -4049,12 +4113,39 @@ export class CompanionBroker extends EventEmitter {
       assertCanvasVisualPatchUnchanged(verified.canvasPatch, canvasPatch);
       return true;
     }
+    const followElement = allowMovedTarget && Boolean(verified.elementRef || verified.element);
     const inspection = await this.#executeOperation(peer, {
       sessionId: session.sessionId,
       leaseId: lease.leaseId,
       method: "visual.inspectTarget",
-      params: { tabId, locator: verified.locator, scroll: false },
+      params: { tabId, locator: verified.locator, scroll: false,
+        ...(followElement ? { elementRef: verified.elementRef ?? null } : {}) },
     });
+    if (followElement && (inspection?.elementRefMatched !== undefined || inspection?.elementRef)) {
+      const inspectionUrl = String(inspection?.topLevelUrl || inspection?.url || "");
+      const samePageNow = inspectionUrl === String(currentUrl || "")
+        && (verified.pageInstanceId === null || inspection?.pageInstanceId === verified.pageInstanceId);
+      const sameFrameNow = String(inspection?.coordinateSpace || "viewport") === String(verified?.coordinateSpace || "viewport")
+        && JSON.stringify(inspection?.framePath || []) === JSON.stringify(verified?.framePath || []);
+      // The remembered DOM object, or else one element found without choosing among several,
+      // with the same tag, role, name and test id.
+      const sameElement = inspection?.elementRefMatched === true
+        || (inspection?.elementRefMatched !== false && sameVisualIdentity(inspection?.element, verified.element)
+          && !inspection?.targetChoice?.disambiguatedBy);
+      const pointNow = inspection?.point;
+      const pointInViewport = Number.isFinite(Number(pointNow?.x)) && Number.isFinite(Number(pointNow?.y))
+        && Number(pointNow.x) >= 0 && Number(pointNow.y) >= 0
+        && Number(pointNow.x) <= Number(inspection?.viewport?.width) && Number(pointNow.y) <= Number(inspection?.viewport?.height);
+      if (inspection?.supported === false || !samePageNow || !sameFrameNow || !sameElement || !pointInViewport) {
+        throw new CompanionError("visual_target_proof_stale_geometry", "The screenshot-bound target is no longer the same visible element of the approved page", {
+          mismatches: Object.entries({ supported: inspection?.supported !== false, samePage: samePageNow, sameFrame: sameFrameNow, sameElement, pointInViewport })
+            .filter(([, matched]) => !matched).map(([key]) => key),
+        });
+      }
+      return { point: { x: Number(pointNow.x), y: Number(pointNow.y) }, rect: inspection.clippedRect ?? verified.rect,
+        viewport: inspection.viewport ?? verified.viewport, scroll: inspection.scroll ?? verified.scroll,
+        moved: Number(pointNow.x) !== Number(verified.point?.x) || Number(pointNow.y) !== Number(verified.point?.y) };
+    }
     const samePoint = Number(inspection?.point?.x) === Number(verified.point?.x)
       && Number(inspection?.point?.y) === Number(verified.point?.y);
     const sameViewport = Number(inspection?.viewport?.width) === Number(verified.viewport?.width)
@@ -5163,36 +5254,48 @@ export class CompanionBroker extends EventEmitter {
           tabId: taskTab.id,
           currentUrl: before.url,
           currentPageInstanceId: before.pageInstanceId,
+          consume: false,
           });
-          await this.#revalidateVisualTargetProof(peer, { session, lease, tabId: taskTab.id, verified, currentUrl: before.url });
+          // Only a click follows a moved element; typing, keys, scrolls and drags keep exact geometry.
+          const followsElement = method === "visual.click" || method === "visual.doubleClick";
+          const fresh = await this.#revalidateVisualTargetProof(peer, { session, lease, tabId: taskTab.id, verified,
+            currentUrl: before.url, allowMovedTarget: followsElement && !verified.canvasPatch });
+          const geometry = fresh && typeof fresh === "object" ? fresh : null;
           delete actionParams.visualProof;
-          actionParams.point = verified.point;
+          actionParams.point = geometry?.point ?? verified.point;
           if (method === "visual.click" || method === "visual.doubleClick") {
             // The Extension promotes the tab and renders its cursor after this
             // broker check. Carry only verified geometry for a final check
             // after those layout-changing steps, before any mouse input.
             actionParams.visualTargetGuard = {
               kind: verified.kind, locator: verified.locator,
-              point: verified.point, rect: verified.rect,
-              viewport: verified.viewport, scroll: verified.scroll,
+              point: actionParams.point, rect: geometry?.rect ?? verified.rect,
+              viewport: geometry?.viewport ?? verified.viewport, scroll: geometry?.scroll ?? verified.scroll,
               pageUrl: before.url, pageInstanceId: verified.pageInstanceId,
               frameId: verified.frameId, framePath: verified.framePath,
               coordinateSpace: verified.coordinateSpace,
+              ...(geometry ? { allowMovedTarget: true, elementRef: verified.elementRef,
+                element: verified.element, hitElement: verified.hitElement } : {}),
+              ...(verified.canvasPatch ? { canvas: true } : {}),
             };
           }
+          let verifiedTo = null;
           if (method === "visual.drag") {
-            const verifiedTo = this.#verifyVisualTargetProof({
+            verifiedTo = this.#verifyVisualTargetProof({
               proof: actionParams.toVisualProof,
               session,
               lease,
               tabId: taskTab.id,
               currentUrl: before.url,
               currentPageInstanceId: before.pageInstanceId,
+              consume: false,
             });
             await this.#revalidateVisualTargetProof(peer, { session, lease, tabId: taskTab.id, verified: verifiedTo, currentUrl: before.url });
             delete actionParams.toVisualProof;
             actionParams.to = verifiedTo.point;
           }
+          this.#consumeVisualTargetProof(verified);
+          if (verifiedTo) this.#consumeVisualTargetProof(verifiedTo);
           visualTargetProofVerified = true;
         }
         const boundStep = bindTransactionStep(action, {
@@ -5625,6 +5728,9 @@ export class CompanionBroker extends EventEmitter {
           ...(Array.isArray(error.details.suggestions) ? { suggestions: error.details.suggestions.slice(0, 6).map(boundedControl) } : {}),
           ...(Array.isArray(error.details.candidates) ? { candidates: error.details.candidates.slice(0, 6).map(boundedControl) } : {}),
           ...(Number.isSafeInteger(error.details.hiddenMatches) ? { hiddenMatches: error.details.hiddenMatches } : {}),
+          // When nothing is named alike, the controls on screen with the names they answer to (2026-10-19).
+          ...(Array.isArray(error.details.controlsOnScreen) ? { controlsOnScreen: error.details.controlsOnScreen.slice(0, 12).map(boundedControl) } : {}),
+          ...(Array.isArray(error.details.mismatches) ? { mismatches: error.details.mismatches.filter((key) => typeof key === "string").slice(0, 8).map((key) => key.slice(0, 40)) } : {}),
         }
         : {};
       if (error?.code === "screenshot_target_changed" && error.details && typeof error.details === "object") {

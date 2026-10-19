@@ -1903,6 +1903,71 @@ test("schema-valid drags bind both inspected targets and reject a moved destinat
   } finally { await harness.close(); }
 });
 
+// 2026-10-19: feeds move between the screenshot and the click (56 stops a day on Instagram,
+// Threads and X). A click now follows the same element to where it is; anything else stops before
+// input.
+test("a visual click follows the same element after the feed moved, and stops before input when it is another element", async () => {
+  let phase = "inspect";
+  const harness = await createCapsuleHarness({ interceptCommand: ({ message, tab, extension }) => {
+    if (message.method !== "visual.inspectTarget" || message.params?.locator?.testId !== "feed-like") return false;
+    const moved = phase !== "inspect";
+    extension.send({ kind: "command.result", operationId: message.operationId, result: {
+      supported: true, url: tab.url, topLevelUrl: tab.url, pageInstanceId: `document-${tab.id}-${tab.url}`,
+      element: { tag: "div", role: "button", name: "いいね！", testId: "feed-like" },
+      rect: { x: 10, y: moved ? 70 : 10, width: 100, height: 30 }, clippedRect: { x: 10, y: moved ? 70 : 10, width: 100, height: 30 },
+      point: { x: 60, y: moved ? 85 : 25 }, viewport: { width: 1200, height: moved ? 860 : 800, devicePixelRatio: 1, scale: 1 },
+      scroll: { x: 0, y: moved ? 60 : 0 }, framePath: [], coordinateSpace: "top-level-viewport", elementRef: "ref-like",
+      ...(message.params?.elementRef !== undefined ? { elementRefMatched: phase === "replaced" ? false : true } : {}),
+    } });
+    return true;
+  } });
+  const { client, session, commands } = harness;
+  const origin = "https://example.test";
+  try {
+    const base = { sessionId: session.sessionId, taskId: session.taskId, targetOrigin: origin, startUrl: origin + "/feed", allowedOrigins: [origin], keepTaskTab: true };
+    const prepared = await client.requestAuthorizedTransaction({ ...base, runId: "feed-prepare", idempotencyKey: "feed-prepare", actions: [{ method: "page.query", params: { query: "ready" } }] });
+    const tabId = prepared.tab.id;
+    const lease = await client.request("lease.acquire", { sessionId: session.sessionId, tabId });
+    const inspect = async () => {
+      const current = await client.request("lease.acquire", { sessionId: session.sessionId, tabId }).catch(() => lease);
+      return client.request("visual.target.inspect", { sessionId: session.sessionId, leaseId: current.leaseId, tabId, locator: { testId: "feed-like" } });
+    };
+    let inspected = await inspect();
+    assert.equal(inspected.visualProof.elementRef, "ref-like");
+    assert.deepEqual(inspected.visualProof.element, { tag: "div", role: "button", name: "いいね！", testId: "feed-like" });
+    assert.ok(Date.parse(inspected.visualProof.expiresAt) - Date.parse(inspected.visualProof.capturedAt) >= 179_000);
+    const clickWith = (key) => client.requestAuthorizedTransaction({ ...base, tabId, runId: key, idempotencyKey: key,
+      actions: [{ method: "visual.click", params: { visualProof: inspected.visualProof } }] });
+    const clicks = () => commands.filter((command) => command.method === "visual.click");
+
+    phase = "replaced";
+    const stopped = await clickWith("feed-like-replaced");
+    assert.equal(stopped.result, "blocked");
+    assert.equal(stopped.exact_blocker.code, "visual_target_proof_stale_geometry");
+    assert.ok(stopped.exact_blocker.details.mismatches.includes("sameElement"));
+    assert.equal(clicks().length, 0);
+
+    // A stop hands the tab to a new lease, so the run inspects again (the page has moved since).
+    phase = "inspect";
+    inspected = await inspect();
+    phase = "moved";
+    const clicked = await clickWith("feed-like-moved");
+    assert.equal(clicked.result, "verified", JSON.stringify(clicked.exact_blocker));
+    assert.equal(clicks().length, 1);
+    const sent = clicks()[0].params;
+    assert.deepEqual(sent.point, { x: 60, y: 85 });
+    assert.equal(sent.visualTargetGuard.allowMovedTarget, true);
+    assert.equal(sent.visualTargetGuard.elementRef, "ref-like");
+    assert.deepEqual(sent.visualTargetGuard.point, { x: 60, y: 85 });
+    assert.equal(sent.visualTargetGuard.element.name, "いいね！");
+
+    const reused = await clickWith("feed-like-again");
+    assert.equal(reused.result, "blocked");
+    assert.equal(reused.exact_blocker.code, "visual_target_proof_invalid");
+    assert.equal(clicks().length, 1);
+  } finally { await harness.close(); }
+});
+
 test("visual target proofs bind settled postcapture geometry with bounded same-document reads", async () => {
   for (const change of ['stable','height-once','moves-every-capture','document','url','frame']) {
     let captures=0, armed=false;
