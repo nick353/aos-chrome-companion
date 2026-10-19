@@ -168,3 +168,12 @@ test('the recorded tab is not put back into its task group while it records', as
   assert.match(step, /recordingWindows\.status\(\)\?\.tabId === tabId/);
   assert.ok(step.indexOf('recordingWindows.status()') < step.indexOf('ensureTaskGroup('));
 });
+
+// A new task group used to be made in the last focused window, which pulled another task's new tab
+// into the recording window while it recorded (2026-10-19, second real run).
+test('a new task group is made in the tab\'s own window', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const source = await readFile(new URL('../extension/service-worker.js', import.meta.url), 'utf8');
+  const step = source.slice(source.indexOf('async function ensureTaskGroup('), source.indexOf('function requireVisualPoint('));
+  assert.match(step, /chrome\.tabs\.group\(\{ tabIds: \[tab\.id\], createProperties: \{ windowId: tab\.windowId \} \}\)/);
+});

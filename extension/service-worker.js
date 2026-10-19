@@ -936,7 +936,9 @@ async function ensureTaskGroup(tab, { taskId, taskLabel, collapsed = false } = {
     }
   }
   if (!Number.isSafeInteger(groupId)) {
-    groupId = await chrome.tabs.group({ tabIds: [tab.id] });
+    // In the tab's own window: Chrome's default is the last focused window, which moved a task's
+    // new tab into a recording window (2026-10-19).
+    groupId = await chrome.tabs.group({ tabIds: [tab.id], createProperties: { windowId: tab.windowId } });
   } else if (tab.groupId !== groupId) {
     await chrome.tabs.group({ groupId, tabIds: [tab.id] });
   }
