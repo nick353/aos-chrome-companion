@@ -2503,6 +2503,12 @@ async function executeCommand(method, params) {
       const tabId = requireTabId(params.tabId);
       const tab = await assertLiveOrigin(tabId, params);
       const collapsed = params.collapsed === true;
+      // A tab group lives in one window, and Chrome makes a new group in the last focused window:
+      // regrouping a tab that is recording pulled it back into the task's window and the emptied
+      // recording window closed (2026-10-19, first real run). It stays ungrouped until it goes back.
+      if (typeof recordingWindows !== "undefined" && recordingWindows.status()?.tabId === tabId) {
+        return { ...sanitizeTab(await chrome.tabs.get(tabId)), grouped: false, recordingWindow: true, collapsed: false };
+      }
       const groupId = await ensureTaskGroup(tab, {
         taskId: params.taskId,
         taskLabel: params.taskLabel,

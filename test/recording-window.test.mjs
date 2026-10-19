@@ -153,3 +153,13 @@ test('the media step clicks the video through the debugger and evaluates no scri
   assert.doesNotMatch(source, /Runtime\.evaluate/);
   assert.match(source, /if \(action === "recordingMedia"\)/);
 });
+
+// Every Companion step puts its tab into the task's tab group first; for the recorded tab that
+// would pull it out of the recording window (2026-10-19, first real run: the window closed at once).
+test('the recorded tab is not put back into its task group while it records', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const source = await readFile(new URL('../extension/service-worker.js', import.meta.url), 'utf8');
+  const step = source.slice(source.indexOf('case "tabs.groupTask": {'), source.indexOf('case "page.snapshot": {'));
+  assert.match(step, /recordingWindows\.status\(\)\?\.tabId === tabId/);
+  assert.ok(step.indexOf('recordingWindows.status()') < step.indexOf('ensureTaskGroup('));
+});
