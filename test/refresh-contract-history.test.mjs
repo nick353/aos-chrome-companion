@@ -80,15 +80,15 @@ test('refresh history supports dev-local bootstrap with the same exact verified 
   assert.equal(historicalRefreshContractMatches(record, { ...record, buildId: `install-${randomUUID()}` }), false);
 });
 
-test('refresh history atomically retains three distinct verified tuples and survives fresh reads', async t => {
+test('refresh history atomically retains ten distinct verified tuples and survives fresh reads', async t => {
   const { record, historyPath } = await fixture(t);
-  for (let index = 0; index < 4; index++) await saveRefreshContractHistory(historyPath,
-    { ...record, buildId: `install-00000000-0000-0000-0000-00000000000${index}` });
+  for (let index = 0; index < 11; index++) await saveRefreshContractHistory(historyPath,
+    { ...record, buildId: `install-00000000-0000-0000-0000-0000000000${String(index).padStart(2, '0')}` });
   const saved = await readRefreshContractHistory(historyPath);
-  assert.equal(saved.records.length, 3);
-  assert.equal(saved.records[0].buildId.endsWith('1'), true);
+  assert.equal(saved.records.length, 10);
+  assert.equal(saved.records[0].buildId.endsWith('01'), true);
   await saveRefreshContractHistory(historyPath, saved.records[1]);
-  assert.equal((await readRefreshContractHistory(historyPath)).records.length, 3);
+  assert.equal((await readRefreshContractHistory(historyPath)).records.length, 10);
   assert.equal((await lstat(historyPath)).mode & 0o777, 0o600);
   assert.equal((await readdir(dirname(historyPath))).some(name => name.endsWith('.tmp')), false);
 });

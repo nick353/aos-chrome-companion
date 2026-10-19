@@ -5,6 +5,10 @@ import { dirname, join, relative, resolve, sep } from 'node:path';
 
 export const REFRESH_CONTRACT_HISTORY_SCHEMA = 'companion_refresh_contract_history.v1';
 const HASH = /^[a-f0-9]{64}$/u;
+// Several installs can land while Chrome still runs an older Extension that
+// never reflected them (2026-10-19: four installs overnight evicted the running
+// tuple and the Extension could never be told to reload). Keep enough history.
+export const REFRESH_CONTRACT_HISTORY_LIMIT = 10;
 const ARTIFACTS = ['bundleTreeSha256', 'extensionTreeSha256', 'nativeRecorderSha256'];
 const sha = data => createHash('sha256').update(data).digest('hex');
 const capDigest = list => sha(JSON.stringify([...list].sort()));
@@ -65,7 +69,7 @@ export async function readRefreshContractHistory(path) {
       || typeof process.getuid === 'function' && stat.uid !== process.getuid()) fail();
     const history = JSON.parse(await file.readFile('utf8'));
     if (history.schema !== REFRESH_CONTRACT_HISTORY_SCHEMA || !Array.isArray(history.records)
-      || history.records.length < 1 || history.records.length > 3) fail();
+      || history.records.length < 1 || history.records.length > REFRESH_CONTRACT_HISTORY_LIMIT) fail();
     if (Object.keys(history).length !== 2 || Object.keys(history).some(field => !['schema', 'records'].includes(field))) fail();
     const keys = history.records.map(record => tupleIdentity(validateRecord(record)));
     if (new Set(keys).size !== keys.length) fail();
@@ -80,7 +84,7 @@ export async function saveRefreshContractHistory(path, record) {
   let previous = [];
   try { previous = (await readRefreshContractHistory(absolute)).records; }
   catch (error) { if (error.code !== 'ENOENT') throw error; }
-  const records = [...previous.filter(value => tupleIdentity(value) !== tupleIdentity(record)), record].slice(-3);
+  const records = [...previous.filter(value => tupleIdentity(value) !== tupleIdentity(record)), record].slice(-REFRESH_CONTRACT_HISTORY_LIMIT);
   const history = { schema: REFRESH_CONTRACT_HISTORY_SCHEMA, records };
   const temporary = `${absolute}.${randomUUID()}.tmp`;
   const file = await open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
