@@ -5,24 +5,16 @@ import { promisify } from "node:util";
 
 // A real recording (moving video with sound) for what a slideshow replay cannot show: short videos
 // on TikTok or Instagram to analyse without downloading them, and how a moving page feels
-// (owner, 2026-10-19). The native recorder captures the frontmost Chrome window, so Chrome comes to
-// the front; the owner allowed that only while the Mac is not in use: no input for a few minutes and
-// no camera or microphone in use (a video interview). The recording stops at its limit (at most ten
-// minutes, owner's choice), when the owner comes back, or when a call starts.
+// (owner, 2026-10-19). Recording is allowed whenever the AI needs it, even during the owner's work or a
+// call (owner, 2026-10-19: 「普通にAIが使いたい時に録画使えるようにしてください。私は気にしないで」「大丈夫
+// です。こんな感じで分けて普段使っているので」: the AOS Chrome window always sits on one half of the screen).
+// The native recorder picks the frontmost Chrome window, so Chrome is in front only for the moment the
+// recording starts; then the previous app gets the keyboard back, and the recorder keeps capturing that
+// window while it stays visible. The recording stops at its limit (at most ten minutes, owner's choice).
 
 const run = promisify(execFile);
 
 export const RECORD_MAX_SECONDS = 600;
-export const OWNER_IDLE_SECONDS = 180;
-// Input within this many seconds after a longer pause means the owner is back at the Mac.
-export const OWNER_RETURN_SECONDS = 20;
-
-export async function readIdleSeconds({ exec = run } = {}) {
-  const { stdout } = await exec("/usr/sbin/ioreg", ["-c", "IOHIDSystem", "-d", "4"], { timeout: 5_000, maxBuffer: 8 << 20 });
-  const match = /"HIDIdleTime"\s*=\s*(\d+)/u.exec(stdout);
-  if (!match) throw Object.assign(new Error("Could not read the time since the last keyboard or mouse input"), { code: "owner_idle_unknown" });
-  return Number(match[1]) / 1e9;
-}
 
 export async function readDevicePresence(recorderPath, { exec = run } = {}) {
   const { stdout } = await exec(recorderPath, ["--presence"], { timeout: 10_000 });
@@ -45,23 +37,9 @@ export async function bringAppToFront(bundleId, { exec = run } = {}) {
   try { await exec("/usr/bin/open", ["-b", bundleId], { timeout: 10_000 }); return true; } catch { return false; }
 }
 
-// Why recording may not start now, or null when the owner is away.
-export function ownerPresenceBlocker({ idleSeconds, camera, microphone }, { minIdleSeconds = OWNER_IDLE_SECONDS } = {}) {
-  if (camera) return { code: "owner_on_camera", message: "A camera is in use (a call or an interview); Chrome is not brought to the front now" };
-  if (microphone) return { code: "owner_on_microphone", message: "A microphone is in use (a call or an interview); Chrome is not brought to the front now" };
-  if (!(idleSeconds >= minIdleSeconds)) {
-    return { code: "owner_active", message: `The owner used the Mac ${Math.round(idleSeconds)} seconds ago; recording waits until there has been no input for ${minIdleSeconds} seconds` };
-  }
-  return null;
-}
-
 // Why a running recording must stop now, or null to keep going.
-export function autoStopReason({ elapsedSeconds, maxSeconds, idleSeconds, previousIdleSeconds, camera, microphone }) {
-  if (elapsedSeconds >= maxSeconds) return "time_limit";
-  if (camera || microphone) return "owner_call_started";
-  if (Number.isFinite(idleSeconds) && Number.isFinite(previousIdleSeconds)
-    && idleSeconds < previousIdleSeconds && idleSeconds < OWNER_RETURN_SECONDS) return "owner_returned";
-  return null;
+export function autoStopReason({ elapsedSeconds, maxSeconds }) {
+  return elapsedSeconds >= maxSeconds ? "time_limit" : null;
 }
 
 export function recordFolderName(createdAt, tag, label = null) {

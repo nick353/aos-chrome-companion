@@ -5,46 +5,30 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  OWNER_IDLE_SECONDS, RECORD_MAX_SECONDS, autoStopReason, bringAppToFront, frontmostBundleId, ownerPresenceBlocker,
-  prepareRecordingForAnalysis, readDevicePresence, readIdleSeconds, recordFolderName,
+  RECORD_MAX_SECONDS, autoStopReason, bringAppToFront, frontmostBundleId,
+  prepareRecordingForAnalysis, readDevicePresence, recordFolderName,
 } from '../src/mcp/recording.mjs';
 import { pruneReplays } from '../src/mcp/replay.mjs';
 
-// Real recordings bring Chrome to the front, which the owner allowed only while the Mac is not in
-// use, and never during a call (2026-10-19). The longest recording is ten minutes (owner's choice).
+// Recording is allowed whenever the AI needs it, even during the owner's work or a call (owner,
+// 2026-10-19: 「私は気にしないで」「こんな感じで分けて普段使っているので」). The longest is ten minutes.
 
-test('recording waits while the owner uses the Mac or is on a call', () => {
+test('a recording runs until its limit, whatever the owner is doing', () => {
   assert.equal(RECORD_MAX_SECONDS, 600);
-  assert.equal(ownerPresenceBlocker({ idleSeconds: OWNER_IDLE_SECONDS + 1, camera: false, microphone: false }), null);
-  assert.equal(ownerPresenceBlocker({ idleSeconds: 30, camera: false, microphone: false }).code, 'owner_active');
-  assert.equal(ownerPresenceBlocker({ idleSeconds: 9999, camera: true, microphone: false }).code, 'owner_on_camera');
-  assert.equal(ownerPresenceBlocker({ idleSeconds: 9999, camera: false, microphone: true }).code, 'owner_on_microphone');
-  assert.equal(ownerPresenceBlocker({ idleSeconds: Number.NaN, camera: false, microphone: false }).code, 'owner_active');
+  assert.equal(autoStopReason({ elapsedSeconds: 10, maxSeconds: 60 }), null);
+  assert.equal(autoStopReason({ elapsedSeconds: 60, maxSeconds: 60 }), 'time_limit');
+  assert.equal(autoStopReason({ elapsedSeconds: 10, maxSeconds: 60, camera: true, microphone: true }), null);
 });
 
-test('a recording stops at its limit, when a call starts, or when the owner comes back', () => {
-  const base = { elapsedSeconds: 10, maxSeconds: 60, idleSeconds: 400, previousIdleSeconds: 397, camera: false, microphone: false };
-  assert.equal(autoStopReason(base), null);
-  assert.equal(autoStopReason({ ...base, elapsedSeconds: 60 }), 'time_limit');
-  assert.equal(autoStopReason({ ...base, camera: true }), 'owner_call_started');
-  assert.equal(autoStopReason({ ...base, microphone: true }), 'owner_call_started');
-  assert.equal(autoStopReason({ ...base, idleSeconds: 2, previousIdleSeconds: 397 }), 'owner_returned');
-  // An unreadable idle time does not stop the recording by itself.
-  assert.equal(autoStopReason({ ...base, idleSeconds: Number.NaN }), null);
-});
-
-test('idle time, devices in use and the front app are read from macOS tools', async () => {
+test('devices in use and the front app are read from macOS tools', async () => {
   const exec = async (file, args) => {
-    if (file.endsWith('ioreg')) return { stdout: '  |   "HIDIdleTime" = 245123456789\n' };
     if (file === '/rec' && args[0] === '--presence') return { stdout: '{"camera":true,"microphone":false}\n' };
     if (file.endsWith('lsappinfo') && args[0] === 'front') return { stdout: 'ASN:0x0-0x1a01a:\n' };
     if (file.endsWith('lsappinfo')) return { stdout: '"CFBundleIdentifier"="com.anthropic.claudefordesktop"\n' };
     throw new Error(`unexpected ${file}`);
   };
-  assert.equal(Math.round(await readIdleSeconds({ exec })), 245);
   assert.deepEqual(await readDevicePresence('/rec', { exec }), { camera: true, microphone: false });
   assert.equal(await frontmostBundleId({ exec }), 'com.anthropic.claudefordesktop');
-  await assert.rejects(readIdleSeconds({ exec: async () => ({ stdout: 'nothing' }) }), { code: 'owner_idle_unknown' });
   assert.equal(await frontmostBundleId({ exec: async () => { throw new Error('no'); } }), null);
 });
 

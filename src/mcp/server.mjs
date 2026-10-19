@@ -17,8 +17,8 @@ import { withSiteAliases } from "../shared/site-aliases.mjs";
 import { settleUnknownSend } from "./settle-unknown-send.mjs";
 import { MAX_SPLIT_ACTIONS, runSplitTransaction } from "./split-transaction.mjs";
 import { buildReplayTimeline, listSessionScreenshots, pruneReplays, replayFolderName, writeReplay } from "./replay.mjs";
-import { RECORD_MAX_SECONDS, autoStopReason, bringAppToFront, frontmostBundleId, ownerPresenceBlocker, prepareRecordingForAnalysis,
-  readDevicePresence, readIdleSeconds, recordFolderName } from "./recording.mjs";
+import { RECORD_MAX_SECONDS, autoStopReason, bringAppToFront, frontmostBundleId, prepareRecordingForAnalysis,
+  recordFolderName } from "./recording.mjs";
 import { existsSync } from "node:fs";
 import { resolveDataDir } from "../shared/paths.mjs";
 import { join } from "node:path";
@@ -813,9 +813,7 @@ server.registerTool("companion_replay", {
   return { ...replay, removedOldReplays: pruneReplays(root, { except: outDir }).length };
 }));
 
-// Real recordings (recording.mjs): at most one per MCP process, watched every few seconds so it stops
-// at its limit, when the owner comes back to the Mac or when a call starts.
-const recorderPath = () => process.env.AOS_CHROME_COMPANION_RECORDER ?? join(resolveDataDir(), "bin", "aos-chrome-companion-recorder");
+// Real recordings (recording.mjs): at most one per MCP process, stopped at its time limit.
 let activeRecording = null;
 const finishedRecordings = new Map();
 
@@ -833,7 +831,6 @@ function finishRecording(state, stoppedBy) {
     } catch (error) {
       stopError = normalizeError(error);
     }
-    const restoredFront = await bringAppToFront(state.frontApp);
     let analysis = null;
     let analysisError = null;
     if (existsSync(state.moviePath)) {
@@ -843,7 +840,7 @@ function finishRecording(state, stoppedBy) {
       analysisError = "The recorder left no movie file";
     }
     const result = { kind: "companion_recording", stoppedBy, startedAt: state.startedAt, stoppedAt: new Date().toISOString(),
-      stopResult: stop?.result ?? null, stopError, restoredFront: restoredFront ? state.frontApp : null,
+      stopResult: stop?.result ?? null, stopError,
       ...(analysis ?? { folder: null, video: null, frames: [] }), analysisError,
       removedOldRecordings: pruneReplays(join(resolveDataDir(), "Recordings"), { except: state.outDir }).length };
     finishedRecordings.set(state.sessionId, result);
@@ -853,7 +850,7 @@ function finishRecording(state, stoppedBy) {
 }
 
 server.registerTool("companion_record_start", {
-  description: "Record this task's tab as a real video with sound, for what a slideshow replay cannot show: short videos (TikTok, Instagram, YouTube) to analyse without downloading them, and animations or how a moving page behaves. The recorder captures the frontmost Chrome window, so this brings the task's tab and its window to the front. The owner allowed that only while the Mac is idle: it refuses with owner_active (keyboard or mouse used in the last 3 minutes), owner_on_camera or owner_on_microphone (a call or an interview); then do it later or use companion_replay. While recording, play and scroll the page with ordinary Companion actions. It stops by itself at maxSeconds (at most 600), when the owner touches the Mac or when a call starts; call companion_record_stop when done. To review which steps a run took, use companion_replay instead (no capture, nothing comes to the front).",
+  description: "Record this task's tab as a real video with sound, for what a slideshow replay cannot show: short videos (TikTok, Instagram, YouTube) to analyse without downloading them, and animations or how a moving page behaves. Use it whenever it helps, even while the owner is using the Mac or on a call (the owner allowed that). The recorder picks the frontmost Chrome window, so the task's tab and its window come to the front only for the moment the recording starts; then the previous app gets the keyboard back and the window keeps being recorded while it stays visible on screen. While recording, play and scroll the page with ordinary Companion actions. It stops by itself at maxSeconds (at most 600); call companion_record_stop when done. To review which steps a run took, use companion_replay instead (no capture, nothing comes to the front).",
   inputSchema: { sessionId, runId: z.string().min(1), taskId: z.string().min(1).optional(), idempotencyKey: z.string().min(1),
     tabId: tabId.describe("The task-owned tab to record"), startUrl: z.string().url().describe("The tab's current URL"),
     allowedOrigins: z.array(z.string().url()).min(1).max(16), targetOrigin: z.string().url().optional(),
@@ -866,10 +863,6 @@ server.registerTool("companion_record_start", {
   if (activeRecording) {
     throw new CompanionError("recording_already_active", "A recording is already running; stop it with companion_record_stop first", { startedAt: activeRecording.startedAt });
   }
-  const [idleSeconds, presence] = await Promise.all([readIdleSeconds(), readDevicePresence(recorderPath())]);
-  const blocker = ownerPresenceBlocker({ idleSeconds, ...presence });
-  if (blocker) throw new CompanionError(blocker.code, blocker.message, { idleSeconds: Math.round(idleSeconds), ...presence, retryAfterSeconds: 300 });
-
   const client = await broker();
   const targetOrigin = args.targetOrigin ?? new URL(args.startUrl).origin;
   const transaction = { sessionId: args.sessionId, runId: args.runId, taskId, idempotencyKey: args.idempotencyKey,
@@ -897,35 +890,28 @@ server.registerTool("companion_record_start", {
     await bringAppToFront(frontApp);
     throw error;
   }
+  // The recorder has fixed its window; give the keyboard back so the owner's typing never lands in Chrome.
+  const restoredFront = await bringAppToFront(frontApp);
   if (started?.result !== "verified") {
-    await bringAppToFront(frontApp);
     return { kind: "companion_recording", started: false, reason: "recorder_did_not_start", start: started };
   }
   const state = { sessionId: args.sessionId, transaction, frontApp, outDir, moviePath: join(resolveDataDir(), "Recordings", `${filename}.mov`),
-    startedAt: new Date(now).toISOString(), startedMs: now, maxSeconds: args.maxSeconds, lastIdle: idleSeconds, timer: null, checking: false };
-  state.timer = setInterval(async () => {
-    if (state.checking || state.finishing) return;
-    state.checking = true;
-    try {
-      const idle = await readIdleSeconds().catch(() => Number.NaN);
-      const devices = await readDevicePresence(recorderPath()).catch(() => ({ camera: false, microphone: false }));
-      const reason = autoStopReason({ elapsedSeconds: (Date.now() - state.startedMs) / 1000, maxSeconds: state.maxSeconds,
-        idleSeconds: idle, previousIdleSeconds: state.lastIdle, ...devices });
-      if (Number.isFinite(idle)) state.lastIdle = idle;
-      if (reason) void finishRecording(state, reason);
-    } finally {
-      state.checking = false;
-    }
+    startedAt: new Date(now).toISOString(), startedMs: now, maxSeconds: args.maxSeconds, timer: null };
+  state.timer = setInterval(() => {
+    if (state.finishing) return;
+    const reason = autoStopReason({ elapsedSeconds: (Date.now() - state.startedMs) / 1000, maxSeconds: state.maxSeconds });
+    if (reason) void finishRecording(state, reason);
   }, 3_000);
   state.timer.unref?.();
   activeRecording = state;
   finishedRecordings.delete(args.sessionId);
   return { kind: "companion_recording", started: true, startedAt: state.startedAt, maxSeconds: args.maxSeconds, folder: outDir,
-    previousFrontApp: frontApp, next: "Play or scroll the page with Companion actions, then call companion_record_stop" };
+    previousFrontApp: frontApp, keyboardReturnedToPreviousApp: restoredFront,
+    next: "Play or scroll the page with Companion actions, then call companion_record_stop" };
 }));
 
 server.registerTool("companion_record_stop", {
-  description: "Stop this session's recording (or read the result of one that already stopped by itself), give the front back to the app that was there before, and return a folder with recording.mov, audio.m4a and a still frame every 2 seconds (paths with their time in the video) to look at. Recordings and replays are removed after seven days unless their folder holds a file named keep.",
+  description: "Stop this session's recording (or read the result of one that already stopped by itself) and return a folder with recording.mov, audio.m4a and a still frame every 2 seconds (paths with their time in the video) to look at. Recordings and replays are removed after seven days unless their folder holds a file named keep.",
   inputSchema: { sessionId },
   annotations: { destructiveHint: false },
 }, guarded(async (args, extra) => {
