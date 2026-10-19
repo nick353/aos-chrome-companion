@@ -19,6 +19,8 @@ export function transactionActionSchema(locator) {
     'page.query': { exactEditor: z.boolean().optional(), splitBinding: z.boolean().optional().describe('Read current exact editor body/HTML and DOM caret for a signed splitParagraph guard; requires exactEditor'), query: text.min(1).max(500).optional(), locator: locator.optional(), attributes: z.array(text.regex(/^[A-Za-z_:][A-Za-z0-9_.:-]*$/u).max(100)).max(16).optional(), includeHidden: z.boolean().optional(), offset: z.number().int().min(0).max(4_999).optional(), limit: z.number().int().min(1).max(100).optional(), frameId: z.number().int().min(0).optional() },
     'page.type': { locator, text, clear: z.boolean().describe('For contenteditable, true explicitly replaces the entire editor; false inserts at selection').optional(), physicalFallback: z.enum(['disabled', 'on_verified_no_effect']).optional() },
     'page.click': { locator }, 'page.doubleClick': { locator }, 'page.hover': { locator },
+    // Close a window laid over the page (feedback box, cookie or app prompt) with its own close control or one Escape; never a deciding button.
+    'page.dismissOverlay': { locator: locator.optional() },
     'page.setChecked': { locator, checked: z.boolean() },
     'page.pressKey': { locator, key: text.min(1) },
     'page.selectText': { locator, text: text.min(1).max(10_000).describe('Exact rendered editor text, including visible line and paragraph breaks'), occurrence: z.number().int().min(0).max(99).optional(), prefix: text.min(1).max(1_000).optional().describe('Exact rendered text immediately before the selection'), suffix: text.min(1).max(1_000).optional().describe('Exact rendered text immediately after the selection') },
@@ -64,7 +66,7 @@ export function transactionActionSchema(locator) {
     if (method === 'visual.scroll') Object.assign(fields[method], { deltaX: z.number().min(-3000).max(3000).optional(), deltaY: z.number().min(-3000).max(3000).optional() });
     if (['visual.click', 'visual.doubleClick'].includes(method)) Object.assign(fields[method], { button: z.enum(['left', 'right', 'middle']).optional(), allowSecondaryButton: z.boolean().optional(), clickCount: z.number().int().min(1).max(2).optional(), holdMs: z.number().min(0).max(2000).optional() });
   }
-  const noRequiredParams = new Set(['tabs.back', 'tabs.forward', 'tabs.reload', 'page.scroll', 'page.delay', 'page.nativeChooser', 'tabs.claimExisting', 'page.bookmark']);
+  const noRequiredParams = new Set(['tabs.back', 'tabs.forward', 'tabs.reload', 'page.scroll', 'page.delay', 'page.nativeChooser', 'tabs.claimExisting', 'page.bookmark', 'page.dismissOverlay']);
   for (const method of ACTION_EVENT_CONTRACT.methods) fields[method].expectEvent = z.object({
     type: z.enum(ACTION_EVENT_CONTRACT.types),
     timeoutMs: z.number().int().min(ACTION_EVENT_CONTRACT.minTimeoutMs).max(ACTION_EVENT_CONTRACT.maxTimeoutMs).optional(),

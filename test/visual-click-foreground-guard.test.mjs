@@ -9,7 +9,7 @@ const input=source.slice(source.indexOf('async function runTrustedVisualInput(')
 const mouse=source.slice(source.indexOf('async function dispatchMouseClick('),source.indexOf('\nconst TRUSTED_VISUAL_KEYS'));
 const inspect=source.slice(source.indexOf('  if (action === "inspectVisualTarget") {'),source.indexOf('  if (action === "inspectVisualPoint") {'));
 // The hit search and the remembered-element helpers the inspection uses (2026-10-19).
-const hitHelpers=source.slice(source.indexOf('  const ownsPoint = (element, x, y) => {'),source.indexOf('  const stillMatches = (element, locator) => {'));
+const hitHelpers=source.slice(source.indexOf('  const ownsPoint = (element, x, y) => {'),source.indexOf('  // A window laid over the page'));
 const before={kind:'target',locator:{role:'button',name:'参考画像ライブラリ'},point:{x:293,y:400},rect:{x:238.625,y:391.359375,width:108,height:17.140625},viewport:{width:714,height:635,devicePixelRatio:2,scale:1},scroll:{x:0,y:0},pageUrl:'https://owned.test/pose',pageInstanceId:'doc',frameId:0,framePath:[],coordinateSpace:'top-level-viewport'};
 const error=(code,message,details)=>Object.assign(new Error(message),{code,details});
 

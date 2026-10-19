@@ -66,6 +66,7 @@ export const DEFAULT_OPERATION_TIMEOUTS_MS = Object.freeze({
   "page.click": 30_000,
   "page.doubleClick": 30_000,
   "page.hover": 30_000,
+  "page.dismissOverlay": 30_000,
   "page.setChecked": 30_000,
   "page.pressKey": 30_000,
   "page.selectText": 30_000,

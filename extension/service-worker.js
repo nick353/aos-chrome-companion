@@ -1816,15 +1816,38 @@ async function runTrustedVisualInput(tabId, method, params) {
       // position. The page, document, frame and coordinate space must still be the same.
       const sameElementMode = guard.allowMovedTarget === true && guard.canvas !== true;
       let current;
+      // A window laid over the target (a feedback box, a cookie or app prompt) is closed once with
+      // its own close control or one Escape, and the target is checked again (2026-10-19, owner).
+      let overlayDismissal = null;
+      const inspectClickTarget = () => runPageOperation(tabId, guard.kind === "target" ? "inspectVisualTarget" : "inspectVisualPoint", {
+        locator: guard.locator, point, frameId: guard.frameId,
+        scroll: false, requireHitOwner: guard.kind === "target",
+        ...(sameElementMode ? { elementRef: guard.elementRef ?? null, allowShift: true, markOperated: true } : {}),
+      }, { allowedOrigins: params.allowedOrigins });
+      const dismissOverlayOnce = async () => {
+        try {
+          overlayDismissal = await runPageOperation(tabId, "dismissOverlay", {
+            ...(guard.kind === "target" ? { locator: guard.locator } : { point }),
+            elementRef: guard.elementRef ?? undefined, frameId: guard.frameId,
+          }, { allowedOrigins: params.allowedOrigins });
+        } catch (error) {
+          overlayDismissal = { attempted: false, cleared: false, error: error?.code ?? "overlay_dismiss_failed" };
+        }
+        return overlayDismissal?.cleared === true;
+      };
       try {
-        current = await runPageOperation(tabId, guard.kind === "target" ? "inspectVisualTarget" : "inspectVisualPoint", {
-          locator: guard.locator, point, frameId: guard.frameId,
-          scroll: false, requireHitOwner: guard.kind === "target",
-          ...(sameElementMode ? { elementRef: guard.elementRef ?? null, allowShift: true, markOperated: true } : {}),
-        }, { allowedOrigins: params.allowedOrigins });
+        try {
+          current = await inspectClickTarget();
+        } catch (error) {
+          if (error?.code !== "visual_target_not_at_point" || !(await dismissOverlayOnce())) throw error;
+          current = await inspectClickTarget();
+        }
+        if (sameElementMode && guard.kind === "point" && current?.elementRefMatched === false && !overlayDismissal
+          && await dismissOverlayOnce()) current = await inspectClickTarget();
       } catch (error) {
         throw companionError(error?.code ?? "visual_target_proof_stale_geometry", error?.message ?? "The click target cannot be verified after activation", {
           operationEffectState: "none", mutationDispatchAttempted: false,
+          ...(overlayDismissal ? { overlayDismissal } : {}),
         });
       }
       if (sameElementMode) {
@@ -1851,7 +1874,8 @@ async function runTrustedVisualInput(tabId, method, params) {
         clickGuardReadback = { verified: true, kind: guard.kind, mode: "same_element", expectedViewport: guard.viewport, observedViewport: current.viewport,
           elementRefMatched: current.elementRefMatched === true, targetMoved: moved,
           ...(moved ? { from: point, to: { x: Number(freshPoint.x), y: Number(freshPoint.y) } } : {}),
-          hitOwnerVerified: guard.kind === "target" || current.elementRefMatched === true };
+          hitOwnerVerified: guard.kind === "target" || current.elementRefMatched === true,
+          ...(overlayDismissal ? { overlayDismissal } : {}) };
         point = { x: Number(freshPoint.x), y: Number(freshPoint.y) };
       } else {
         const samePoint = Number(current?.point?.x) === Number(guard.point?.x)
@@ -1883,7 +1907,8 @@ async function runTrustedVisualInput(tabId, method, params) {
         clickGuardReadback = { verified: true, kind: guard.kind, expectedViewport: guard.viewport, observedViewport: current.viewport,
           viewportHeightChanged: Number(current.viewport.height) !== Number(guard.viewport.height),
           sameTargetGeometry: guard.kind === "target" && sameRect && samePoint,
-          hitOwnerVerified: guard.kind === "target" };
+          hitOwnerVerified: guard.kind === "target",
+          ...(overlayDismissal ? { overlayDismissal } : {}) };
       }
     }
     if (method === "visual.pointerMove") {
@@ -2564,6 +2589,9 @@ async function executeCommand(method, params) {
     case "page.doubleClick":
       await assertLiveOrigin(requireTabId(params.tabId), params);
       return runAndCheckMutation(requireTabId(params.tabId), "doubleClick", { locator: params.locator, companionContext }, params);
+    case "page.dismissOverlay":
+      await assertLiveOrigin(requireTabId(params.tabId), params);
+      return runAndCheckMutation(requireTabId(params.tabId), "dismissOverlay", { locator: params.locator, companionContext }, params);
     case "page.hover":
       await assertLiveOrigin(requireTabId(params.tabId), params);
       return runAndCheckMutation(requireTabId(params.tabId), "hover", { locator: params.locator, companionContext }, params);
@@ -3851,6 +3879,104 @@ async function injectedPageOperation(action, payload) {
     }
     return null;
   };
+  // A window laid over the page (a feedback box, a cookie notice, an app or login prompt, a
+  // notification request) hid the control a run had to press: 42 clicks a week stopped as covered,
+  // and on CrowdWorks a feedback box kept the screen check from passing until the proposal was never
+  // sent (2026-10-19, owner: let the Companion close it). Close such a window once, only with a
+  // control that just closes or postpones it, or with one Escape, and never one holding typed text.
+  const DISMISS_KEYS = ["閉じる", "とじる", "close", "あとで", "後で", "今はしない", "notnow", "スキップ", "skip", "maybelater", "later", "dismiss"]
+    .map(looseKey);
+  const DISMISS_SYMBOLS = new Set(["×", "✕", "✖", "╳", "✗", "x", "X"]);
+  const DECIDING_NAME = /同意|許可|登録|購入|送信|はい|承諾|続行|インストール|accept|allow|agree|subscribe|sign ?up|register|buy|purchase|submit|\byes\b|continue|install|\bok\b/iu;
+  const dismissesOnly = (name) => {
+    const raw = normalize(name);
+    if (!raw || raw.length > 40 || DECIDING_NAME.test(raw) || RISKY_NAME.test(lower(raw))) return false;
+    if (DISMISS_SYMBOLS.has(raw)) return true;
+    const key = looseKey(raw);
+    return DISMISS_KEYS.includes(key) || (key.length <= 24 && ["close", "閉じる", "dismiss"].some((word) => key.startsWith(word)));
+  };
+  const PAGE_FRAME_ROLES = new Set(["navigation", "banner", "contentinfo", "complementary", "main"]);
+  const overlayRootOf = (node, target) => {
+    let root = null;
+    for (let current = node; current && current !== document.body && current !== document.documentElement; current = parentSemanticNode(current)) {
+      if (!(current instanceof Element)) continue;
+      if (target && (current === target || current.contains(target))) break;
+      const role = lower(current.getAttribute("role"));
+      const tag = current.tagName.toLowerCase();
+      const position = getComputedStyle(current).position;
+      if (position === "fixed" || position === "sticky" || role === "dialog" || role === "alertdialog"
+        || current.getAttribute("aria-modal") === "true" || tag === "dialog") root = current;
+    }
+    if (!root) return null;
+    const role = lower(root.getAttribute("role"));
+    const tag = root.tagName.toLowerCase();
+    return PAGE_FRAME_ROLES.has(role) || tag === "nav" || tag === "header" || tag === "footer" ? null : root;
+  };
+  const hitAt = (x, y) => {
+    let hit = document.elementFromPoint(x, y);
+    while (hit?.shadowRoot) {
+      const child = hit.shadowRoot.elementFromPoint?.(x, y);
+      if (!child || child === hit) break;
+      hit = child;
+    }
+    return hit;
+  };
+  const findCoveringOverlay = (target, point) => {
+    const points = [];
+    if (target) {
+      const rect = boxOf(target);
+      const left = Math.max(0, rect.left), top = Math.max(0, rect.top);
+      const right = Math.min(innerWidth, rect.right), bottom = Math.min(innerHeight, rect.bottom);
+      for (const [fx, fy] of [[0.5, 0.5], [0.3, 0.5], [0.7, 0.5], [0.5, 0.3], [0.5, 0.7]]) {
+        points.push({ x: Math.round(left + (right - left) * fx), y: Math.round(top + (bottom - top) * fy) });
+      }
+    } else if (point && Number.isFinite(Number(point.x)) && Number.isFinite(Number(point.y))) {
+      points.push({ x: Math.round(Number(point.x)), y: Math.round(Number(point.y)) });
+    } else {
+      points.push({ x: innerWidth / 2, y: innerHeight / 2 }, { x: innerWidth / 2, y: innerHeight - 40 },
+        { x: innerWidth - 80, y: innerHeight - 80 }, { x: innerWidth / 2, y: 60 });
+    }
+    for (const { x, y } of points) {
+      const hit = hitAt(x, y);
+      if (!hit || (target && (hit === target || target.contains(hit)))) continue;
+      const root = overlayRootOf(hit, target);
+      if (root && visible(root)) return root;
+    }
+    return null;
+  };
+  const holdsTypedText = (root) => [...root.querySelectorAll("input,textarea,[contenteditable='true']")].slice(0, 50).some((field) => {
+    if (field instanceof HTMLInputElement && ["hidden", "checkbox", "radio", "submit", "button", "reset", "image"].includes(lower(field.type))) return false;
+    return normalize(field.isContentEditable ? field.textContent : field.value).length > 0;
+  });
+  const dismissCoveringOverlay = async (target, point) => {
+    const overlay = findCoveringOverlay(target, point);
+    if (!overlay) return { overlayFound: false, attempted: false, cleared: false };
+    const about = { tag: overlay.tagName.toLowerCase(), role: overlay.getAttribute("role") || implicitRole(overlay), name: accessibleName(overlay).slice(0, 80) };
+    if (holdsTypedText(overlay)) return { overlayFound: true, overlay: about, attempted: false, cleared: false, reason: "overlay_holds_typed_text" };
+    const control = [...overlay.querySelectorAll("button,[role='button'],a,[aria-label],[title]")].slice(0, 200)
+      .filter((element) => visible(element) && otherNames(element).some(dismissesOnly) && !otherNames(element).some((name) => DECIDING_NAME.test(name))
+        // A link that leads to another page is not a close button.
+        && !(element.matches?.("a[href]") && !/^javascript:|#$/iu.test(element.href)))[0] ?? null;
+    let method;
+    if (control) {
+      method = "close_control";
+      activateControl(control);
+    } else {
+      method = "escape";
+      const focus = document.activeElement && document.activeElement !== document.body ? document.activeElement : overlay;
+      for (const type of ["keydown", "keyup"]) {
+        focus.dispatchEvent(new KeyboardEvent(type, { key: "Escape", code: "Escape", keyCode: 27, which: 27, bubbles: true, composed: true, cancelable: true }));
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    const overlayGone = !overlay.isConnected || !visible(overlay);
+    const targetClear = target ? (() => {
+      const rect = boxOf(target);
+      return !!hitOwnedPoint(target, { left: Math.max(0, rect.left), top: Math.max(0, rect.top), right: Math.min(innerWidth, rect.right), bottom: Math.min(innerHeight, rect.bottom) });
+    })() : overlayGone;
+    return { overlayFound: true, overlay: about, attempted: true, method, control: control ? accessibleName(control).slice(0, 80) || otherNames(control)[0]?.slice(0, 80) || null : null,
+      overlayGone, cleared: overlayGone || targetClear };
+  };
   const stillMatches = (element, locator) => {
     if (!visible(element)) return false;
     if (matchesLocator(element, locator)) return true;
@@ -4803,6 +4929,15 @@ async function injectedPageOperation(action, payload) {
     element.dispatchEvent(new MouseEvent("click", options));
     element.dispatchEvent(new MouseEvent("dblclick", options));
     return { doubleClicked: true, visualized: true, trustedInput: false, element: describe(element), url: location.href };
+  }
+  if (action === "dismissOverlay") {
+    let target = null;
+    if (payload.locator && typeof payload.locator === "object" && Object.keys(payload.locator).length > 0) {
+      const remembered = recallVisualRef(payload.elementRef);
+      target = remembered && stillMatches(remembered.element, payload.locator) ? remembered.element : find(payload.locator);
+    }
+    const dismissal = await dismissCoveringOverlay(target, payload.point);
+    return { ...dismissal, mutationDispatchAttempted: dismissal.attempted, url: location.href, pageInstanceId };
   }
   if (action === "hover") {
     const element = find(payload.locator);

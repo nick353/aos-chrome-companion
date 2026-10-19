@@ -1968,6 +1968,27 @@ test("a visual click follows the same element after the feed moved, and stops be
   } finally { await harness.close(); }
 });
 
+// 2026-10-19 (owner): a run may close a window laid over the page before its screen check.
+test("page.dismissOverlay is one local-UI step dispatched once inside a transaction", async () => {
+  const harness = await createCapsuleHarness({ interceptCommand: ({ message, tab, extension }) => {
+    if (message.method !== "page.dismissOverlay") return false;
+    extension.send({ kind: "command.result", operationId: message.operationId, result: {
+      overlayFound: true, attempted: true, method: "close_control", control: "閉じる", cleared: true,
+      mutationDispatchAttempted: true, url: tab.url, pageInstanceId: `document-${tab.id}-${tab.url}` } });
+    return true;
+  } });
+  const { client, session, commands } = harness;
+  try {
+    const origin = "https://example.test";
+    const result = await client.requestAuthorizedTransaction({ sessionId: session.sessionId, taskId: session.taskId,
+      targetOrigin: origin, startUrl: origin + "/proposal", allowedOrigins: [origin], keepTaskTab: true,
+      runId: "overlay-close", idempotencyKey: "overlay-close", actions: [{ method: "page.dismissOverlay", params: {} }] });
+    assert.equal(result.result, "verified", JSON.stringify(result.exact_blocker));
+    assert.equal(commands.filter((command) => command.method === "page.dismissOverlay").length, 1);
+    assert.equal(result.actions[0].result.control, "閉じる");
+  } finally { await harness.close(); }
+});
+
 test("visual target proofs bind settled postcapture geometry with bounded same-document reads", async () => {
   for (const change of ['stable','height-once','moves-every-capture','document','url','frame']) {
     let captures=0, armed=false;

@@ -89,6 +89,7 @@ export const LOCAL_UI_OPERATION_METHODS = Object.freeze([
   "tabs.configure",
   "page.configureViewport",
   "page.hover",
+  "page.dismissOverlay",
   "page.setChecked",
   "page.pressKey",
   "page.selectText",

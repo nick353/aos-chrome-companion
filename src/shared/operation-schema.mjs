@@ -71,6 +71,7 @@ const definitions = [
   ["page.click", true, true, false],
   ["page.doubleClick", true, true, false],
   ["page.hover", true, true, false],
+  ["page.dismissOverlay", true, true, false],
   ["page.setChecked", true, true, false],
   ["page.pressKey", true, true, false],
   ["page.selectText", true, true, false],
@@ -128,7 +129,7 @@ export const DEFAULT_CAPABILITIES = Object.freeze([...EXTENSION_METHODS]);
 // extension.reload) are intentionally excluded; the broker owns those steps.
 export const AUTHORIZED_TRANSACTION_METHODS = Object.freeze([
   "tabs.navigate", "tabs.back", "tabs.forward", "tabs.reload", "tabs.configure", "page.configureViewport", "page.bookmark",
-  "page.click", "page.doubleClick", "page.hover", "page.setChecked", "page.pressKey", "page.selectText", "page.scroll",
+  "page.click", "page.doubleClick", "page.hover", "page.dismissOverlay", "page.setChecked", "page.pressKey", "page.selectText", "page.scroll",
   "visual.pointerMove", "visual.click", "visual.doubleClick", "visual.drag", "visual.scroll", "visual.pressKey", "visual.keyDown", "visual.keyUp",
   "visual.typeText",
   "page.download", "clipboard.write", "page.handleDialog",

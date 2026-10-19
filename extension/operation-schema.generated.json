@@ -1,7 +1,7 @@
 {
   "schema": "aos.chrome_companion.operation_schema.v1",
   "version": 1,
-  "schemaDigest": "cfe45da2fb130910fb465dbd38b575bc3fc78ee49264044908324951debe6613",
+  "schemaDigest": "24255558eba8cbf2f9890ecf656cabe9828bd3c9693ae18693bd2dbfae043682",
   "methods": [
     {
       "method": "extension.reload",
@@ -355,6 +355,12 @@
       "profileGlobal": false
     },
     {
+      "method": "page.dismissOverlay",
+      "targetScoped": true,
+      "mutation": true,
+      "profileGlobal": false
+    },
+    {
       "method": "page.setChecked",
       "targetScoped": true,
       "mutation": true,
@@ -514,6 +520,7 @@
     "page.click",
     "page.doubleClick",
     "page.hover",
+    "page.dismissOverlay",
     "page.setChecked",
     "page.pressKey",
     "page.selectText",
@@ -543,6 +550,7 @@
     "page.click",
     "page.doubleClick",
     "page.hover",
+    "page.dismissOverlay",
     "page.setChecked",
     "page.pressKey",
     "page.selectText",

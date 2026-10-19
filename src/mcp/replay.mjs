@@ -50,7 +50,7 @@ const LABELS = {
   "page.upload": "ファイルを添付", "page.uploadMultiple": "ファイルを添付", "page.query": "ページを読取",
   "page.snapshot": "ページを確認", "page.screenshot": "画面を確認", "page.richText": "文章の書式を編集",
   "page.selectOption": "選択肢を選ぶ", "page.setChecked": "チェックを切り替え", "page.pressKey": "キーを押す",
-  "page.scroll": "スクロール", "page.hover": "マウスを乗せる", "page.submit": "送信", "page.waitFor": "表示を待つ",
+  "page.scroll": "スクロール", "page.hover": "マウスを乗せる", "page.dismissOverlay": "かぶさる窓を閉じる", "page.submit": "送信", "page.waitFor": "表示を待つ",
   "page.handleDialog": "確認画面に応答", "page.download": "ダウンロード", "page.selectText": "文字を選択",
   "visual.click": "画面の位置をクリック", "visual.doubleClick": "画面の位置をダブルクリック",
   "visual.typeText": "画面に文字を入力", "visual.pressKey": "キーを押す", "visual.scroll": "スクロール", "visual.drag": "ドラッグ",
