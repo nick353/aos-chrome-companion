@@ -16,12 +16,14 @@ function fakeChrome({ originalWindow = { id: 1, left: 0, top: 25, width: 1280, h
   let nextWindow = 50;
   let lastFocused = 1;
   const moves = [];
+  const raised = [];
   const api = {
     storage: { session: { set: async () => {}, get: async () => ({}), remove: async () => {} } },
     windows: {
       get: async id => { if (!windows.has(id)) throw new Error('no window'); return { ...windows.get(id) }; },
       getAll: async () => [...windows.values()].map(w => ({ ...w })),
       getLastFocused: async () => ({ id: lastFocused }),
+      update: async (id, change) => { if (change.focused) { raised.push(id); lastFocused = id; } return { ...windows.get(id) }; },
       create: async ({ tabId, left, top, width, height }) => {
         const id = nextWindow++;
         windows.set(id, { id, left, top, width, height, type: 'normal' });
@@ -45,7 +47,7 @@ function fakeChrome({ originalWindow = { id: 1, left: 0, top: 25, width: 1280, h
       onDetached: on('tabs.onDetached'), onRemoved: on('tabs.onRemoved'), onUpdated: on('tabs.onUpdated'),
     },
   };
-  return { api, emit, tabs, windows, moves, focus: id => { lastFocused = id; } };
+  return { api, emit, tabs, windows, moves, raised, focus: id => { lastFocused = id; } };
 }
 
 function controller(chrome, clock = { t: 0 }) {
@@ -68,15 +70,18 @@ test('a recorded tab moves alone into its window, unmuted, and other windows can
   const opened = await recording.isolate({ tabId: 10, width: 600, maxSeconds: 60, allowedOrigins: ['https://www.tiktok.com'] });
   assert.equal(opened.recordingWindow, true);
   assert.equal(opened.windowId, 50);
+  assert.equal(opened.raised, true, 'an unfocused new window opens hidden behind the task window');
+  assert.deepEqual(chrome.raised, [50]);
   assert.deepEqual(opened.bounds, { left: 0, top: 25, width: 599, height: 875 });
   assert.deepEqual(opened.viewport, { width: 599, height: 785 });
   assert.equal(chrome.tabs.get(10).mutedInfo.muted, false);
   assert.deepEqual(recording.status().taints, [], 'moving the tab in is not another page getting in');
   assert.equal(recording.focusAllowed(1), false);
   assert.equal(recording.focusAllowed(50), true);
-  assert.deepEqual(await recording.windowForNewTab(), {});
-  chrome.focus(50);
+  // Raising made the recording window the last focused one: new tabs still open in the task window.
   assert.deepEqual(await recording.windowForNewTab(), { windowId: 1 });
+  chrome.focus(1);
+  assert.deepEqual(await recording.windowForNewTab(), {});
   await assert.rejects(recording.isolate({ tabId: 11 }), { code: 'recording_window_busy' });
 });
 

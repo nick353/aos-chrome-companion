@@ -105,10 +105,14 @@ export function createRecordingWindows(api, { now = () => Date.now(), sleep = ms
       if (before.mutedInfo?.muted) await api.tabs.update(tabId, { muted: false });
       await api.tabs.update(tabId, { active: true });
     } catch { /* the readback below reports the state */ }
+    // Chrome opens an unfocused window behind the task's window, where it is fully hidden and Chrome
+    // stops drawing it (2026-10-19: a playing video was recorded as one still picture). Raise it.
+    let raised = false;
+    try { await api.windows.update(created.id, { focused: true }); raised = true; } catch { /* reported as raised: false */ }
     const placed = await api.windows.get(created.id);
     const { tab, viewport } = await readViewport(tabId);
     if (tab.windowId !== created.id) taint('recording_tab_left_window');
-    return { configured: true, recordingWindow: true, tabId, windowId: created.id, previousWindowId: original.id,
+    return { configured: true, recordingWindow: true, raised, tabId, windowId: created.id, previousWindowId: original.id,
       bounds: { left: placed.left, top: placed.top, width: placed.width, height: placed.height }, viewport,
       audible: tab.audible === true, muted: tab.mutedInfo?.muted === true, url: tab.url };
   }

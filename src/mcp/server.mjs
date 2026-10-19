@@ -17,8 +17,8 @@ import { withSiteAliases } from "../shared/site-aliases.mjs";
 import { settleUnknownSend } from "./settle-unknown-send.mjs";
 import { MAX_SPLIT_ACTIONS, runSplitTransaction } from "./split-transaction.mjs";
 import { buildReplayTimeline, listSessionScreenshots, pruneReplays, replayFolderName, writeReplay } from "./replay.mjs";
-import { RECORD_MAX_SECONDS, autoStopReason, ownerOnCall, prepareRecordingForAnalysis, readDevicePresence,
-  recordFolderName } from "./recording.mjs";
+import { RECORD_MAX_SECONDS, autoStopReason, bringAppToFront, frontmostBundleId, ownerOnCall, prepareRecordingForAnalysis,
+  readDevicePresence, recordFolderName } from "./recording.mjs";
 import { existsSync } from "node:fs";
 import { resolveDataDir } from "../shared/paths.mjs";
 import { join } from "node:path";
@@ -870,7 +870,7 @@ function finishRecording(state, stoppedBy) {
       ...(analysis ?? { folder: null, video: null, frames: [] }), analysisError,
       removedOldRecordings: pruneReplays(join(resolveDataDir(), "Recordings"), { except: state.outDir }).length,
       next: usable
-        ? `Give video (the page only, ${analysis.audioSilent ? "WITHOUT sound: say so in the question" : "with sound"}) to aos_watch_video. Frames are for your own look.`
+        ? `Give video (the page only, ${analysis.audioSilent ? "WITHOUT sound: say so in the question" : "with sound"}${analysis.videoMayBeFrozen ? "; the picture may have stood still (the window was hidden), so ask mainly about the sound and say so" : ""}) to aos_watch_video. Frames are for your own look.`
         : "Do not send this recording for analysis: another page may be in it or it could not be checked. Record again, or analyse from screenshots." };
     finishedRecordings.set(state.sessionId, result);
     return result;
@@ -913,7 +913,12 @@ server.registerTool("companion_record_start", {
   const state = { sessionId: args.sessionId, transaction, tabId: args.tabId, startUrl: args.startUrl, outDir,
     moviePath: join(resolveDataDir(), "Recordings", `${filename}.mov`), startedAt: new Date(now).toISOString(), startedMs: now,
     maxSeconds: args.maxSeconds, timer: null, windowBounds: null, viewport: null };
+  const frontApp = await frontmostBundleId();
   const opened = await configureRecordingTab(client, state, { recordingWindow: { width: args.windowWidth, maxSeconds: args.maxSeconds } }, "window");
+  // The recording window is raised over the task's window (a hidden window is not drawn); if that
+  // made Chrome the front app, the owner's app gets the keyboard back.
+  const keyboardReturned = frontApp && frontApp !== "com.google.Chrome" && await frontmostBundleId() === "com.google.Chrome"
+    ? await bringAppToFront(frontApp) : null;
   if (!opened.value?.recordingWindow) {
     return { kind: "companion_recording", started: false, reason: "recording_window_not_opened", blocker: opened.blocker };
   }
@@ -952,7 +957,8 @@ server.registerTool("companion_record_start", {
   }
   const audible = media?.audible ?? null;
   return { kind: "companion_recording", started: true, startedAt: state.startedAt, maxSeconds: args.maxSeconds, folder: outDir,
-    recordingWindow: { windowId: opened.value.windowId, bounds: state.windowBounds }, media: media?.media ?? media, audible,
+    recordingWindow: { windowId: opened.value.windowId, bounds: state.windowBounds, raised: opened.value.raised ?? null }, keyboardReturned,
+    media: media?.media ?? media, audible,
     next: audible === true
       ? `The video plays with sound${media?.media?.durationSeconds ? ` (${media.media.durationSeconds} s long)` : ""}; wait until it has played once, then call companion_record_stop`
       : "No sound is playing yet: press the page's play or sound button with companion_inspect_visual_target and visual.click, then wait for the video and call companion_record_stop" };

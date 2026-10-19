@@ -27,6 +27,23 @@ export function ownerOnCall(presence) {
   return presence?.camera === true || presence?.microphone === true;
 }
 
+// Bringing the recording window over the task's window can make Chrome the front app; the app the
+// owner was using gets the keyboard back at once.
+export async function frontmostBundleId({ exec = run } = {}) {
+  try {
+    const { stdout: asn } = await exec("/usr/bin/lsappinfo", ["front"], { timeout: 5_000 });
+    const { stdout } = await exec("/usr/bin/lsappinfo", ["info", "-only", "bundleid", asn.trim()], { timeout: 5_000 });
+    return /"CFBundleIdentifier"="([^"]+)"/u.exec(stdout)?.[1] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+export async function bringAppToFront(bundleId, { exec = run } = {}) {
+  if (!bundleId || bundleId === "com.google.Chrome" || !/^[A-Za-z0-9.-]+$/u.test(bundleId)) return false;
+  try { await exec("/usr/bin/open", ["-b", bundleId], { timeout: 10_000 }); return true; } catch { return false; }
+}
+
 // Why a running recording must stop now, or null to keep going.
 export function autoStopReason({ elapsedSeconds, maxSeconds }) {
   return elapsedSeconds >= maxSeconds ? "time_limit" : null;
@@ -108,11 +125,20 @@ export async function prepareRecordingForAnalysis({ moviePath, outDir, windowBou
       audioMaxDb = found ? Number(found[1]) : null;
     } catch { /* the level stays unknown */ }
   }
+  // macOS sends a frame only when the window changes, and Chrome stops drawing a window that is
+  // hidden behind others (2026-10-19: a playing YouTube short gave one still picture and full sound).
+  let videoFramesPerSecond = null;
+  try {
+    const { stdout } = await exec(ffprobe, ["-v", "error", "-count_packets", "-select_streams", "v", "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", raw], { timeout: 120_000 });
+    const packets = Number(String(stdout).trim());
+    if (Number.isFinite(packets) && durationSeconds) videoFramesPerSecond = Math.round((packets / durationSeconds) * 10) / 10;
+  } catch { /* unknown */ }
   let names = [];
   try { names = readdirSync(join(outDir, "frames")).filter(name => name.endsWith(".jpg")).sort(); } catch { /* none */ }
   return {
     folder: outDir, video, rawVideo: raw, cropped: crop !== null, analysisBlocked: blocked ? blockedReasons : null, videoError,
     durationSeconds, hasAudio, audio, audioError, audioMaxDb, audioSilent: audioMaxDb !== null ? audioMaxDb < -50 : !hasAudio,
+    videoFramesPerSecond, videoMayBeFrozen: videoFramesPerSecond !== null && videoFramesPerSecond < 2,
     framesError, frameEverySeconds,
     frames: names.map((name, index) => ({ path: join(outDir, "frames", name), atSeconds: index * frameEverySeconds })),
   };

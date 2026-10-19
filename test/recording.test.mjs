@@ -5,7 +5,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  RECORD_MAX_SECONDS, autoStopReason, ownerOnCall, pageCrop,
+  RECORD_MAX_SECONDS, autoStopReason, bringAppToFront, frontmostBundleId, ownerOnCall, pageCrop,
   prepareRecordingForAnalysis, readDevicePresence, recordFolderName,
 } from '../src/mcp/recording.mjs';
 import { pruneReplays } from '../src/mcp/replay.mjs';
@@ -31,6 +31,19 @@ test('a camera or microphone in use means a call, and no recording starts', asyn
   assert.equal(ownerOnCall({ camera: false, microphone: true }), true);
   assert.equal(ownerOnCall({ camera: false, microphone: false }), false);
   assert.equal(ownerOnCall(null), false);
+});
+
+test('the owner\'s app gets the keyboard back, never Chrome or an odd name', async () => {
+  const exec = async (file, args) => {
+    if (file.endsWith('lsappinfo') && args[0] === 'front') return { stdout: 'ASN:0x0-0x1a01a:\n' };
+    if (file.endsWith('lsappinfo')) return { stdout: '"CFBundleIdentifier"="com.anthropic.claudefordesktop"\n' };
+    return { stdout: '' };
+  };
+  assert.equal(await frontmostBundleId({ exec }), 'com.anthropic.claudefordesktop');
+  assert.equal(await frontmostBundleId({ exec: async () => { throw new Error('no'); } }), null);
+  assert.equal(await bringAppToFront('com.anthropic.claudefordesktop', { exec }), true);
+  assert.equal(await bringAppToFront('com.google.Chrome', { exec }), false);
+  assert.equal(await bringAppToFront('x; rm -rf /', { exec }), false);
 });
 
 test('only the page part of the recording window goes to analysis', () => {
@@ -116,6 +129,8 @@ test('a clean recording gets the page-only analysis.mp4; one that another page g
     assert.equal(clean.cropped, true);
     assert.equal(clean.analysisBlocked, null);
     assert.equal(clean.audioSilent, false);
+    assert.ok(clean.videoFramesPerSecond > 10, String(clean.videoFramesPerSecond));
+    assert.equal(clean.videoMayBeFrozen, false);
     const size = execFileSync('ffprobe', ['-v', 'error', '-select_streams', 'v', '-show_entries', 'stream=width,height', '-of', 'csv=p=0', clean.video]).toString().trim();
     assert.equal(size, '598,784');
     assert.ok(existsSync(join(dir, 'a', 'recording.mov')));
