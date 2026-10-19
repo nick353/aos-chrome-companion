@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { createServer } from "node:net";
 import { dirname, join } from "node:path";
 import {
@@ -790,6 +790,9 @@ export class CompanionBroker extends EventEmitter {
     this.ownerlessCleanupInFlight = new Set();
     this.reconciliationExpiryInFlight = false;
     this.consumedVisualProofs = new Map();
+    // Proofs this broker issued, by a short id, so a run can pass { proofId } instead of copying
+    // the whole signed proof by hand (2026-10-19: copies from a cut-off tool result held typos).
+    this.issuedVisualProofs = new Map();
     this.consumedReconciliationProofs = new Map();
     this.profileRegistrationFailures = new Map();
     this.closing = false;
@@ -3838,6 +3841,7 @@ export class CompanionBroker extends EventEmitter {
     const expiresAt = new Date(Date.parse(capturedAt) + 60_000).toISOString();
     const proofPayload = {
       schema: "aos.chrome_companion.visual_point_proof.v1",
+      proofId: `vp_${randomBytes(9).toString("hex")}`,
       // The control under the point, so a click can follow it when the feed moves a little.
       elementRef: typeof inspection.elementRef === "string" ? inspection.elementRef : null,
       hitElement: visualIdentity(inspection.hitElement),
@@ -3863,7 +3867,7 @@ export class CompanionBroker extends EventEmitter {
       kind: "visual_point_confirmation",
       target: inspection,
       visual,
-      visualProof: { ...proofPayload, signature: payloadDigest(this.ledgerSecret, proofPayload) },
+      visualProof: this.#rememberIssuedVisualProof({ ...proofPayload, signature: payloadDigest(this.ledgerSecret, proofPayload) }),
       visual_readback_verified: true,
       external_action_executed: false,
       mutation_dispatch_attempted: false,
@@ -3938,6 +3942,7 @@ export class CompanionBroker extends EventEmitter {
     const expiresAt = new Date(Date.parse(capturedAt) + VISUAL_PROOF_TTL_MS).toISOString();
     const proofPayload = {
       schema: "aos.chrome_companion.visual_target_proof.v1",
+      proofId: `vp_${randomBytes(9).toString("hex")}`,
       // Which element this is, so a click can find the same one after the page moved.
       element: visualIdentity(inspection.element),
       elementRef: typeof inspection.elementRef === "string" ? inspection.elementRef : null,
@@ -3966,7 +3971,7 @@ export class CompanionBroker extends EventEmitter {
       kind: "visual_target_confirmation",
       target: inspection,
       visual,
-      visualProof: { ...proofPayload, signature: payloadDigest(this.ledgerSecret, proofPayload) },
+      visualProof: this.#rememberIssuedVisualProof({ ...proofPayload, signature: payloadDigest(this.ledgerSecret, proofPayload) }),
       visual_readback_verified: true,
       external_action_executed: false,
       mutation_dispatch_attempted: false,
@@ -3976,7 +3981,21 @@ export class CompanionBroker extends EventEmitter {
     };
   }
 
+  #rememberIssuedVisualProof(proof) {
+    const now = Date.now();
+    for (const [key, entry] of this.issuedVisualProofs) if (Date.parse(entry.expiresAt) <= now) this.issuedVisualProofs.delete(key);
+    while (this.issuedVisualProofs.size >= 500) this.issuedVisualProofs.delete(this.issuedVisualProofs.keys().next().value);
+    this.issuedVisualProofs.set(proof.proofId, proof);
+    return proof;
+  }
+
   #verifyVisualTargetProof({ proof, session, lease, tabId, currentUrl, currentPageInstanceId = null, consume = true }) {
+    // A run may pass only { proofId }, or a hand copy that lost a character: the proof this broker
+    // issued under that id is used, and every binding below is still checked against it.
+    if (proof && typeof proof === "object" && !Array.isArray(proof) && typeof proof.proofId === "string") {
+      const issued = this.issuedVisualProofs.get(proof.proofId);
+      if (issued) proof = issued;
+    }
     if (!proof || typeof proof !== "object" || Array.isArray(proof)) {
       throw new CompanionError("visual_target_proof_required", "Trusted visual input requires a fresh screenshot-bound target proof");
     }
@@ -4766,8 +4785,22 @@ export class CompanionBroker extends EventEmitter {
             candidates: resolution.candidates,
           });
         }
+        // Runs often name a tab that is not one of this task's live tabs: Chrome's own new tab
+        // (chrome://newtab, the user's), another task's tab, or one that closed. That stopped 59
+        // transactions a day as task_target_unavailable (2026-10-19, owner: relax the safety checks).
+        // Such a tab is never touched; when the start page is an ordinary web page of the allowed
+        // sites, a new task tab is opened there instead and the result says so. A busy, protected
+        // or ambiguous target still stops above, and a dialog answer still needs its exact tab.
+        let exactTabReplaced = false;
         if (exactTabId !== undefined && resolution.status !== "resolved") {
-          throw new CompanionError(resolution.exactBlocker ?? "task_target_unavailable", "The requested exact task tab is unavailable; no replacement was opened", { tabId: exactTabId });
+          let startOrigin = null;
+          try { startOrigin = /^https?:$/u.test(new URL(initialUrl).protocol) ? new URL(initialUrl).origin : null; } catch { startOrigin = null; }
+          if (dialogOnly || !startOrigin || !allowedOrigins.includes(startOrigin)) {
+            throw new CompanionError(resolution.exactBlocker ?? "task_target_unavailable", "The requested exact task tab is unavailable; no replacement was opened", { tabId: exactTabId });
+          }
+          exactTabReplaced = true;
+          snapshot.target_replacement = { requested_tab_id: exactTabId, reason: resolution.exactBlocker ?? "task_target_unavailable",
+            opened: "new_task_tab", start_url: initialUrl };
         }
         if (resolution.status === "resolved") {
           const available = { candidate: resolution.entry, live: resolution.live };

@@ -132,7 +132,13 @@ export function toolResult(value, { textDetail = 'full', detail = 'full', screen
     metadata.detail = detail === 'compact' ? 'compact' : 'full';
   }
   const textValue = textDetail === 'summary' ? transactionTextSummary(metadata) : metadata;
-  return { content: [...images, { type: 'text', text: JSON.stringify(textValue) }], structuredContent: { result: metadata } };
+  // The proof goes first, before the picture: a run that prints the whole result got it cut off
+  // after the image data and copied the proof by hand with typos (2026-10-19, Threads replies).
+  const proofFirst = metadata?.visualProof?.proofId
+    ? [{ type: 'text', text: JSON.stringify({ proofId: metadata.visualProof.proofId,
+      use: 'pass visualProof: { proofId } (or the whole visualProof unchanged) to one visual.* action', visualProof: metadata.visualProof }) }]
+    : [];
+  return { content: [...proofFirst, ...images, { type: 'text', text: JSON.stringify(textValue) }], structuredContent: { result: metadata } };
 }
 
 function compactTransaction(metadata) {

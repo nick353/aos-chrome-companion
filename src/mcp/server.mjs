@@ -502,7 +502,7 @@ server.registerTool("companion_inspect_dropdown", {
 }));
 
 server.registerTool("companion_inspect_visual_target", {
-  description: "Read-only semantic geometry plus exact screenshot proof for one visible target. Inspect the returned image, then pass visualProof unchanged to one visual.* action in an authorized transaction. The proof is exact-tab-bound, expires after 3 minutes, and is spent once its input is dispatched. visual.click and visual.doubleClick press the same element (the one this proof saw, still matching the locator, visible and on top at the pressed point) at its current position, so a feed that moved a little since the screenshot does not stop the click; typing, keys, scrolls and drags keep the exact geometry.",
+  description: "Read-only semantic geometry plus exact screenshot proof for one visible target. Inspect the returned image, then pass visualProof: { proofId } (the short id printed first) or the whole visualProof unchanged to one visual.* action in an authorized transaction. The proof is exact-tab-bound, expires after 3 minutes, and is spent once its input is dispatched. visual.click and visual.doubleClick press the same element (the one this proof saw, still matching the locator, visible and on top at the pressed point) at its current position, so a feed that moved a little since the screenshot does not stop the click; typing, keys, scrolls and drags keep the exact geometry.",
   inputSchema: {
     sessionId,
     leaseId,
@@ -521,7 +521,7 @@ server.registerTool("companion_inspect_visual_target", {
 }));
 
 server.registerTool("companion_inspect_visual_point", {
-  description: "Read-only screenshot-bound confirmation for a user-visible point in the exact leased tab. Inspect the returned image, then pass visualProof unchanged to one visual.* action. The proof expires after 60 seconds. A visual.click on a page control follows that control if it moved at most 64 px; a canvas keeps exact pixels. Prefer companion_inspect_visual_target with a locator read from page.query. This never moves the OS cursor; the Companion only renders a temporary blue in-page cursor and uses exact-tab CDP input if explicitly enabled.",
+  description: "Read-only screenshot-bound confirmation for a user-visible point in the exact leased tab. Inspect the returned image, then pass visualProof: { proofId } or the whole visualProof unchanged to one visual.* action. The proof expires after 60 seconds. A visual.click on a page control follows that control if it moved at most 64 px; a canvas keeps exact pixels. Prefer companion_inspect_visual_target with a locator read from page.query. This never moves the OS cursor; the Companion only renders a temporary blue in-page cursor and uses exact-tab CDP input if explicitly enabled.",
   inputSchema: {
     sessionId,
     leaseId,

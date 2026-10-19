@@ -5,7 +5,7 @@ import { ACTION_EVENT_CONTRACT, AUTHORIZED_TRANSACTION_METHODS } from '../shared
 // required arguments before dispatch. Unknown method-specific fields are retained.
 export function transactionActionSchema(locator) {
   const text = z.string();
-  const proof = z.record(z.string(), z.unknown()).describe('Unchanged signed visualProof from the matching inspect tool');
+  const proof = z.record(z.string(), z.unknown()).describe('Unchanged signed visualProof from the matching inspect tool, or just { proofId } from it');
   const point = z.object({ x: z.number().min(0).max(20_000), y: z.number().min(0).max(20_000) });
   const modifiers = z.union([z.array(z.enum(['alt', 'ctrl', 'control', 'meta', 'command', 'cmd', 'shift'])), text.min(1).describe('Shortcut modifier string such as Meta+Shift')]).optional();
   const uploadConfirmation = {

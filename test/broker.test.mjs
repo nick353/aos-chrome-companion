@@ -1968,6 +1968,63 @@ test("a visual click follows the same element after the feed moved, and stops be
   } finally { await harness.close(); }
 });
 
+// 2026-10-19: runs copied the proof by hand from a cut-off result and the copy held typos (Threads
+// replies stopped as visual_target_proof_invalid). A run may pass only { proofId }.
+test("a visual click accepts only the short proof id, or repairs a hand copy, and still binds the lease", async () => {
+  const harness = await createCapsuleHarness();
+  const { client, session, commands } = harness;
+  try {
+    const origin = "https://example.test";
+    const base = { sessionId: session.sessionId, taskId: session.taskId, targetOrigin: origin, startUrl: origin + "/post", allowedOrigins: [origin], keepTaskTab: true };
+    const prepared = await client.requestAuthorizedTransaction({ ...base, runId: "proof-id-prepare", idempotencyKey: "proof-id-prepare", actions: [{ method: "page.query", params: { query: "ready" } }] });
+    const tabId = prepared.tab.id;
+    const inspect = async () => {
+      const lease = await client.request("lease.acquire", { sessionId: session.sessionId, tabId });
+      return client.request("visual.target.inspect", { sessionId: session.sessionId, leaseId: lease.leaseId, tabId, locator: { testId: "reply" } });
+    };
+    let inspected = await inspect();
+    assert.match(inspected.visualProof.proofId, /^vp_[0-9a-f]{18}$/u);
+    const clicks = () => commands.filter((command) => command.method === "visual.click").length;
+    const byId = await client.requestAuthorizedTransaction({ ...base, tabId, runId: "proof-id-only", idempotencyKey: "proof-id-only",
+      actions: [{ method: "visual.click", params: { visualProof: { proofId: inspected.visualProof.proofId } } }] });
+    assert.equal(byId.result, "verified", JSON.stringify(byId.exact_blocker));
+    assert.equal(clicks(), 1);
+    inspected = await inspect();
+    const typo = { ...inspected.visualProof, profileInstanceId: inspected.visualProof.profileInstanceId.replace(/.$/u, "x") };
+    const repaired = await client.requestAuthorizedTransaction({ ...base, tabId, runId: "proof-id-typo", idempotencyKey: "proof-id-typo",
+      actions: [{ method: "visual.click", params: { visualProof: typo } }] });
+    assert.equal(repaired.result, "verified", JSON.stringify(repaired.exact_blocker));
+    assert.equal(clicks(), 2);
+    const unknown = await client.requestAuthorizedTransaction({ ...base, tabId, runId: "proof-id-unknown", idempotencyKey: "proof-id-unknown",
+      actions: [{ method: "visual.click", params: { visualProof: { proofId: "vp_000000000000000000" } } }] });
+    assert.equal(unknown.exact_blocker.code, "visual_target_proof_invalid");
+    assert.equal(clicks(), 2);
+  } finally { await harness.close(); }
+});
+
+// 2026-10-19: runs named Chrome's own new tab or another task's tab (59 stops a day). That tab is
+// never touched; a new task tab opens at an allowed web start page instead.
+test("a tab id that is not this task's live tab opens a new task tab at an allowed start page", async () => {
+  const harness = await createCapsuleHarness();
+  const { client, session, commands } = harness;
+  try {
+    const origin = "https://example.test";
+    const base = { sessionId: session.sessionId, taskId: session.taskId, targetOrigin: origin, allowedOrigins: [origin], keepTaskTab: true };
+    const opened = await client.requestAuthorizedTransaction({ ...base, startUrl: origin + "/feed", tabId: 987654, runId: "replace-tab",
+      idempotencyKey: "replace-tab", actions: [{ method: "page.query", params: { query: "ready" } }] });
+    assert.equal(opened.result, "verified", JSON.stringify(opened.exact_blocker));
+    assert.equal(opened.target_replacement.requested_tab_id, 987654);
+    assert.notEqual(opened.tab.id, 987654);
+    assert.equal(commands.filter((command) => command.method === "tabs.create").length >= 1, true);
+    assert.equal(commands.some((command) => command.params?.tabId === 987654), false, "the named tab is never touched");
+    for (const startUrl of ["chrome://newtab/", "https://elsewhere.test/"]) {
+      const stopped = await client.requestAuthorizedTransaction({ ...base, startUrl, tabId: 987654, runId: "replace-tab-no", idempotencyKey: `replace-tab-no-${startUrl}`,
+        actions: [{ method: "page.query", params: { query: "ready" } }] }).catch((error) => ({ exact_blocker: { code: error.code } }));
+      assert.notEqual(stopped.result, "verified", startUrl);
+    }
+  } finally { await harness.close(); }
+});
+
 // 2026-10-19 (owner): a run may close a window laid over the page before its screen check.
 test("page.dismissOverlay is one local-UI step dispatched once inside a transaction", async () => {
   const harness = await createCapsuleHarness({ interceptCommand: ({ message, tab, extension }) => {
@@ -4650,14 +4707,15 @@ test("explicit transaction tab preserves SPA state and never reloads its startUr
     assert.equal(commands.filter(command => command.method === "tabs.create").length, 1);
     const beforeInvalid = commands.length;
     const missing = await client.requestAuthorizedTransaction({ ...base, tabId: 9999, idempotencyKey: "idem_missing_tab", actions: [{ method: "page.query", params: { query: "ready" } }] });
-    assert.equal(missing.result, "blocked");
-    assert.equal(missing.exact_blocker.code, "task_target_unavailable");
-    // No effect was dispatched, so this is a recoverable target blocker, not a terminal one.
-    assert.equal(missing.continuation.allowed, true);
-    assert.equal(missing.continuation.reason, "no_effect_target_readback_then_continue");
-    assert.equal(missing.continuation.task_may_continue, true);
-    assert.match(missing.continuation.next_action, /companion_reserve_tab/u);
-    assert.ok(commands.slice(beforeInvalid).every(command => command.method === "tabs.list"));
+    // 2026-10-19 (owner: relax the safety checks): a tab that is not this task's live tab is never
+    // touched; a new task tab opens at the allowed start page and the result says so.
+    assert.equal(missing.result, "verified", JSON.stringify(missing.exact_blocker));
+    assert.equal(missing.target_replacement.requested_tab_id, 9999);
+    assert.equal(missing.target_replacement.reason, "task_target_unavailable");
+    assert.notEqual(missing.tab.id, 9999);
+    assert.ok(commands.slice(beforeInvalid).every(command => command.params?.tabId !== 9999));
+    // The SPA tab named before was not reloaded either.
+    assert.equal(liveTabs.get(tab.id).url, "https://example.test/editor/next#detail");
   } finally { await harness.close(); }
 });
 
@@ -5835,8 +5893,10 @@ test("the task may re-reserve and continue on its own completed tab even while C
       tabId: foreignTab, taskId: "foreign_task", runId: "other", sessionId: "other-session", lifecycleState: "completed", retentionPolicy: "cleanup", userHelpRequired: false });
     broker.taskTabs.set(`${session.profileInstanceId}:${foreignTab}`, foreign);
     await client.request("lease.acquire", { sessionId: session.sessionId, tabId: foreignTab }).catch(() => null);
+    // Another task's tab is never used: a new task tab opens instead (2026-10-19).
     const refused = await client.requestAuthorizedTransaction({ ...base, tabId: foreignTab, idempotencyKey: "foreign-active", actions: [{ method: "page.query", params: { query: "editor" } }] });
-    assert.notEqual(refused.result, "verified");
+    assert.notEqual(refused.tab?.id, foreignTab);
+    assert.equal(refused.target_replacement?.requested_tab_id, foreignTab);
   } finally { await harness.close(); }
 });
 

@@ -226,3 +226,17 @@ test("two links to the same place are one target; risky names are never chosen",
   assert.equal(chooser()([node("x", { href: "https://site.test/#" }), node("x", { href: "https://site.test/#" })]), null);
   assert.equal(chooser()([node("投稿を削除", { rect: [0, 0, 20, 20] }), node("投稿を削除", { rect: [0, 900, 20, 20] })]), null);
 });
+
+// 2026-10-19: a run that printed the whole inspection result got it cut off after the image data and
+// copied the proof by hand with typos. The proof and its short id now come first.
+test("an inspection result puts the proof and its short id before the picture", async () => {
+  const { toolResult } = await import("../src/mcp/result.mjs");
+  const result = toolResult({ kind: "visual_target_confirmation", visual_readback_verified: true,
+    visual: { kind: "screenshot", mimeType: "image/jpeg", dataBase64: "A".repeat(4000) },
+    visualProof: { schema: "aos.chrome_companion.visual_target_proof.v1", proofId: "vp_0123456789abcdef01", signature: "sig" } });
+  assert.equal(result.content[0].type, "text");
+  const first = JSON.parse(result.content[0].text);
+  assert.equal(first.proofId, "vp_0123456789abcdef01");
+  assert.equal(first.visualProof.signature, "sig");
+  assert.equal(result.content[1].type, "image");
+});
