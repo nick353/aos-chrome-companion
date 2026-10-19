@@ -4,6 +4,7 @@ import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'n
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { defaultScreenshotDir, saveScreenshot, sessionTag, toolResult } from '../src/mcp/result.mjs';
+import { calledByCodex } from '../src/mcp/task-context.mjs';
 
 // A screenshot is also kept as a file and its path returned, so a task can hand the very screen it
 // saw to a second reader (AOS's aos_check_screen, 2026-10-18).
@@ -66,4 +67,36 @@ test("the task's session goes into the file name, so one run's screens can be fo
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// Codex reads an image block of a call from its code tool as base64 text it cannot see (2026-10-19:
+// 74% of the tool output of AOS's heavy runs). Codex gets the saved file instead; others the picture.
+test('for Codex a saved screenshot comes back as its file only; one that could not be saved keeps its picture', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'shots-'));
+  try {
+    const result = toolResult({ visual_readback: shot(), visualProof: { screenshotPath: '/x/shot.jpg' } }, { screenshotDir: dir, inlineImages: false });
+    const readback = result.structuredContent.result.visual_readback;
+    assert.ok(readback.savedPath.startsWith(dir));
+    assert.equal(readFileSync(readback.savedPath).toString(), 'fake-jpeg-bytes');
+    assert.match(readback.picture, /view_image/);
+    assert.equal(result.structuredContent.result.visualProof.screenshotPath, '/x/shot.jpg');
+    assert.equal(result.content.filter(item => item.type === 'image').length, 0);
+    assert.ok(!JSON.stringify(result.content).includes(picture), 'no base64 in what Codex reads');
+    const unsaved = toolResult({ visual_readback: shot() }, { screenshotDir: '/dev/null/cannot', inlineImages: false });
+    assert.equal(unsaved.content.filter(item => item.type === 'image').length, 1);
+    const other = toolResult({ visual_readback: shot() }, { screenshotDir: dir });
+    assert.equal(other.content.filter(item => item.type === 'image').length, 1);
+    assert.equal(other.structuredContent.result.visual_readback.picture, undefined);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a call is from Codex when its metadata or its process carries a Codex thread id', () => {
+  assert.equal(calledByCodex(undefined, {}), false);
+  assert.equal(calledByCodex({ _meta: {} }, {}), false);
+  assert.equal(calledByCodex(undefined, { CODEX_THREAD_ID: '01a1' }), true);
+  assert.equal(calledByCodex(undefined, { CODEX_SESSION_ID: ' ' }), false);
+  assert.equal(calledByCodex({ _meta: { 'openai/threadId': '01a15440' } }, {}), true);
+  assert.equal(calledByCodex({ _meta: { 'openai/threadId': 'a', codexThreadId: 'b' } }, {}), true, 'conflicting ids are still Codex');
 });

@@ -72,8 +72,15 @@ export function transactionTextSummary(value) {
   return summary;
 }
 
-/** Keep browser evidence small and expose screenshots as native MCP images. */
-export function toolResult(value, { textDetail = 'full', detail = 'full', screenshotDir = null, screenshotTag = null } = {}) {
+/**
+ * Keep browser evidence small and expose screenshots as native MCP images.
+ * inlineImages: false leaves out the picture of a screenshot that was saved as a file (its savedPath
+ * stays). Codex calls Companion from inside its code tool, where an image block reaches the model as
+ * base64 text it cannot see: on 2026-10-19 that text was 74% of the tool output of AOS's heavy runs and
+ * about 31% of their input tokens, re-read on every model call. Codex opens savedPath with view_image
+ * when it needs to look; AOS's checks read the saved files (owner: 「進めて」).
+ */
+export function toolResult(value, { textDetail = 'full', detail = 'full', screenshotDir = null, screenshotTag = null, inlineImages = true } = {}) {
   const images = [];
   const seen = new Map(); // picture → the file it was saved to (null when not saved)
   function visit(item) {
@@ -81,12 +88,15 @@ export function toolResult(value, { textDetail = 'full', detail = 'full', screen
     if (!item || typeof item !== 'object') return item;
     const screenshot = item.kind === 'screenshot' && typeof item.dataBase64 === 'string' && typeof item.mimeType === 'string';
     if (screenshot && !seen.has(item.dataBase64)) {
-      seen.set(item.dataBase64, screenshotDir ? saveScreenshot(item.dataBase64, item.mimeType, screenshotDir, Date.now(), screenshotTag) : null);
-      images.push({ type: 'image', data: item.dataBase64, mimeType: item.mimeType });
+      const path = screenshotDir ? saveScreenshot(item.dataBase64, item.mimeType, screenshotDir, Date.now(), screenshotTag) : null;
+      seen.set(item.dataBase64, path);
+      // A picture that could not be saved is still handed back, so it is never lost.
+      if (inlineImages || !path) images.push({ type: 'image', data: item.dataBase64, mimeType: item.mimeType });
     }
     const savedPath = screenshot ? seen.get(item.dataBase64) : null;
     const kept = Object.entries(item).filter(([key]) => !(screenshot && key === 'dataBase64')).map(([key, entry]) => [key, visit(entry)]);
-    return Object.fromEntries(savedPath ? [...kept, ['savedPath', savedPath]] : kept);
+    const extra = savedPath ? [['savedPath', savedPath], ...(inlineImages ? [] : [['picture', 'saved only: open savedPath with view_image to look']])] : [];
+    return Object.fromEntries([...kept, ...extra]);
   }
   const metadata = visit(value);
   if (metadata?.visual_readback_verified === true && metadata?.visualProof

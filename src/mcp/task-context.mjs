@@ -190,3 +190,15 @@ export class McpTaskBindingRegistry {
     }
   }
 }
+
+// A call from a Codex task (its thread id in the request metadata or this process's environment) gets
+// screenshots as saved files only; other clients (Claude Code) see the pictures (result.mjs).
+export function calledByCodex(extra, env = process.env) {
+  try {
+    if (resolveHostCodexTaskId(extra)) return true;
+  } catch {
+    return true; // conflicting Codex ids: still a Codex call
+  }
+  const set = (value) => typeof value === "string" && value.trim() !== "";
+  return set(env?.CODEX_THREAD_ID) || set(env?.CODEX_SESSION_ID);
+}

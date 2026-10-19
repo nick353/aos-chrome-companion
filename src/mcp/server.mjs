@@ -10,7 +10,7 @@ import { validateLocatorTree } from "./locator-validation.mjs";
 import { defaultScreenshotDir, sessionTag, toolResult, taskStatus } from "./result.mjs";
 import { normalizeError, CompanionError } from "../shared/errors.mjs";
 import { materializeTransactionActions } from "./action-materializer.mjs";
-import { bindCodexTaskId, McpTaskBindingRegistry, resolveCodexTaskId } from "./task-context.mjs";
+import { bindCodexTaskId, calledByCodex, McpTaskBindingRegistry, resolveCodexTaskId } from "./task-context.mjs";
 import { normalizeBinaryClipboardRequest } from "../shared/peripheral-policy.mjs";
 import { readUrls } from "./read-urls.mjs";
 import { withSiteAliases } from "../shared/site-aliases.mjs";
@@ -125,6 +125,7 @@ async function recoverSessionForPrepareResume(client, { previousSessionId, runId
 // Where screenshots are kept as files (result.mjs), so their path can be handed on.
 const SCREENSHOT_DIR = defaultScreenshotDir();
 
+
 function guarded(handler, { summarizeTransactionText = false } = {}) {
   return async (args, extra) => {
     try {
@@ -133,6 +134,7 @@ function guarded(handler, { summarizeTransactionText = false } = {}) {
         detail: args.responseDetail === "compact" ? "compact" : "full",
         screenshotDir: SCREENSHOT_DIR,
         screenshotTag: sessionTag(args?.sessionId),
+        inlineImages: !calledByCodex(extra),
       });
     } catch (error) {
       return toolError(error);
