@@ -17,7 +17,7 @@ import { withSiteAliases } from "../shared/site-aliases.mjs";
 import { settleUnknownSend } from "./settle-unknown-send.mjs";
 import { MAX_SPLIT_ACTIONS, runSplitTransaction } from "./split-transaction.mjs";
 import { buildReplayTimeline, listSessionScreenshots, pruneReplays, replayFolderName, writeReplay } from "./replay.mjs";
-import { RECORD_MAX_SECONDS, autoStopReason, bringAppToFront, frontmostBundleId, prepareRecordingForAnalysis,
+import { RECORD_MAX_SECONDS, autoStopReason, ownerOnCall, prepareRecordingForAnalysis, readDevicePresence,
   recordFolderName } from "./recording.mjs";
 import { existsSync } from "node:fs";
 import { resolveDataDir } from "../shared/paths.mjs";
@@ -816,6 +816,17 @@ server.registerTool("companion_replay", {
 // Real recordings (recording.mjs): at most one per MCP process, stopped at its time limit.
 let activeRecording = null;
 const finishedRecordings = new Map();
+const RECORDER_PATH = join(resolveDataDir(), "bin", "aos-chrome-companion-recorder");
+
+// One tabs.configure step on the recorded tab (opening, starting the media of, or closing its
+// recording window), returning the extension's answer.
+async function configureRecordingTab(client, state, params, step) {
+  const transaction = await client.requestAuthorizedTransaction({ ...state.transaction, idempotencyKey: `${state.transaction.idempotencyKey}:${step}`,
+    startUrl: state.startUrl, tabId: state.tabId, reuseTaskTab: true, keepTaskTab: true,
+    actions: await materializeTransactionActions([{ method: "tabs.configure", params }]) }, { timeoutMs: 60_000 });
+  return { verified: transaction?.result === "verified", value: transaction?.actions?.[0]?.result ?? null,
+    blocker: transaction?.exact_blocker ?? null };
+}
 
 function finishRecording(state, stoppedBy) {
   state.finishing ??= (async () => {
@@ -823,26 +834,44 @@ function finishRecording(state, stoppedBy) {
     if (activeRecording === state) activeRecording = null;
     let stop = null;
     let stopError = null;
+    let client = null;
     try {
-      const client = await broker();
+      client = await broker();
       stop = await client.requestAuthorizedTransaction({ ...state.transaction, idempotencyKey: `${state.transaction.idempotencyKey}:stop`,
         startUrl: "about:blank", tabId: undefined, reuseTaskTab: false, keepTaskTab: false,
         actions: await materializeTransactionActions([{ method: "recording.stopAuto", params: {} }]) }, { timeoutMs: 120_000 });
     } catch (error) {
       stopError = normalizeError(error);
     }
+    // Move the tab back and learn whether anything else got into the recording window meanwhile.
+    let ended = null;
+    let endError = null;
+    try {
+      const result = await configureRecordingTab(client ?? await broker(), state, { endRecordingWindow: true }, "end");
+      if (result.value?.recordingWindowEnded === true) ended = result.value;
+      else endError = result.blocker?.code ?? result.value?.reason ?? "recording_window_not_closed";
+    } catch (error) {
+      endError = normalizeError(error).code;
+    }
+    const blockedReasons = ended ? ended.taints.map(item => item.reason) : [`recording_window_state_unknown:${endError}`];
     let analysis = null;
     let analysisError = null;
     if (existsSync(state.moviePath)) {
-      try { analysis = await prepareRecordingForAnalysis({ moviePath: state.moviePath, outDir: state.outDir }); }
-      catch (error) { analysisError = String(error?.message ?? error).slice(0, 300); }
+      try {
+        analysis = await prepareRecordingForAnalysis({ moviePath: state.moviePath, outDir: state.outDir,
+          windowBounds: state.windowBounds, viewport: state.viewport, blockedReasons });
+      } catch (error) { analysisError = String(error?.message ?? error).slice(0, 300); }
     } else {
       analysisError = "The recorder left no movie file";
     }
+    const usable = Boolean(analysis?.video);
     const result = { kind: "companion_recording", stoppedBy, startedAt: state.startedAt, stoppedAt: new Date().toISOString(),
-      stopResult: stop?.result ?? null, stopError,
+      stopResult: stop?.result ?? null, stopError, recordingWindowEndError: endError, taints: ended?.taints ?? null,
       ...(analysis ?? { folder: null, video: null, frames: [] }), analysisError,
-      removedOldRecordings: pruneReplays(join(resolveDataDir(), "Recordings"), { except: state.outDir }).length };
+      removedOldRecordings: pruneReplays(join(resolveDataDir(), "Recordings"), { except: state.outDir }).length,
+      next: usable
+        ? `Give video (the page only, ${analysis.audioSilent ? "WITHOUT sound: say so in the question" : "with sound"}) to aos_watch_video. Frames are for your own look.`
+        : "Do not send this recording for analysis: another page may be in it or it could not be checked. Record again, or analyse from screenshots." };
     finishedRecordings.set(state.sessionId, result);
     return result;
   })();
@@ -850,11 +879,13 @@ function finishRecording(state, stoppedBy) {
 }
 
 server.registerTool("companion_record_start", {
-  description: "Record this task's tab as a real video with sound, for what a slideshow replay cannot show: short videos (TikTok, Instagram, YouTube) to analyse without downloading them, and animations or how a moving page behaves. Use it whenever it helps, even while the owner is using the Mac or on a call (the owner allowed that). The recorder picks the frontmost Chrome window, so the task's tab and its window come to the front only for the moment the recording starts; then the previous app gets the keyboard back and the window keeps being recorded while it stays visible on screen. While recording, play and scroll the page with ordinary Companion actions. It stops by itself at maxSeconds (at most 600); call companion_record_stop when done. To review which steps a run took, use companion_replay instead (no capture, nothing comes to the front).",
+  description: "Record this task's tab as a real video with sound, for what a slideshow replay cannot show: short videos (TikTok, Instagram) to analyse without downloading them, and animations or how a moving page behaves. (A public YouTube video needs no recording: give its URL to aos_watch_video.) The tab is moved alone into its own recording window over part of Chrome, which is recorded even while another app is in front; other tasks keep working in the main window but cannot bring it over the recording window or open tabs in it, and anything that still gets into the recording window blocks the recording from analysis. Then the page's largest video is played with sound from its start (check audible in the result; if false, press the page's play/sound button with companion_inspect_visual_target and visual.click, because an ordinary click does not count as a person's). Nothing is recorded while a camera or microphone is in use (reason owner_on_call: the sound would play into a call; try later). Never record mail, messages, notifications or account pages. It stops by itself at maxSeconds (at most 600; use the video length plus a few seconds); call companion_record_stop when done, which moves the tab back. To review which steps a run took, use companion_replay instead.",
   inputSchema: { sessionId, runId: z.string().min(1), taskId: z.string().min(1).optional(), idempotencyKey: z.string().min(1),
     tabId: tabId.describe("The task-owned tab to record"), startUrl: z.string().url().describe("The tab's current URL"),
     allowedOrigins: z.array(z.string().url()).min(1).max(16), targetOrigin: z.string().url().optional(),
     maxSeconds: z.number().int().min(10).max(RECORD_MAX_SECONDS).default(180),
+    windowWidth: z.number().int().min(360).max(1600).default(600).describe("Width of the recording window; about 600 suits a vertical short video"),
+    playMedia: z.boolean().default(true).describe("Play the page's largest video with sound from its start once recording begins"),
     label: z.string().min(1).max(80).optional().describe("Short name added to the folder, such as the task name") },
   annotations: { destructiveHint: false },
 }, guarded(async (args, extra) => {
@@ -863,40 +894,45 @@ server.registerTool("companion_record_start", {
   if (activeRecording) {
     throw new CompanionError("recording_already_active", "A recording is already running; stop it with companion_record_stop first", { startedAt: activeRecording.startedAt });
   }
+  let presence = null;
+  try { presence = await readDevicePresence(RECORDER_PATH); } catch { /* unknown: a night run has no call to protect */ }
+  if (ownerOnCall(presence)) {
+    return { kind: "companion_recording", started: false, reason: "owner_on_call", presence,
+      next: "A camera or microphone is in use, so the video's sound would play into a call. Do not record now; continue with screenshots or try again later." };
+  }
   const client = await broker();
   const targetOrigin = args.targetOrigin ?? new URL(args.startUrl).origin;
   const transaction = { sessionId: args.sessionId, runId: args.runId, taskId, idempotencyKey: args.idempotencyKey,
     intent: "authorized_transaction", targetOrigin, allowedOrigins: withSiteAliases(args.allowedOrigins),
     retainOnUnknown: false, precondition: null, capsule: null };
-  const frontApp = await frontmostBundleId();
   const tag = sessionTag(args.sessionId);
   const now = Date.now();
   const outDir = join(resolveDataDir(), "Recordings", recordFolderName(now, tag, args.label));
   // The live movie is named so that cleanup (pruneReplays) never matches it while it is being written.
   const filename = `recording-${recordFolderName(now, tag).slice("record-".length)}`;
-  const activated = await client.requestAuthorizedTransaction({ ...transaction, idempotencyKey: `${args.idempotencyKey}:front`,
-    startUrl: args.startUrl, tabId: args.tabId, reuseTaskTab: true, keepTaskTab: true,
-    actions: await materializeTransactionActions([{ method: "tabs.activate", params: {} }]) }, { timeoutMs: 60_000 });
-  if (activated?.result !== "verified") {
-    await bringAppToFront(frontApp);
-    return { kind: "companion_recording", started: false, reason: "tab_not_brought_to_front", activation: activated };
+  const state = { sessionId: args.sessionId, transaction, tabId: args.tabId, startUrl: args.startUrl, outDir,
+    moviePath: join(resolveDataDir(), "Recordings", `${filename}.mov`), startedAt: new Date(now).toISOString(), startedMs: now,
+    maxSeconds: args.maxSeconds, timer: null, windowBounds: null, viewport: null };
+  const opened = await configureRecordingTab(client, state, { recordingWindow: { width: args.windowWidth, maxSeconds: args.maxSeconds } }, "window");
+  if (!opened.value?.recordingWindow) {
+    return { kind: "companion_recording", started: false, reason: "recording_window_not_opened", blocker: opened.blocker };
   }
-  let started;
+  state.windowBounds = opened.value.bounds;
+  state.viewport = opened.value.viewport;
+  let started = null;
+  let startError = null;
   try {
     started = await client.requestAuthorizedTransaction({ ...transaction, idempotencyKey: `${args.idempotencyKey}:start`,
       startUrl: "about:blank", reuseTaskTab: false, keepTaskTab: false,
-      actions: await materializeTransactionActions([{ method: "recording.startAuto", params: { filename } }]) }, { timeoutMs: 60_000 });
+      actions: await materializeTransactionActions([{ method: "recording.startAuto", params: { filename, windowBounds: state.windowBounds } }]) }, { timeoutMs: 60_000 });
   } catch (error) {
-    await bringAppToFront(frontApp);
-    throw error;
+    startError = normalizeError(error);
   }
-  // The recorder has fixed its window; give the keyboard back so the owner's typing never lands in Chrome.
-  const restoredFront = await bringAppToFront(frontApp);
-  if (started?.result !== "verified") {
-    return { kind: "companion_recording", started: false, reason: "recorder_did_not_start", start: started };
+  if (startError || started?.result !== "verified") {
+    const closed = await configureRecordingTab(client, state, { endRecordingWindow: true }, "end").catch(error => ({ blocker: normalizeError(error) }));
+    return { kind: "companion_recording", started: false, reason: "recorder_did_not_start", error: startError ?? started?.exact_blocker ?? null,
+      tabMovedBack: closed?.value?.movedBack ?? false };
   }
-  const state = { sessionId: args.sessionId, transaction, frontApp, outDir, moviePath: join(resolveDataDir(), "Recordings", `${filename}.mov`),
-    startedAt: new Date(now).toISOString(), startedMs: now, maxSeconds: args.maxSeconds, timer: null };
   state.timer = setInterval(() => {
     if (state.finishing) return;
     const reason = autoStopReason({ elapsedSeconds: (Date.now() - state.startedMs) / 1000, maxSeconds: state.maxSeconds });
@@ -905,13 +941,25 @@ server.registerTool("companion_record_start", {
   state.timer.unref?.();
   activeRecording = state;
   finishedRecordings.delete(args.sessionId);
+  let media = null;
+  if (args.playMedia) {
+    try {
+      const played = await configureRecordingTab(client, state, { recordingMedia: true }, "media");
+      media = played.value ?? { error: played.blocker?.code ?? "media_not_started" };
+    } catch (error) {
+      media = { error: normalizeError(error).code };
+    }
+  }
+  const audible = media?.audible ?? null;
   return { kind: "companion_recording", started: true, startedAt: state.startedAt, maxSeconds: args.maxSeconds, folder: outDir,
-    previousFrontApp: frontApp, keyboardReturnedToPreviousApp: restoredFront,
-    next: "Play or scroll the page with Companion actions, then call companion_record_stop" };
+    recordingWindow: { windowId: opened.value.windowId, bounds: state.windowBounds }, media: media?.media ?? media, audible,
+    next: audible === true
+      ? `The video plays with sound${media?.media?.durationSeconds ? ` (${media.media.durationSeconds} s long)` : ""}; wait until it has played once, then call companion_record_stop`
+      : "No sound is playing yet: press the page's play or sound button with companion_inspect_visual_target and visual.click, then wait for the video and call companion_record_stop" };
 }));
 
 server.registerTool("companion_record_stop", {
-  description: "Stop this session's recording (or read the result of one that already stopped by itself) and return a folder with recording.mov, audio.m4a and a still frame every 2 seconds (paths with their time in the video) to look at. Recordings and replays are removed after seven days unless their folder holds a file named keep.",
+  description: "Stop this session's recording (or read the result of one that already stopped by itself), move the tab back to its window, and return a folder with recording.mov (the whole recording window, kept for the owner), analysis.mp4 as video (only the page, and only when nothing else got into the recording: give it to aos_watch_video), audio.m4a and a still frame every 2 seconds. When video is null, do not send this recording anywhere. Recordings and replays are removed after seven days unless their folder holds a file named keep.",
   inputSchema: { sessionId },
   annotations: { destructiveHint: false },
 }, guarded(async (args, extra) => {

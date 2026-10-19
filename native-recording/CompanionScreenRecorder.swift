@@ -102,14 +102,40 @@ private enum RecorderError: Error, CustomStringConvertible {
 private struct Arguments {
     let output: URL
     let presence: Bool
+    // `--bounds left,top,width,height`: the Chrome window to record, by its place on screen (the
+    // recording window Companion opened for this recording). Without it, the frontmost Chrome window.
+    let bounds: CGRect?
     static func parse(_ raw: [String]) throws -> Arguments {
-        if raw == ["--presence"] { return Arguments(output: URL(fileURLWithPath: "/dev/null"), presence: true) }
-        guard raw.count == 2, raw[0] == "--output" else { throw RecorderError.invalidArguments }
+        if raw == ["--presence"] { return Arguments(output: URL(fileURLWithPath: "/dev/null"), presence: true, bounds: nil) }
+        guard raw.count == 2 || raw.count == 4, raw[0] == "--output" else { throw RecorderError.invalidArguments }
+        var bounds: CGRect? = nil
+        if raw.count == 4 {
+            let values = raw[3].split(separator: ",").compactMap { Double($0) }
+            guard raw[2] == "--bounds", values.count == 4, values.allSatisfy({ $0.isFinite }), values[2] > 0, values[3] > 0 else {
+                throw RecorderError.invalidArguments
+            }
+            bounds = CGRect(x: values[0], y: values[1], width: values[2], height: values[3])
+        }
         let output = URL(fileURLWithPath: raw[1]).standardizedFileURL
         guard !FileManager.default.fileExists(atPath: output.path) else { throw RecorderError.failed("output_exists") }
         try FileManager.default.createDirectory(at: output.deletingLastPathComponent(), withIntermediateDirectories: true)
-        return Arguments(output: output, presence: false)
+        return Arguments(output: output, presence: false, bounds: bounds)
     }
+}
+
+// The one Chrome window with exactly this place and size. Chrome does not need to be in front, so
+// the owner keeps the keyboard. None or two matches stop the recording rather than guess.
+private func chromeWindow(matching bounds: CGRect, in content: SCShareableContent) throws -> SCWindow {
+    let close = { (a: CGFloat, b: CGFloat) in abs(a - b) <= 2 }
+    let chrome = content.windows.filter { $0.owningApplication?.bundleIdentifier == "com.google.Chrome" && $0.windowLayer == 0 }
+    let matches = chrome.filter {
+        close($0.frame.origin.x, bounds.origin.x) && close($0.frame.origin.y, bounds.origin.y)
+            && close($0.frame.width, bounds.width) && close($0.frame.height, bounds.height)
+    }
+    if matches.count == 1 { return matches[0] }
+    let seen = chrome.prefix(8).map { "\(Int($0.frame.origin.x)),\(Int($0.frame.origin.y)),\(Int($0.frame.width)),\(Int($0.frame.height))" }.joined(separator: ";")
+    FileHandle.standardError.write(Data("chrome_windows=\(seen)\n".utf8))
+    throw matches.isEmpty ? RecorderError.chromeWindowNotFound : RecorderError.failed("recording_window_ambiguous")
 }
 
 private func frontmostChromeWindow() throws -> (CGWindowID, pid_t) {
@@ -189,11 +215,18 @@ private struct CompanionScreenRecorder {
                 FileHandle.standardOutput.write(Data("{\"camera\":\(cameraInUse()),\"microphone\":\(microphoneInUse())}\n".utf8))
                 return
             }
-            let (windowID, ownerPID) = try frontmostChromeWindow()
             let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-            guard let window = content.windows.first(where: { $0.windowID == windowID && $0.owningApplication?.processID == ownerPID }) else {
-                throw RecorderError.permissionOrContentUnavailable
+            let window: SCWindow
+            if let bounds = arguments.bounds {
+                window = try chromeWindow(matching: bounds, in: content)
+            } else {
+                let (frontID, ownerPID) = try frontmostChromeWindow()
+                guard let front = content.windows.first(where: { $0.windowID == frontID && $0.owningApplication?.processID == ownerPID }) else {
+                    throw RecorderError.permissionOrContentUnavailable
+                }
+                window = front
             }
+            let windowID = window.windowID
             let filter = SCContentFilter(desktopIndependentWindow: window)
             // Point size at 15 frames a second is enough to read a page or watch a short video, and
             // keeps the H.264 work off this Intel Mac's integrated GPU, which crashed under load
@@ -234,7 +267,7 @@ private struct CompanionScreenRecorder {
                 _ = try? handle.read(upToCount: 4096)
                 stop.request()
             }
-            FileHandle.standardOutput.write(Data("native_recording_started window_id=\(windowID) target=frontmost_chrome_window audio_requested=1\n".utf8))
+            FileHandle.standardOutput.write(Data("native_recording_started window_id=\(windowID) target=\(arguments.bounds == nil ? "frontmost_chrome_window" : "recording_window") audio_requested=1\n".utf8))
             // A recording never outlives eleven minutes even if Companion forgets to stop it (the limit
             // offered to the AI is ten), so a lost stop cannot keep Chrome capturing all night.
             let deadline = Date().addingTimeInterval(660)

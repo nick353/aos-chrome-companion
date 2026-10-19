@@ -40,7 +40,11 @@ export function transactionActionSchema(locator) {
     // the frontmost Chrome window) records the task's page and never the owner's own Chrome window.
     'tabs.activate': {},
     'tabs.reload': { bypassCache: z.boolean().optional() },
-    'tabs.configure': { pinned: z.boolean().optional(), muted: z.boolean().optional(), index: z.number().int().min(-1).optional(), destinationWindowId: z.number().int().nonnegative().optional().describe('An existing window returned by companion_list_windows; source identity stays bound separately') },
+    'tabs.configure': { pinned: z.boolean().optional(), muted: z.boolean().optional(), index: z.number().int().min(-1).optional(), destinationWindowId: z.number().int().nonnegative().optional().describe('An existing window returned by companion_list_windows; source identity stays bound separately'),
+      // Used by companion_record_start/stop; a task calls those tools rather than these fields.
+      recordingWindow: z.object({ width: z.number().int().min(300).max(3840).optional(), maxSeconds: z.number().int().min(10).max(600).optional() }).optional().describe('Internal to companion_record_start: move this tab alone into a recording window'),
+      recordingMedia: z.literal(true).optional().describe('Internal to companion_record_start: play the page video with sound from its start'),
+      endRecordingWindow: z.literal(true).optional().describe('Internal to companion_record_stop: move the tab back and report anything that entered the recording') },
     'page.bookmark': { title: text.max(500).optional(), parentId: text.min(1).optional() },
     'page.configureViewport': { action: z.enum(['set', 'restore']), width: z.number().int().min(200).max(3840).optional(), height: z.number().int().min(200).max(2160).optional(), deviceScaleFactor: z.number().min(0.5).max(3).optional(), durationMs: z.number().int().min(1000).max(1800000).optional().describe('Automatically clear this task-owned override; default 5 minutes. Obtain new visual proofs after set or restore.') },
     'page.scroll': { locator: locator.optional(), direction: z.enum(['up', 'down', 'left', 'right']).optional(), amount: z.number().min(1).max(10_000).optional() },
@@ -54,7 +58,7 @@ export function transactionActionSchema(locator) {
     'page.nativeChooser': {},
     'tabs.claimExisting': {},
     'recording.status': {},
-    'recording.startAuto': { filename: text.max(160).optional() },
+    'recording.startAuto': { filename: text.max(160).optional(), windowBounds: z.object({ left: z.number(), top: z.number(), width: z.number().positive(), height: z.number().positive() }).optional().describe('The recording window to record, by its place on screen') },
     'recording.stopAuto': { filename: text.max(160).optional() },
   };
   for (const method of AUTHORIZED_TRANSACTION_METHODS.filter(name => name.startsWith('visual.'))) {
@@ -82,7 +86,7 @@ export function transactionActionSchema(locator) {
     if (method === 'page.query') params = params.refine(value => value.splitBinding !== true || value.exactEditor === true, 'splitBinding requires exactEditor');
     if (method === 'page.richText') params = params.refine(value => value.operation !== 'splitParagraph' || (value.expectedCaret !== undefined && value.expectedBody !== undefined && value.expectedFullBody === value.expectedBody && value.expectedSelection?.start === value.expectedSelection?.end && value.expectedSelection?.start <= value.expectedBody.length), 'splitParagraph requires full unchanged body and one collapsed UTF-16 selection');
     if (method === 'page.configureViewport') params = params.refine(value => value.action === 'restore' || (value.width !== undefined && value.height !== undefined && value.width * value.height * (value.deviceScaleFactor ?? 1) ** 2 <= 16777216), 'Set requires width/height and at most 16 megapixels');
-    if (method === 'tabs.configure') params = params.refine(value => ['pinned','muted','index','destinationWindowId'].some(key => value[key] !== undefined), 'Provide a tab configuration change');
+    if (method === 'tabs.configure') params = params.refine(value => ['pinned','muted','index','destinationWindowId','recordingWindow','recordingMedia','endRecordingWindow'].some(key => value[key] !== undefined), 'Provide a tab configuration change');
     if (method === 'page.download') params = params.refine(value => (value.url !== undefined) !== (value.locator !== undefined), 'Provide exactly one URL or locator');
     if (method === 'clipboard.write') params = params.refine(value => (value.text !== undefined) !== (value.formats !== undefined), 'Provide text or MIME formats, not both').refine(value => !value.formats || (value.approved === true && new Set(value.formats.map(format => format.mimeType)).size === value.formats.length), 'MIME writes require approved: true and unique MIME types');
     return z.object({

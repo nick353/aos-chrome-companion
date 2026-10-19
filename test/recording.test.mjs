@@ -5,41 +5,41 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  RECORD_MAX_SECONDS, autoStopReason, bringAppToFront, frontmostBundleId,
+  RECORD_MAX_SECONDS, autoStopReason, ownerOnCall, pageCrop,
   prepareRecordingForAnalysis, readDevicePresence, recordFolderName,
 } from '../src/mcp/recording.mjs';
 import { pruneReplays } from '../src/mcp/replay.mjs';
 
-// Recording is allowed whenever the AI needs it, even during the owner's work or a call (owner,
-// 2026-10-19: 「私は気にしないで」「こんな感じで分けて普段使っているので」). The longest is ten minutes.
+// Recording is allowed whenever the AI needs it, even during the owner's work (owner, 2026-10-19:
+// 「私は気にしないで」), but not during a call: the recorded video's sound would play into it (owner,
+// 2026-10-19: 通話中は待つ). The longest is ten minutes.
 
-test('a recording runs until its limit, whatever the owner is doing', () => {
+test('a recording runs until its limit', () => {
   assert.equal(RECORD_MAX_SECONDS, 600);
   assert.equal(autoStopReason({ elapsedSeconds: 10, maxSeconds: 60 }), null);
   assert.equal(autoStopReason({ elapsedSeconds: 60, maxSeconds: 60 }), 'time_limit');
-  assert.equal(autoStopReason({ elapsedSeconds: 10, maxSeconds: 60, camera: true, microphone: true }), null);
 });
 
-test('devices in use and the front app are read from macOS tools', async () => {
+test('a camera or microphone in use means a call, and no recording starts', async () => {
   const exec = async (file, args) => {
     if (file === '/rec' && args[0] === '--presence') return { stdout: '{"camera":true,"microphone":false}\n' };
-    if (file.endsWith('lsappinfo') && args[0] === 'front') return { stdout: 'ASN:0x0-0x1a01a:\n' };
-    if (file.endsWith('lsappinfo')) return { stdout: '"CFBundleIdentifier"="com.anthropic.claudefordesktop"\n' };
     throw new Error(`unexpected ${file}`);
   };
-  assert.deepEqual(await readDevicePresence('/rec', { exec }), { camera: true, microphone: false });
-  assert.equal(await frontmostBundleId({ exec }), 'com.anthropic.claudefordesktop');
-  assert.equal(await frontmostBundleId({ exec: async () => { throw new Error('no'); } }), null);
+  const presence = await readDevicePresence('/rec', { exec });
+  assert.deepEqual(presence, { camera: true, microphone: false });
+  assert.equal(ownerOnCall(presence), true);
+  assert.equal(ownerOnCall({ camera: false, microphone: true }), true);
+  assert.equal(ownerOnCall({ camera: false, microphone: false }), false);
+  assert.equal(ownerOnCall(null), false);
 });
 
-test('the front goes back to the previous app, but never to Chrome or an odd name', async () => {
-  const opened = [];
-  const exec = async (file, args) => { opened.push([file, ...args]); return { stdout: '' }; };
-  assert.equal(await bringAppToFront('com.apple.Safari', { exec }), true);
-  assert.equal(await bringAppToFront('com.google.Chrome', { exec }), false);
-  assert.equal(await bringAppToFront('x; rm -rf /', { exec }), false);
-  assert.equal(await bringAppToFront(null, { exec }), false);
-  assert.deepEqual(opened, [['/usr/bin/open', '-b', 'com.apple.Safari']]);
+test('only the page part of the recording window goes to analysis', () => {
+  const windowBounds = { left: 0, top: 25, width: 599, height: 875 };
+  assert.deepEqual(pageCrop({ videoWidth: 598, videoHeight: 874, windowBounds, viewport: { width: 599, height: 785 } }),
+    { x: 0, y: 90, width: 598, height: 784 });
+  assert.deepEqual(pageCrop({ videoWidth: 1198, videoHeight: 1750, windowBounds, viewport: { width: 599, height: 785 } }),
+    { x: 0, y: 180, width: 1198, height: 1570 });
+  assert.equal(pageCrop({ videoWidth: 598, videoHeight: 874, windowBounds, viewport: null }), null);
 });
 
 test('recording folders are named like replays, and cleanup removes old ones but never a movie being written', () => {
@@ -95,6 +95,54 @@ test('a still page still gets a frame every two seconds to the end of the record
     assert.ok(result.durationSeconds > 8.5, String(result.durationSeconds));
     assert.equal(result.frames.length, 5, String(result.frames.length));
     assert.equal(result.frames.at(-1).atSeconds, 8);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a clean recording gets the page-only analysis.mp4; one that another page got into gets none', { skip: !ffmpegReady && 'ffmpeg is not installed' }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'record-crop-'));
+  try {
+    const make = name => {
+      const movie = join(dir, name);
+      execFileSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', 'testsrc=size=598x874:rate=15:duration=4',
+        '-f', 'lavfi', '-i', 'sine=frequency=440:duration=4', '-shortest', '-c:v', 'libx264', '-c:a', 'aac', movie]);
+      return movie;
+    };
+    const windowBounds = { left: 0, top: 25, width: 598, height: 874 };
+    const viewport = { width: 598, height: 784 };
+    const clean = await prepareRecordingForAnalysis({ moviePath: make('recording-a.mov'), outDir: join(dir, 'a'), windowBounds, viewport });
+    assert.equal(clean.video, join(dir, 'a', 'analysis.mp4'));
+    assert.equal(clean.cropped, true);
+    assert.equal(clean.analysisBlocked, null);
+    assert.equal(clean.audioSilent, false);
+    const size = execFileSync('ffprobe', ['-v', 'error', '-select_streams', 'v', '-show_entries', 'stream=width,height', '-of', 'csv=p=0', clean.video]).toString().trim();
+    assert.equal(size, '598,784');
+    assert.ok(existsSync(join(dir, 'a', 'recording.mov')));
+
+    const dirty = await prepareRecordingForAnalysis({ moviePath: make('recording-b.mov'), outDir: join(dir, 'b'), windowBounds, viewport,
+      blockedReasons: ['other_tab_shown_in_recording_window'] });
+    assert.equal(dirty.video, null);
+    assert.deepEqual(dirty.analysisBlocked, ['other_tab_shown_in_recording_window']);
+    assert.ok(!existsSync(join(dir, 'b', 'analysis.mp4')));
+    assert.ok(existsSync(join(dir, 'b', 'unsafe.json')));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// A page that never got a person's click plays muted: the recording has a sound track that is all
+// silence (2026-10-19: -91 dB), and the AI must tell Gemini there is no sound.
+test('a silent sound track is reported as silent', { skip: !ffmpegReady && 'ffmpeg is not installed' }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'record-silent-'));
+  try {
+    const movie = join(dir, 'recording-s.mov');
+    execFileSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', 'testsrc=size=320x240:rate=15:duration=3',
+      '-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo', '-t', '3', '-c:v', 'libx264', '-c:a', 'aac', movie]);
+    const result = await prepareRecordingForAnalysis({ moviePath: movie, outDir: join(dir, 'out') });
+    assert.equal(result.hasAudio, true);
+    assert.equal(result.audioSilent, true);
+    assert.equal(result.cropped, false);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

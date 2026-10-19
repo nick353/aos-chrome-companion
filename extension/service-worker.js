@@ -15,6 +15,7 @@ import {
 } from "./build-info.js";
 import { createUserControls } from "./user-controls.js";
 import { searchBrowserLibrary, configureTaskTab, bookmarkTaskPage } from "./browser-library.js";
+import { createRecordingWindows } from "./recording-window.js";
 import {
   CAPABILITIES,
   CAPABILITIES_DIGEST,
@@ -57,6 +58,12 @@ const commandAssembler = new NativeCommandAssembler({
     { operationEffectState: "none", mutationDispatchAttempted: false }),
 });
 const debuggerSessions = new DebuggerSessionPool(chrome.debugger);
+// The window a recording runs in, kept free of other tasks' tabs (recording-window.js).
+const recordingWindows = createRecordingWindows(chrome);
+// Each place that brings a window to the front asks recordingWindows.focusAllowed first (with a
+// typeof check, because tests run single functions of this file without the controller).
+recordingWindows.attach(chrome);
+void recordingWindows.restore();
 const pageObservations = new PageObservations({ debuggerApi: chrome.debugger, pool: debuggerSessions,
   sendCommand: sendDebuggerCommand, redactText: redactPeripheralText });
 const javaScriptDialogs = new JavaScriptDialogs({ debuggerApi: chrome.debugger, pool: debuggerSessions,
@@ -1595,6 +1602,30 @@ async function readConsole(tabId) {
   });
 }
 
+// Chrome lets a page start sound only after a person's click, and Companion's ordinary clicks do
+// not count as one (2026-10-19: the test recording was silent until a trusted click). One click on
+// the video through the debugger, the same input as visual.click, gives the page that right; then
+// the fixed page step plays the video with sound from its start. No script text is evaluated.
+async function startRecordingMedia(tabId) {
+  const located = await runPageOperation(tabId, "recordingMedia", { phase: "locate" });
+  if (!located?.found) return located ?? { found: false };
+  let debuggerLease = null;
+  try {
+    debuggerLease = await debuggerSessions.acquire(tabId);
+    for (const type of ["mouseMoved", "mousePressed", "mouseReleased"]) {
+      await sendDebuggerCommand(debuggerLease.target, "Input.dispatchMouseEvent", { type, x: located.x, y: located.y,
+        button: type === "mouseMoved" ? "none" : "left", clickCount: type === "mouseMoved" ? 0 : 1 });
+    }
+  } catch (error) {
+    if (error?.code) throw error;
+    throw debuggerError(error);
+  } finally {
+    if (debuggerLease) await debuggerLease.release();
+  }
+  await new Promise(resolve => setTimeout(resolve, 300));
+  return runPageOperation(tabId, "recordingMedia", { phase: "play" });
+}
+
 async function sendDebuggerCommand(target, method, params) {
   return withTimeout(
     chrome.debugger.sendCommand(target, method, params),
@@ -1731,7 +1762,7 @@ async function runTrustedVisualInput(tabId, method, params) {
     await withTimeout(
       Promise.all([
         chrome.tabs.update(tabId, { active: true }),
-        chrome.windows.update(taskTab.windowId, { focused: true }),
+        (typeof recordingWindows === "undefined" || recordingWindows.focusAllowed(taskTab.windowId)) ? chrome.windows.update(taskTab.windowId, { focused: true }) : null,
       ]),
       15_000,
       "visual_input_activation_timeout",
@@ -2026,7 +2057,7 @@ async function runTrustedVisualInput(tabId, method, params) {
           : await chrome.tabs.query({ active: true, windowId: targetWindowId });
         const lastFocused = await chrome.windows.getLastFocused();
         if (currentActive?.id === tabId && lastFocused?.id === targetWindowId) {
-          if (previousFocusedWindowId !== null && previousFocusedWindowId !== targetWindowId) {
+          if (previousFocusedWindowId !== null && previousFocusedWindowId !== targetWindowId && (typeof recordingWindows === "undefined" || recordingWindows.focusAllowed(previousFocusedWindowId))) {
             await chrome.windows.update(previousFocusedWindowId, { focused: true });
           }
           await chrome.tabs.update(previousActiveTabId, { active: true });
@@ -2173,7 +2204,7 @@ async function runTypeWithVerifiedPhysicalFallback(tabId, payload, params) {
   if (Number.isSafeInteger(physicalTab.windowId)) {
     await Promise.all([
       chrome.tabs.update(tabId, { active: true }),
-      chrome.windows.update(physicalTab.windowId, { focused: true }),
+      (typeof recordingWindows === "undefined" || recordingWindows.focusAllowed(physicalTab.windowId)) ? chrome.windows.update(physicalTab.windowId, { focused: true }) : null,
     ]);
   }
   const afterSemanticTarget = await runPageOperation(
@@ -2334,6 +2365,15 @@ async function executeCommand(method, params) {
       }));
     case "tabs.configure":
       await assertLiveOrigin(requireTabId(params.tabId), params);
+      if (params.recordingWindow) {
+        return recordingWindows.isolate({ tabId: params.tabId, width: params.recordingWindow.width,
+          maxSeconds: params.recordingWindow.maxSeconds, allowedOrigins: params.allowedOrigins ?? [] });
+      }
+      if (params.recordingMedia) {
+        await requireTrustedDebuggerAccess();
+        return recordingWindows.startMedia(params.tabId, () => startRecordingMedia(params.tabId));
+      }
+      if (params.endRecordingWindow) return recordingWindows.end(params.tabId);
       return configureTaskTab(chrome, params);
     case "page.configureViewport":
       await assertLiveOrigin(requireTabId(params.tabId), params);
@@ -2354,6 +2394,8 @@ async function executeCommand(method, params) {
       const tab = await chrome.tabs.create({
         url: requestedUrl,
         active: params.active === true,
+        // Never open another task's tab inside a recording window.
+        ...(typeof recordingWindows === "undefined" ? {} : await recordingWindows.windowForNewTab()),
       });
       finishPhase("tab_create");
       if (params.mutation && Number.isSafeInteger(tab.id)) {
@@ -2390,7 +2432,7 @@ async function executeCommand(method, params) {
     case "tabs.activate": {
       await assertLiveOrigin(requireTabId(params.tabId), params);
       const tab = await chrome.tabs.update(requireTabId(params.tabId), { active: true });
-      await chrome.windows.update(tab.windowId, { focused: true });
+      if ((typeof recordingWindows === "undefined" || recordingWindows.focusAllowed(tab.windowId))) await chrome.windows.update(tab.windowId, { focused: true });
       const activated = await chrome.tabs.get(tab.id);
       await assertLiveOrigin(activated.id, params);
       return sanitizeTab(activated);
@@ -4671,6 +4713,29 @@ async function injectedPageOperation(action, payload) {
     const rect = boxOf(element);
     return { element: describe(element), documentRect: { x: rect.x + scrollX, y: rect.y + scrollY, width: rect.width, height: rect.height },
       url: location.href, pageInstanceId, frameId: 0 };
+  }
+  if (action === "recordingMedia") {
+    // The page's main video: the one with the largest visible area. "locate" only reads where to
+    // click; "play" (after that click) plays it with sound from its start.
+    const visibleArea = video => { const r = video.getBoundingClientRect();
+      return Math.max(0, Math.min(r.right, innerWidth) - Math.max(r.left, 0)) * Math.max(0, Math.min(r.bottom, innerHeight) - Math.max(r.top, 0)); };
+    const videos = [...document.querySelectorAll("video")];
+    const video = videos.map(item => [item, visibleArea(item)]).filter(([, area]) => area > 0).sort((a, b) => b[1] - a[1])[0]?.[0];
+    if (!video) return { found: false, videos: videos.length, url: location.href, pageInstanceId };
+    if (payload.phase === "locate") {
+      const r = video.getBoundingClientRect();
+      return { found: true, videos: videos.length, x: Math.round(Math.max(1, Math.min(innerWidth - 1, r.left + r.width / 2))),
+        y: Math.round(Math.max(1, Math.min(innerHeight - 1, r.top + r.height / 2))), url: location.href, pageInstanceId };
+    }
+    try { video.currentTime = 0; } catch { /* a live stream cannot seek */ }
+    video.muted = false;
+    if (video.volume === 0) video.volume = 1;
+    let playError = null;
+    try { await video.play(); } catch (failure) { playError = String(failure?.name || failure).slice(0, 80); }
+    await new Promise(resolve => setTimeout(resolve, 400));
+    return { found: true, videos: videos.length, paused: video.paused, muted: video.muted,
+      durationSeconds: Number.isFinite(video.duration) ? Math.round(video.duration * 10) / 10 : null,
+      currentTime: Math.round(video.currentTime * 10) / 10, playError, url: location.href, pageInstanceId };
   }
   if (action === "inspectViewport") return { width: innerWidth, height: innerHeight, devicePixelRatio,
     scale: Number(globalThis.visualViewport?.scale ?? 1), url: location.href, pageInstanceId };

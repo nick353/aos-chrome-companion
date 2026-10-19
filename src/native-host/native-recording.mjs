@@ -5,6 +5,7 @@ import { createReadStream } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
+import { CompanionError } from "../shared/errors.mjs";
 
 const execFileAsync = promisify(execFile);
 const SUPPORT_DIR = join(homedir(), "Library", "Application Support", "AOS Chrome Companion");
@@ -15,7 +16,21 @@ const STOP_TIMEOUT_MS = 12_000;
 const TERMINATE_TIMEOUT_MS = 3_000;
 const KILL_TIMEOUT_MS = 1_500;
 
-const error = (code, message, details = {}) => Object.assign(new Error(message), { code, details });
+// CompanionError keeps code and details across the broker, so the AI sees why a recording did not
+// start (2026-10-19: a plain Error lost the recorder's reason on the way and arrived as internal_error).
+const error = (code, message, details = {}) => new CompanionError(code, message, details);
+
+// The recording window's place on screen, passed to the recorder so it records that window even
+// while another app is in front.
+export function recorderArguments(recordingPath, windowBounds) {
+  const args = ["--output", recordingPath];
+  if (windowBounds === undefined || windowBounds === null) return args;
+  const values = ["left", "top", "width", "height"].map(key => Number(windowBounds?.[key]));
+  if (!values.every(Number.isFinite) || values[2] <= 0 || values[3] <= 0) {
+    throw error("recording_window_bounds_invalid", "Give the recording window's left, top, width and height");
+  }
+  return [...args, "--bounds", values.join(",")];
+}
 const safeName = (value) => String(value || `companion-${Date.now()}`).replace(/[^a-zA-Z0-9._-]+/g, "-").slice(0, 120);
 
 function waitFor(promise, timeoutMs, code, message) {
@@ -140,7 +155,9 @@ export function createNativeRecordingController({
     await makeDirectory(recordingsDir, { recursive: true, mode: 0o700 });
     const filename = `${safeName(params.filename || `companion-${Date.now()}`)}.mov`;
     const recordingPath = join(recordingsDir, filename);
-    const child = spawnProcess(recorderPath, ["--output", recordingPath], { stdio: ["pipe", "pipe", "pipe"] });
+    const args = recorderArguments(recordingPath, params.windowBounds);
+    const captureTarget = args.includes("--bounds") ? "recording_window" : "frontmost_chrome_window";
+    const child = spawnProcess(recorderPath, args, { stdio: ["pipe", "pipe", "pipe"] });
     let resolveExit;
     const record = {
       child,
@@ -158,6 +175,7 @@ export function createNativeRecordingController({
       exitPromise: new Promise(resolve => { resolveExit = resolve; }),
       resolveExit,
       startPromise: null,
+      captureTarget,
       resolveStart: null,
       rejectStart: null,
     };
@@ -186,8 +204,9 @@ export function createNativeRecordingController({
     child.once("exit", (code, signal) => {
       record.exitInfo = { code, signal };
       if (!record.startSeen) {
-        record.rejectStart(error("recording_start_failed", "Native recording helper exited before confirming capture", {
-          code, signal, stderr: record.stderr.trim().slice(-2_000), stdout: record.stdout.trim().slice(-2_000),
+        const reason = /native_recording_[a-z_]+/u.exec(record.stderr)?.[0] ?? null;
+        record.rejectStart(error("recording_start_failed", `Native recording helper exited before confirming capture${reason ? ` (${reason})` : ""}`, {
+          code, signal, reason, stderr: record.stderr.trim().slice(-2_000), stdout: record.stdout.trim().slice(-2_000),
         }));
       } else if (record.phase === "recording") {
         record.phase = "helper_exited";
@@ -208,7 +227,7 @@ export function createNativeRecordingController({
         audioCaptured: false,
         audioTrackVerified: false,
         mediaVerified: false,
-        captureTarget: "frontmost_chrome_window",
+        captureTarget,
         surface: "chrome-window",
         captureEngine: "ScreenCaptureKit+SCRecordingOutput",
         scope: "window",
@@ -287,7 +306,7 @@ export function createNativeRecordingController({
           audioTrackVerified: media.audioTrackVerified === true,
           audioCaptured: media.audioTrackVerified === true,
           ...media,
-          captureTarget: "frontmost_chrome_window",
+          captureTarget: record.captureTarget,
           surface: "chrome-window",
           captureEngine: "ScreenCaptureKit+SCRecordingOutput",
           scope: "window",

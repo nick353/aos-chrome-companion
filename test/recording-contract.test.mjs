@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { EventEmitter } from "node:events";
 import { PassThrough, Writable } from "node:stream";
-import { createNativeRecordingController } from "../src/native-host/native-recording.mjs";
+import { createNativeRecordingController, recorderArguments } from "../src/native-host/native-recording.mjs";
 
 const root = resolve(import.meta.dirname, "..");
 
@@ -35,6 +35,10 @@ test("Native recording is installed as a ScreenCaptureKit audio path", async () 
   assert.match(source, /SCRecordingOutput/);
   assert.match(source, /com\.google\.Chrome/);
   assert.match(source, /frontmostChromeWindow/);
+  // The recording window is found by its place on screen, so Chrome need not be in front.
+  assert.match(source, /--bounds/);
+  assert.match(source, /chromeWindow\(matching: bounds/);
+  assert.match(source, /recording_window_ambiguous/);
   assert.doesNotMatch(source, /largestChromeWindow/);
   assert.match(source, /frontmostApplication/);
   assert.match(source, /audio_samples=/);
@@ -148,4 +152,11 @@ test("native recording stop escalates in bounded order and keeps failure truthfu
   assert.equal(controller.status().active, false);
   assert.equal(controller.status().audioCaptured, false);
   assert.equal(controller.status().phase, "failed");
+});
+
+test("The recorder is told which window to record by its place on screen", () => {
+  assert.deepEqual(recorderArguments("/r/a.mov"), ["--output", "/r/a.mov"]);
+  assert.deepEqual(recorderArguments("/r/a.mov", { left: 0, top: 25, width: 599, height: 875 }),
+    ["--output", "/r/a.mov", "--bounds", "0,25,599,875"]);
+  assert.throws(() => recorderArguments("/r/a.mov", { left: 0, top: 25, width: 0, height: 875 }), { code: "recording_window_bounds_invalid" });
 });
