@@ -50,3 +50,37 @@ test('signed inspection proofs are returned unchanged by compact formatting', ()
   const result = toolResult({ visualProof: proof, visual_readback_verified: true }).structuredContent.result;
   assert.deepEqual(result.visualProof, proof);
 });
+
+test('lean results keep action results, blocker, progress and resume data, and drop frames and target copies', () => {
+  const input = { ...transaction('unknown_effect'),
+    frames: Array.from({ length: 8 }, (_, i) => ({ frameId: i, url: `https://ads.example.test/${'x'.repeat(300)}`, pageInstanceId: `doc-${i}`, allowed: false })),
+    frame_origins: ['https://example.test', 'https://ads.example.test'],
+    target_resolution: { schema: 'adapter', diagnostics: { taskId: 'owner' } },
+    stale_generation_cleanup: { skipped: 'exact_tab_continuation' },
+    continuation: { allowed: false, reason: 'terminal_blocker', next_action: 'fresh_status', restart_point: 'task_failure_recovery', affected_target: { tab_id: 77 } },
+    pre: { url: 'https://example.test/a', title: 'A', page_instance_id: 'document', text_sha256: 'e'.repeat(64) },
+  };
+  input.actions = input.actions.map(action => ({ ...action, before: { url: 'u', text_sha256: 'a'.repeat(64) }, after: { url: 'u', text_sha256: 'b'.repeat(64) },
+    result: { ...action.result, element: { name: 'Post', role: 'button', tag: 'button', rect: { x: 1, y: 2, width: 3, height: 4 }, state: { focused: true } }, url: 'https://example.test/a' } }));
+  const lean = toolResult(input, { detail: 'lean' });
+  const compact = toolResult(input, { detail: 'compact' });
+  const result = lean.structuredContent.result;
+  assert.equal(result.detail, 'lean');
+  assert.equal(result.actions.length, 10);
+  assert.equal(result.actions[0].result.inputValueVerified, true);
+  assert.deepEqual(result.actions[0].result.element, { name: 'Post', role: 'button', tag: 'button' });
+  assert.equal(result.actions[0].before, undefined);
+  assert.equal(result.frames, undefined);
+  assert.equal(result.target_resolution, undefined);
+  assert.deepEqual(result.exact_blocker, input.exact_blocker);
+  assert.deepEqual(result.reconciliation, input.reconciliation);
+  assert.deepEqual(result.action_progress.uncertain_action_indices, [1]);
+  assert.equal(result.continuation.next_action, 'fresh_status');
+  assert.equal(result.continuation.affected_target, undefined);
+  assert.deepEqual(result.pre, { url: 'https://example.test/a', title: 'A' });
+  assert.equal(result.capsule.capsuleId, 'capsule');
+  assert.equal(result.capsule.target, undefined);
+  assert.deepEqual(result.next_target_read.arguments, { sessionId: 'session', tabId: 77 });
+  assert.equal(result.browser_mutation_executed, null);
+  assert.ok(JSON.stringify(result).length < JSON.stringify(compact.structuredContent.result).length * 0.5);
+});

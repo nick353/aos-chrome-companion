@@ -138,7 +138,8 @@ export function toolResult(value, { textDetail = 'full', detail = 'full', screen
     }
   }
   if (metadata?.schema === 'aos.chrome_companion.transaction.v1') {
-    if (detail === 'compact') compactTransaction(metadata);
+    if (detail === 'compact' || detail === 'lean') compactTransaction(metadata);
+    if (detail === 'lean') leanTransaction(metadata);
     // Per-operation timings are diagnostics (30% of a transaction's text on 2026-10-19) that a Codex
     // task prints and then re-reads on every model call; it gets the total only. The broker keeps them.
     if (!inlineImages && metadata.operation_timing) {
@@ -149,7 +150,7 @@ export function toolResult(value, { textDetail = 'full', detail = 'full', screen
         errors: operations.filter(op => op?.error_code).map(op => ({ method: op.method, error_code: op.error_code })),
       };
     }
-    metadata.detail = detail === 'compact' ? 'compact' : 'full';
+    metadata.detail = detail === 'compact' || detail === 'lean' ? detail : 'full';
   }
   const textValue = textDetail === 'summary' ? transactionTextSummary(metadata) : metadata;
   // The proof goes first, before the picture: a run that prints the whole result got it cut off
@@ -184,6 +185,55 @@ function compactTransaction(metadata) {
     const kept = ['schema', 'capsuleId', 'workflowType', 'taskId', 'runId', 'state', 'target', 'resources', 'effect',
       'blocker', 'restartPoint', 'resumeToken', 'completion', 'retention', 'updatedAt'];
     metadata.capsule = Object.fromEntries(kept.filter(key => capsule[key] !== undefined).map(key => [key, capsule[key]]));
+  }
+}
+
+// Claude Code reads every result into its conversation: on 2026-10-20 a Web test of about 60 transactions
+// filled 78% of a 1M-token context (about 10k tokens each, mostly frame lists, target copies and
+// per-action before/after digests). Lean keeps what the next step needs — each action's result, the
+// blocker, progress, effect boundaries, resume and reconciliation ids, the saved picture — and drops the
+// rest; detail=full still returns everything.
+const LEAN_ELEMENT_KEYS = ['name', 'role', 'tag', 'testId', 'text', 'visible', 'disabled', 'checked', 'selectedText', 'valueLength', 'valuePresent', 'fileCount'];
+
+function leanElement(element) {
+  if (!element || typeof element !== 'object') return element;
+  return Object.fromEntries(LEAN_ELEMENT_KEYS.filter(key => element[key] !== undefined && element[key] !== null).map(key => [key, element[key]]));
+}
+
+function leanTransaction(metadata) {
+  for (const key of ['frames', 'frame_origins', 'target_resolution', 'stale_generation_cleanup', 'execution_surface', 'profile', 'run_id', 'task_id', 'target_ready_wait', 'visual_readback_attempts', 'effect_state_scope']) {
+    delete metadata[key];
+  }
+  for (const key of ['pre', 'post']) {
+    if (metadata[key]) metadata[key] = { url: metadata[key].url, title: metadata[key].title };
+  }
+  for (const action of [...(metadata.actions ?? [])]) {
+    delete action.before;
+    delete action.after;
+    delete action.timings_ms;
+    const result = action.result;
+    if (result && typeof result === 'object') {
+      for (const key of ['url', 'pageInstanceId', 'frameId', 'visualized', 'pointerAnimated']) delete result[key];
+      if (result.element) result.element = leanElement(result.element);
+      if (Array.isArray(result.matches)) result.matches = result.matches.map(match => ({ ...leanElement(match), ...(match.attributes ? { attributes: match.attributes } : {}) }));
+    }
+  }
+  if (metadata.exact_blocker && typeof metadata.exact_blocker === 'object') {
+    const { code, message, details, next_action } = metadata.exact_blocker;
+    metadata.exact_blocker = { code, message, ...(details ? { details } : {}), ...(next_action ? { next_action } : {}) };
+  }
+  if (metadata.continuation) {
+    const { allowed, reason, next_action, restart_point, task_may_continue } = metadata.continuation;
+    metadata.continuation = { allowed, reason, next_action, restart_point, ...(task_may_continue !== undefined ? { task_may_continue } : {}) };
+  }
+  if (metadata.capsule) {
+    const { capsuleId, state, restartPoint, resumeToken } = metadata.capsule;
+    metadata.capsule = { capsuleId, state, ...(restartPoint ? { restartPoint } : {}), ...(resumeToken ? { resumeToken } : {}) };
+  }
+  if (metadata.timings_ms) metadata.timings_ms = { total: metadata.timings_ms.total };
+  if (metadata.visual_readback && typeof metadata.visual_readback === 'object') {
+    const { kind, savedPath, url, title, capturedAt, picture } = metadata.visual_readback;
+    metadata.visual_readback = { kind, ...(savedPath ? { savedPath } : {}), url, title, capturedAt, ...(picture ? { picture } : {}) };
   }
 }
 

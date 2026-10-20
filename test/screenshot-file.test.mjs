@@ -116,3 +116,12 @@ test('for Codex a transaction keeps only the total of its per-operation timings'
   const other = toolResult(tx()).structuredContent.result;
   assert.equal(other.operation_timing.operations.length, 2, 'other clients keep every timing');
 });
+
+test('Claude Code callers are told apart from Codex tasks for the lean result', async () => {
+  const { calledByClaudeCode } = await import('../src/mcp/task-context.mjs');
+  assert.equal(calledByClaudeCode(undefined, { CLAUDECODE: '1' }), true);
+  assert.equal(calledByClaudeCode(undefined, { CODEX_THREAD_ID: 'claude-code-5b79f63e' }), true);
+  assert.equal(calledByClaudeCode(undefined, { CODEX_THREAD_ID: '01a1' }), false);
+  assert.equal(calledByClaudeCode({ _meta: { 'openai/threadId': '01a15440' } }, { CLAUDECODE: '1' }), false, 'a Codex task stays compact');
+  assert.equal(calledByClaudeCode(undefined, {}), false);
+});

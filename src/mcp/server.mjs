@@ -10,7 +10,7 @@ import { validateLocatorTree } from "./locator-validation.mjs";
 import { defaultScreenshotDir, sessionTag, toolResult, taskStatus } from "./result.mjs";
 import { normalizeError, CompanionError } from "../shared/errors.mjs";
 import { materializeTransactionActions } from "./action-materializer.mjs";
-import { bindCodexTaskId, calledByCodex, McpTaskBindingRegistry, resolveCodexTaskId } from "./task-context.mjs";
+import { bindCodexTaskId, calledByClaudeCode, calledByCodex, McpTaskBindingRegistry, resolveCodexTaskId } from "./task-context.mjs";
 import { normalizeBinaryClipboardRequest } from "../shared/peripheral-policy.mjs";
 import { readUrls } from "./read-urls.mjs";
 import { withSiteAliases } from "../shared/site-aliases.mjs";
@@ -134,7 +134,10 @@ function guarded(handler, { summarizeTransactionText = false } = {}) {
         textDetail: summarizeTransactionText && args.responseDetail !== "full" ? "summary" : "full",
         // A Codex task prints the whole result and re-reads it on every model call: compact unless it
         // asks for full (2026-10-19). Results, progress, unknown effects and cleanup stay in every mode.
-        detail: args.responseDetail === "compact" || (codex && args.responseDetail !== "full") ? "compact" : "full",
+        // Claude Code gets the lean result unless it asks for compact or full (2026-10-20).
+        detail: args.responseDetail === "lean" || (calledByClaudeCode(extra) && !["full", "compact"].includes(args.responseDetail))
+          ? "lean"
+          : args.responseDetail === "compact" || (codex && args.responseDetail !== "full") ? "compact" : "full",
         screenshotDir: SCREENSHOT_DIR,
         screenshotTag: sessionTag(args?.sessionId),
         inlineImages: !codex,
@@ -734,7 +737,7 @@ server.registerTool("companion_authorized_transaction", {
     taskId: z.string().min(1).optional(),
     idempotencyKey: z.string().min(1),
     intent: z.enum(["authorized_transaction", "direct_application"]).default("authorized_transaction"),
-    responseDetail: z.enum(["summary", "full", "compact"]).default("summary").describe("Concise text with complete structuredContent by default; full restores the complete JSON text. compact also removes duplicate structured evidence. Read/action results, partial progress, unknown effects and cleanup remain in every mode."),
+    responseDetail: z.enum(["summary", "full", "compact", "lean"]).default("summary").describe("Concise text with complete structuredContent by default; full restores the complete JSON text. compact also removes duplicate structured evidence. lean (the default for Claude Code) keeps only each action result, blocker, progress, effect boundaries, resume ids and the saved picture. Read/action results, partial progress, unknown effects and cleanup remain in every mode."),
     targetOrigin: z.string().url().optional(),
     startUrl: z.string().url(),
     tabId: z.number().int().nonnegative().optional().describe("Continue this exact task-owned tab at its current URL without reloading startUrl. Use the tab.id from the previous result. A missing, foreign, busy or protected tab fails without opening a replacement."),

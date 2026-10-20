@@ -193,6 +193,13 @@ export class McpTaskBindingRegistry {
 
 // A call from a Codex task (its thread id in the request metadata or this process's environment) gets
 // screenshots as saved files only; other clients (Claude Code) see the pictures (result.mjs).
+// A call from Claude Code (the operator and the owner's conversations): it gets the lean result
+// (result.mjs) unless it asks for full, since every result stays in its conversation (2026-10-20).
+export function calledByClaudeCode(extra, env = process.env) {
+  if (calledByCodex(extra, env)) return false;
+  return env?.CLAUDECODE === "1" || /^claude-code-/u.test(String(env?.CODEX_THREAD_ID ?? ""));
+}
+
 export function calledByCodex(extra, env = process.env) {
   try {
     if (resolveHostCodexTaskId(extra)) return true;
