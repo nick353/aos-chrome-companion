@@ -210,9 +210,13 @@ async function captureExactTabScreenshot(tabId, { quality = DEFAULT_SCREENSHOT_Q
   const activated = (info) => {
     if (info.windowId === target.windowId && info.tabId !== tabId) interrupted = activationInterruption = true;
   };
+  // A "loading" status alone does not stop the capture: LinkedIn and other busy pages flip the tab to
+  // loading without leaving the document (27 refusals on LinkedIn, all with the same URL, 2026-10-19/20).
+  // The committed-document probe below decides: same URL, no pending navigation, DOM not loading, and
+  // the same document identity before and after the capture. A real navigation fails that probe.
   const updated = (id, info) => {
     if (id !== tabId) return;
-    if (info.status === "loading") interrupted = loadingInterruption = true;
+    if (info.status === "loading") loadingInterruption = true;
     if (info.url && info.url !== target.url) interrupted = urlInterruption = true;
   };
   const assertTarget = async (phase, attempt) => {
@@ -222,14 +226,14 @@ async function captureExactTabScreenshot(tabId, { quality = DEFAULT_SCREENSHOT_Q
     let documentChanged = false;
     let readinessError = null;
     const loadingChanged = current.status === "loading" && target.status !== "loading";
-    if (!interrupted && active[0]?.id === tabId && current.windowId === target.windowId && current.url === target.url && !loadingChanged) {
+    if (!interrupted && active[0]?.id === tabId && current.windowId === target.windowId && current.url === target.url) {
       try {
         const document = await probeCommittedDocument(tabId, { expectedWindowId: target.windowId, expectedUrl: target.url, allowedOrigins });
         documentChanged = captureDocumentId !== null && document.documentId !== captureDocumentId;
         if (captureDocumentId === null) captureDocumentId = document.documentId;
       } catch (error) { readinessError = error; }
     }
-    if (interrupted || active[0]?.id !== tabId || current.windowId !== target.windowId || current.url !== target.url || loadingChanged || readinessError || documentChanged) {
+    if (interrupted || active[0]?.id !== tabId || current.windowId !== target.windowId || current.url !== target.url || readinessError || documentChanged) {
       // Retain observed interruption causes even if the tab returns to its original state.
       // IDs and booleans are sufficient for diagnosis; never expose either document URL.
       const numericId = (id) => Number.isSafeInteger(id) ? id : null;

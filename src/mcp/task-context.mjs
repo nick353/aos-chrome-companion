@@ -199,6 +199,9 @@ export function calledByCodex(extra, env = process.env) {
   } catch {
     return true; // conflicting Codex ids: still a Codex call
   }
+  // Claude Code starts its Companion with CODEX_THREAD_ID=claude-code-… too (the task identity), so the
+  // environment counts only outside Claude Code (2026-10-20: Claude's calls got no pictures).
+  if (env?.CLAUDECODE === "1" || /^claude-code-/u.test(String(env?.CODEX_THREAD_ID ?? ""))) return false;
   const set = (value) => typeof value === "string" && value.trim() !== "";
   return set(env?.CODEX_THREAD_ID) || set(env?.CODEX_SESSION_ID);
 }

@@ -98,6 +98,10 @@ test('a call is from Codex when its metadata or its process carries a Codex thre
   assert.equal(calledByCodex(undefined, { CODEX_THREAD_ID: '01a1' }), true);
   assert.equal(calledByCodex(undefined, { CODEX_SESSION_ID: ' ' }), false);
   assert.equal(calledByCodex({ _meta: { 'openai/threadId': '01a15440' } }, {}), true);
+  // Claude Code's Companion carries CODEX_THREAD_ID=claude-code-… and CLAUDECODE=1: not Codex.
+  assert.equal(calledByCodex(undefined, { CODEX_THREAD_ID: 'claude-code-5b79f63e', CLAUDECODE: '1' }), false);
+  assert.equal(calledByCodex(undefined, { CODEX_THREAD_ID: 'claude-code-5b79f63e' }), false);
+  assert.equal(calledByCodex({ _meta: { 'openai/threadId': '01a15440' } }, { CLAUDECODE: '1' }), true, "Codex's own metadata still wins");
   assert.equal(calledByCodex({ _meta: { 'openai/threadId': 'a', codexThreadId: 'b' } }, {}), true, 'conflicting ids are still Codex');
 });
 

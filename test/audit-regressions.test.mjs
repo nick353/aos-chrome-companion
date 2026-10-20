@@ -249,7 +249,8 @@ for (const [reason, change] of [
   ['activeTabMismatch', api => api.setCurrent({ active: 202 })],
   ['windowMismatch', api => api.setCurrent({ windowId: 2 })],
   ['urlMismatch', api => api.setCurrent({ url: 'https://owned.example/changed' })],
-  ['loading', api => api.setCurrent({ status: 'loading' })],
+  // Loading counts when the document itself is still loading; a status flip alone does not (below).
+  ['loading', api => { api.setCurrent({ status: 'loading' }); api.setDocument({ readyState: 'loading' }); }],
 ]) {
   test(`capture diagnostic isolates ${reason} without conflating other causes`, async () => {
     const f = screenshotFixture({ wait: change });
@@ -292,7 +293,7 @@ test('capture diagnostic retains simultaneous reasons with bounded redacted outp
 });
 test('capture diagnostic preserves transient document interruption causes', async () => {
   for (const [reason, change] of [
-    ['loading', api => api.loadingThenComplete()],
+    ['loading', api => { api.loadingThenComplete(); api.setDocument({ documentId: 'browser-document-2' }); }],
     ['urlMismatch', api => { api.navigate(); api.setCurrent({ url: 'https://owned.example/' }); }],
   ]) {
     const f = screenshotFixture({ capture: change });
@@ -320,7 +321,7 @@ test('capture diagnostic attempt counts remain bounded across read retries and q
   const oversized = `data:image/jpeg;base64,${'a'.repeat(140000)}`;
   const f = screenshotFixture({ capture: api => {
     if (api.captures === 1 || api.captures === 3) throw new Error('image readback failed');
-    if (api.captures === 4) api.setCurrent({ status: 'loading' });
+    if (api.captures === 4) { api.setCurrent({ status: 'loading' }); api.setDocument({ readyState: 'loading' }); }
     return oversized;
   } });
   await assert.rejects(f.run({ maxBytes: 100000 }), error => error.code === 'screenshot_target_changed'
@@ -392,9 +393,19 @@ for (const [phase, hooks, captureCount] of [
   });
 }
 test('initial interactive loading does not relax subsequent loading events or activation interruptions', async () => {
-  for (const change of [api => api.loadingThenComplete(), api => { api.switchTo(202); api.switchTo(101); }]) {
+  for (const change of [api => { api.loadingThenComplete(); api.setDocument({ documentId: 'browser-document-2' }); }, api => { api.switchTo(202); api.switchTo(101); }]) {
     const f = screenshotFixture({ initialStatus: 'loading', readyState: 'interactive', capture: change });
     await assert.rejects(f.run(), { code: 'screenshot_target_changed' });
+    assert.equal(f.api.captures, 1);
+  }
+});
+// LinkedIn flips the tab to loading without leaving the document: 27 screenshots were refused there on
+// 2026-10-19/20, all with the same URL. The committed-document probe decides instead.
+test('a loading flip on the same committed document does not stop the capture', async () => {
+  for (const hooks of [{ capture: api => api.loadingThenComplete() }, { wait: api => api.setCurrent({ status: 'loading' }) }, { capture: api => api.setCurrent({ status: 'loading' }) }]) {
+    const f = screenshotFixture(hooks);
+    const result = await f.run();
+    assert.equal(result.dataBase64, 'aGVsbG8=');
     assert.equal(f.api.captures, 1);
   }
 });
