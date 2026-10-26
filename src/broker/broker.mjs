@@ -5163,6 +5163,11 @@ export class CompanionBroker extends EventEmitter {
             locator,
             targetDocument,
             digest: semanticTargetStateDigest(this.ledgerSecret, locator, inspection),
+            // Which element the page itself remembered. A node that is still the
+            // same one is not a replaced target, even when the page shifted under
+            // it (2026-10-26: ads and countdowns on www.etsy.com moved the button
+            // 4px and every page.type/selectOption stopped 18 times in one run).
+            elementRef: typeof inspection?.elementRef === "string" ? inspection.elementRef : null,
             semanticGuardId: ["page.click", "page.submit"].includes(method)
               && typeof inspection.semanticGuard?.id === "string"
               && inspection.semanticGuard.id.length <= 128
@@ -5177,7 +5182,8 @@ export class CompanionBroker extends EventEmitter {
             sessionId: session.sessionId,
             leaseId: lease.leaseId,
             method: "visual.inspectTarget",
-            params: { tabId: taskTab.id, locator: actionTargetPrecondition.locator, scroll: false, allowedOrigins },
+            params: { tabId: taskTab.id, locator: actionTargetPrecondition.locator, scroll: false, allowedOrigins,
+              ...(actionTargetPrecondition.elementRef ? { elementRef: actionTargetPrecondition.elementRef } : {}) },
           });
           liveTarget = await this.#bindSemanticInspectionToDocument(peer, {
             sessionId: session.sessionId,
@@ -5188,10 +5194,14 @@ export class CompanionBroker extends EventEmitter {
             approvedDocument: actionTargetPrecondition.targetDocument,
           });
           const liveDigest = semanticTargetStateDigest(this.ledgerSecret, actionTargetPrecondition.locator, liveTarget);
+          // The page says whether its remembered node is still this locator's
+          // target. That identity is stronger evidence than an unchanged
+          // rectangle, so a moved button is not a replaced one.
+          const sameNode = actionTargetPrecondition.elementRef !== null && liveTarget?.elementRefMatched === true;
           if ((liveTarget?.frameId ?? 0) !== actionTargetPrecondition.targetDocument.frameId
             || liveTarget?.pageInstanceId !== actionTargetPrecondition.targetDocument.pageInstanceId
             || String(liveTarget?.url || "") !== String(actionTargetPrecondition.targetDocument.url || "")
-            || liveDigest !== actionTargetPrecondition.digest) {
+            || (!sameNode && liveDigest !== actionTargetPrecondition.digest)) {
             throw new CompanionError("transaction_action_target_changed", "The signed semantic action target identity, state, or rectangle changed before mutation dispatch");
           }
         }

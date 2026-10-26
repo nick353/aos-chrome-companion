@@ -1289,15 +1289,25 @@ async function createCapsuleHarness({ failVisualInspectionFor = null, failPostTy
         const locatorKey = JSON.stringify(message.params?.locator ?? {});
         const inspectionCount = (visualInspectionCounts.get(locatorKey) ?? 0) + 1;
         visualInspectionCounts.set(locatorKey, inspectionCount);
-        const shifted = message.params?.locator?.testId === "replace-before-dispatch" && inspectionCount > 1;
+        // replace-before-dispatch: a different node appears at the same locator.
+        // shifted-same-node: the same node moved a few pixels (ads/countdowns).
+        const testId = message.params?.locator?.testId;
+        const replaced = testId === "replace-before-dispatch" && inspectionCount > 1;
+        const moved = testId === "shifted-same-node" && inspectionCount > 1;
+        const rectX = replaced ? 20 : moved ? 14 : 10;
+        const elementRef = `ref-${locatorKey}-${replaced ? "replacement" : "original"}`;
+        const elementRefMatched = message.params?.elementRef === undefined
+          ? undefined : message.params.elementRef === elementRef;
         extension.send({ kind: "command.result", operationId: message.operationId, result: {
           url: tab?.url ?? "https://example.test/",
           pageInstanceId: `document-${tabId}-${tab?.url}`,
           element: { tag: "button", role: "button", name: message.params?.locator?.testId ?? message.params?.locator?.text ?? "target", testId: message.params?.locator?.testId ?? null },
-          rect: { x: shifted ? 20 : 10, y: 10, width: 100, height: 30 },
-          clippedRect: { x: shifted ? 20 : 10, y: 10, width: 100, height: 30 },
-          point: { x: shifted ? 70 : 60, y: 25 },
+          rect: { x: rectX, y: 10, width: 100, height: 30 },
+          clippedRect: { x: rectX, y: 10, width: 100, height: 30 },
+          point: { x: rectX + 50, y: 25 },
           viewport: { width: 1200, height: 800, devicePixelRatio: 1 },
+          elementRef,
+          ...(elementRefMatched !== undefined ? { elementRefMatched } : {}),
           ...(semanticGuards ? { semanticGuard: { id: `fresh-${tabId}-${inspectionCount}`, methods: ["page.click", "page.submit"], expiresAt: Date.now() + 30000 } } : {}),
         } });
       } else if (message.method === "page.upload" || message.method === "page.uploadMultiple") {
@@ -2517,6 +2527,28 @@ test("multi-action transactions reject replaced targets and require a fresh chec
     assert.equal(unavailableHistory.exact_blocker.code, "history_entry_unavailable");
     assert.equal(unavailableHistory.reconciliation, undefined);
     assert.equal(unavailableHistory.cleanup.closed, true);
+  } finally {
+    await harness.close();
+  }
+});
+
+test("a button that moved a few pixels is still the same target", async () => {
+  // www.etsy.com shifts its buttons while ads and countdowns load. The page
+  // remembered the exact node, so an unchanged identity is not a replaced
+  // target even though the rectangle changed (18 stops in one run on 10-26).
+  const harness = await createCapsuleHarness();
+  const { client, session, commands } = harness;
+  const origin = "https://example.test";
+  try {
+    const shifted = await client.requestAuthorizedTransaction({
+      sessionId: session.sessionId, runId: "run_shifted_same_node", taskId: "capsule_task",
+      idempotencyKey: "idem_shifted_same_node", targetOrigin: origin, startUrl: `${origin}/form`,
+      allowedOrigins: [origin],
+      actions: [{ method: "page.type", params: { locator: { testId: "shifted-same-node" }, text: "hello" } }],
+      capsule: { workflowType: "Jobs", targetKey: "run_shifted_same_node" },
+    });
+    assert.equal(shifted.result, "verified", JSON.stringify(shifted.exact_blocker));
+    assert.equal(commands.filter((command) => command.method === "page.type" && command.params?.locator?.testId === "shifted-same-node").length, 1);
   } finally {
     await harness.close();
   }
