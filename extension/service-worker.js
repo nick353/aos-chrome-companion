@@ -1,4 +1,5 @@
 import { mergeSemanticSnapshotResults } from "./semantic-snapshot.js";
+import { notifyPopupTarget } from "./popup-notification.js";
 import { NativeCommandAssembler } from "./native-command-transfer.js";
 import { checkFrameOrigin } from "./frame-origin.js";
 import { DebuggerSessionPool, PageObservations } from "./page-observation.js";
@@ -6462,6 +6463,9 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 // fire again, so reconnect on the first tab/window activity as well. The
 // request is throttled and remains a no-op while a native port is healthy.
 chrome.tabs.onCreated.addListener(tab => { pageObservations.tabCreated(tab); requestReconnect(); });
+chrome.webNavigation.onCreatedNavigationTarget.addListener(details => {
+  void notifyPopupTarget(details, { tabs: chrome.tabs, current: () => ({ ...runtimeState }), send: postNativeMessage });
+});
 chrome.tabs.onUpdated.addListener((tabId, _change, tab) => pageObservations.tabUpdated(tabId, tab));
 chrome.tabs.onActivated.addListener(() => requestReconnect());
 chrome.runtime.onConnect.addListener(() => requestReconnect());

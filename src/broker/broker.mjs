@@ -1755,6 +1755,44 @@ export class CompanionBroker extends EventEmitter {
   }
 
   async #handleExtensionEvent(peer, message) {
+    if (message.event === "task.tab.popup_created") {
+      const profile = this.profiles.get(message.profileInstanceId);
+      if (peer.authenticated !== true || peer.role !== "extension-relay"
+        || !profile?.connected || profile.peerId !== peer.id
+        || !peer.profileInstanceIds.has(message.profileInstanceId)
+        || profile.generation !== message.generation) {
+        throw new CompanionError("popup_source_binding_mismatch", "Popup notification does not belong to the current authenticated Chrome profile");
+      }
+      if (!Number.isSafeInteger(message.sourceTabId) || !Number.isSafeInteger(message.tabId)
+        || message.sourceTabId === message.tabId || !Number.isSafeInteger(message.windowId)) return;
+      const source = this.taskTabs.get(this.#tabKey(message.profileInstanceId, message.sourceTabId));
+      const childKey = this.#tabKey(message.profileInstanceId, message.tabId);
+      const sourceSession = source && this.sessions.get(source.sessionId);
+      const childLease = this.leases.get(this.tabLeaseIndex.get(childKey));
+      let url;
+      try { url = new URL(message.url); } catch { return; }
+      // Only Chrome's actual navigation source grants this lineage. A shared
+      // origin, a newly appearing tab or a read-only lease never grants it.
+      if (!source?.taskId || source.generation !== profile.generation || source.quarantine
+        || !sourceSession || sourceSession.taskId !== source.taskId
+        || sourceSession.generation !== profile.generation || isLedgerOnlyTaskTab(source)
+        || !/^https?:$/u.test(url.protocol) || this.taskTabs.has(childKey)
+        || this.taskLedger.getTaskTab(message.profileInstanceId, message.tabId)
+        || (childLease && childLease.sessionId !== source.sessionId)) return;
+      const popup = { profileInstanceId: source.profileInstanceId, generation: source.generation,
+        taskId: source.taskId, runId: source.runId, sessionId: source.sessionId,
+        tabId: message.tabId, windowId: message.windowId, popupSourceTabId: source.tabId,
+        operationId: null, targetKey: `url:${url.href}`, canonicalLocator: null,
+        workflowType: "browser_popup", capsuleId: null, lifecycleState: "discovered",
+        retentionPolicy: "retain", userHelpRequired: false, resumeToken: null,
+        retentionReason: "browser_observed_task_popup",
+        whyTabWasKept: "Chrome reported a new navigation target from this task's exact owned tab.",
+        resumeAction: "continue_current_task_then_finalize", createdAt: nowIso(), updatedAt: nowIso() };
+      const identity = normalizeTargetIdentity({ ...popup, leaseId: null, pageInstanceId: null, frameId: 0, origin: url.origin });
+      await this.taskLedger.recordTaskTab({ ...popup, targetIdentity: identity,
+        targetFingerprint: targetIdentityDigest(this.ledgerSecret, identity) });
+      this.taskTabs.set(childKey, this.taskLedger.getTaskTab(message.profileInstanceId, message.tabId));
+    }
     if (message.event === "debugger.cleanup") {
       const entry = this.taskLedger.getOperationById(message.operationId);
       const binding = entry?.binding;
@@ -2573,6 +2611,9 @@ export class CompanionBroker extends EventEmitter {
 
   async #closeSession(peer, paramsValue) {
     const params = typeof paramsValue === "string" ? { sessionId: paramsValue } : paramsValue;
+    if (params.abandonUserHelp === true && params.taskTerminal !== true) {
+      throw new CompanionError("explicit_terminal_required", "Abandoning user-help tabs requires explicit taskTerminal=true");
+    }
     const session = this.#requireOwnedSession(peer, params.sessionId, { allowBuildMismatch: params.taskTerminal === false });
     const leaseCountBeforeClose = session.leaseIds.size;
     let terminalTabCleanup = { ok: true, status: "skipped", reason: "task_terminal_false" };
@@ -2580,6 +2621,7 @@ export class CompanionBroker extends EventEmitter {
       terminalTabCleanup = await this.#finalizeSessionTerminalTabs(peer, session, {
         allowPreEffectCleanup: params.taskTerminal !== false,
         explicitTaskTerminal: params.taskTerminal === true,
+        abandonUserHelp: params.abandonUserHelp === true,
       }).then(async (result) => {
         // Startup may already have removed both task-tab records. Only the
         // pinned original capsule/operation can anchor this terminal fallback.
@@ -2739,7 +2781,7 @@ export class CompanionBroker extends EventEmitter {
     return receipt;
   }
 
-  async #finalizeSessionTerminalTabs(peer, session, { allowPreEffectCleanup = false, explicitTaskTerminal = false } = {}) {
+  async #finalizeSessionTerminalTabs(peer, session, { allowPreEffectCleanup = false, explicitTaskTerminal = false, abandonUserHelp = false } = {}) {
     const result = {
       schema: "aos.chrome_companion.owner_cleanup_receipt.v1",
       ok: true,
@@ -2841,15 +2883,21 @@ export class CompanionBroker extends EventEmitter {
         continue;
       }
       if (entry.lifecycleState === "awaiting_user") {
-        result.retained.push({
-          tabId: entry.tabId,
-          user_help_required: true,
-          retention_reason: entry.retentionReason ?? "user_help_required",
-          why_tab_was_kept: entry.whyTabWasKept ?? "The task-owned tab contains the exact user-only action needed to resume safely.",
-          required_user_action: entry.requiredUserAction ?? null,
-          resume_action: entry.resumeAction ?? null,
-        });
-        continue;
+        if (abandonUserHelp && explicitTaskTerminal && !pendingTaskIds.has(entry.taskId)) {
+          // 画面だけを閉じる。本人確認や送信を行わず、元の証跡は変更しない。
+          entry = { ...entry, lifecycleState: "failed", retentionPolicy: "cleanup",
+            userHelpRequired: false, resumeToken: null };
+        } else {
+          result.retained.push({
+            tabId: entry.tabId,
+            user_help_required: true,
+            retention_reason: entry.retentionReason ?? "user_help_required",
+            why_tab_was_kept: entry.whyTabWasKept ?? "The task-owned tab contains the exact user-only action needed to resume safely.",
+            required_user_action: entry.requiredUserAction ?? null,
+            resume_action: entry.resumeAction ?? null,
+          });
+          continue;
+        }
       }
       if (entry.capsuleId === VIEWPORT_CLEANUP_AMENDMENT.capsuleId && entry.retentionReason === "local_ui_effect_unknown") {
         let maintenanceLease = lease;

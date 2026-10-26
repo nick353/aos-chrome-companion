@@ -1049,6 +1049,69 @@ test("profile reconnect closes inactive ownerless ledger-only tabs without touch
   }
 });
 
+test("別タブの実際の開き元を記録し、終了時は元と子だけを閉じる", async () => {
+  const h = await createCapsuleHarness();
+  try {
+    const parent = await h.client.requestAuthorizedTransaction({ sessionId: h.session.sessionId,
+      taskId: h.session.taskId, runId: "popup-parent", idempotencyKey: "popup-parent",
+      startUrl: "https://example.test/jobs", allowedOrigins: ["https://example.test"], keepTaskTab: true,
+      actions: [{ method: "page.waitFor", params: { locator: { testId: "ready" }, timeoutMs: 100 } }] });
+    const child = { id: 20000, windowId: 2, url: "https://example.test/apply", openerTabId: 1, active: true };
+    const manual = { id: 1, windowId: 1, url: "https://example.test/manual" };
+    h.liveTabs.set(child.id, child);
+    h.liveTabs.set(manual.id, manual);
+    const notification = { kind: "extension.event", event: "task.tab.popup_created",
+      profileInstanceId: h.session.profileInstanceId, generation: h.session.generation,
+      sourceTabId: parent.tab.id, tabId: child.id, windowId: child.windowId, url: child.url };
+    const mismatch = onceMessage(h.extensionPeer, m => m.kind === "peer.error");
+    h.extensionPeer.send({ ...notification, generation: "old-generation" });
+    assert.equal((await mismatch).error.code, "popup_source_binding_mismatch");
+    h.extensionPeer.send({ ...notification, sourceTabId: manual.id, tabId: 20001 });
+    const recorded = new Promise(resolve => h.broker.once("extension.event", resolve));
+    h.extensionPeer.send(notification);
+    await recorded;
+    const record = h.broker.taskLedger.getTaskTab(h.session.profileInstanceId, child.id);
+    assert.equal(record.taskId, h.session.taskId);
+    assert.equal(record.popupSourceTabId, parent.tab.id);
+    assert.equal(record.targetIdentity.tabId, child.id);
+    assert.equal(h.broker.taskLedger.getTaskTab(h.session.profileInstanceId, 20001), null);
+    const closed = await h.client.request("session.close", { sessionId: h.session.sessionId, taskTerminal: true });
+    assert.ok(closed.cleanup_receipt.closed.includes(child.id));
+    assert.ok(closed.cleanup_receipt.closed.includes(parent.tab.id));
+    assert.equal(h.liveTabs.has(child.id), false);
+    assert.equal(h.liveTabs.has(manual.id), true);
+  } finally { await h.close(); }
+});
+
+test("本人待ちの画面は明示した終了時だけ閉じ、元の証跡は変えない", async () => {
+  for (const abandon of [false, true]) {
+    const h = await createCapsuleHarness();
+    try {
+      const tab = { id: 20010, windowId: 1, url: "https://example.test/apply", active: true };
+      h.liveTabs.set(tab.id, tab);
+      const entry = await h.broker.taskLedger.recordTaskTab({ profileInstanceId: h.session.profileInstanceId,
+        generation: h.session.generation, taskId: h.session.taskId, sessionId: h.session.sessionId,
+        runId: "waiting", tabId: tab.id, lifecycleState: "awaiting_user", retentionPolicy: "retain",
+        userHelpRequired: true, retentionReason: "visible_captcha", requiredUserAction: "本人確認" });
+      h.broker.taskTabs.set(`${h.session.profileInstanceId}:${tab.id}`, entry);
+      if (abandon) await assert.rejects(h.client.request("session.close", { sessionId: h.session.sessionId,
+        abandonUserHelp: true }), e => e.code === "explicit_terminal_required");
+      const originalKey = "original-unknown-submit";
+      await h.broker.taskLedger.prepare({ idempotencyKey: originalKey, fingerprint: "original-fingerprint",
+        binding: { taskId: h.session.taskId, tabId: tab.id, method: "page.submit" } });
+      await h.broker.taskLedger.transition(originalKey, "dispatched", { dispatchCount: 1 });
+      await h.broker.taskLedger.transition(originalKey, "unknown_effect", { effectState: "unknown_effect" });
+      const before = structuredClone(h.broker.taskLedger.get(originalKey));
+      const close = await h.client.request("session.close", { sessionId: h.session.sessionId,
+        taskTerminal: true, abandonUserHelp: abandon });
+      assert.equal(h.liveTabs.has(tab.id), !abandon);
+      assert.equal(close.cleanup_receipt.closed.includes(tab.id), abandon);
+      assert.equal(h.commands.some(c => ["page.click", "page.submit", "page.type"].includes(c.method)), false);
+      assert.deepEqual(h.broker.taskLedger.get(originalKey), before);
+    } finally { await h.close(); }
+  }
+});
+
 async function createCapsuleHarness({ failVisualInspectionFor = null, failPostTypeReadback = false, uploadBehavior = null, postCaptureBehavior = null, semanticGuards = false, interceptCommand = null } = {}) {
   const dataDir = await mkdtemp(join(tmpdir(), "aos-companion-capsule-integration-"));
   const issuerSecret = "capsule-integration-issuer";
