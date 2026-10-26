@@ -8,6 +8,17 @@ const GROUPS = [
   // Greenhouse moved its hosted job boards: boards.greenhouse.io answers 301 to job-boards.greenhouse.io
   // (2026-10-18, a Datadog application stopped as target_origin_mismatch).
   ["https://boards.greenhouse.io", "https://job-boards.greenhouse.io"],
+  // 2026-10-26 オーナー承認（AOS docs/companion-origin-table-2026-10-26.md の2〜8）。同じ会社・同じサービスの別ドメインだけ。
+  // Google・Slack のワークスペース・Workday の会社ごとの区画・別の会社のサイトは入れない（手順書で宣言する）。
+  ["https://access.line.me", "https://chat.line.me", "https://line.me", "https://web.line.me", "https://chat.line.biz", "https://manager.line.biz", "https://account.line.biz"],
+  ["https://career.levtech.jp", "https://auth.levtech.jp", "https://mypage.levtech.jp"],
+  ["https://next.rikunabi.com", "https://rikunabi-next.yahoo.co.jp"],
+  ["https://www.linkedin.com", "https://linkedin.com", "https://jp.linkedin.com", "https://lnkd.in"],
+  ["https://www.facebook.com", "https://facebook.com", "https://business.facebook.com"],
+  ["https://www.hays.co.jp", "https://m.hays.co.jp"],
+  ["https://www.turing.com", "https://work.turing.com"],
+  ["https://tiktok.com", "https://www.tiktok.com"],
+  ["https://careerengine.jp", "https://www.careerengine.jp"],
 ];
 export const SITE_ALIAS_GROUPS = GROUPS;
 const MAX_ORIGINS = 32;

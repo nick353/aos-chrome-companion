@@ -32,3 +32,38 @@ test('the extension keeps the same alias groups and accepts only a member of the
   assert.equal(sameSiteOrigin('https://www.etsy.com', 'https://evil.example'), false);
   assert.ok(withSiteAliases(['https://boards.greenhouse.io']).includes('https://job-boards.greenhouse.io'));
 });
+
+// 2026-10-26 オーナー承認の別名グループ。同じサービスの別ドメインだけで、他は増えない。
+test('the approved service groups allow their own names and nothing else', () => {
+  assert.ok(withSiteAliases(['https://access.line.me']).includes('https://manager.line.biz'));
+  assert.ok(withSiteAliases(['https://career.levtech.jp']).includes('https://auth.levtech.jp'));
+  assert.ok(withSiteAliases(['https://next.rikunabi.com']).includes('https://rikunabi-next.yahoo.co.jp'));
+  assert.ok(withSiteAliases(['https://www.linkedin.com']).includes('https://lnkd.in'));
+  assert.ok(withSiteAliases(['https://www.facebook.com']).includes('https://business.facebook.com'));
+  assert.ok(withSiteAliases(['https://www.hays.co.jp']).includes('https://m.hays.co.jp'));
+  assert.ok(withSiteAliases(['https://work.turing.com']).includes('https://www.turing.com'));
+  assert.ok(withSiteAliases(['https://tiktok.com']).includes('https://www.tiktok.com'));
+  assert.ok(withSiteAliases(['https://careerengine.jp']).includes('https://www.careerengine.jp'));
+  // 入れていないもの: 別の会社、Google のログイン、Slack のワークスペース、Workday の別の区画、似せたドメイン。
+  for (const [one, other] of [
+    ['https://career.levtech.jp', 'https://accounts.google.com'],
+    ['https://next.rikunabi.com', 'https://login.yahoo.co.jp'],
+    ['https://www.hays.co.jp', 'https://www.jac-recruitment.jp'],
+    ['https://app.slack.com', 'https://api.slack.com'],
+    ['https://trendmicro.wd3.myworkdayjobs.com', 'https://wd3.myworkdayjobs.com'],
+    ['https://line.me', 'https://line.me.evil.example'],
+    ['https://www.linkedin.com', 'https://linkedin.evil.example'],
+  ]) assert.ok(!withSiteAliases([one]).includes(other), `${one} must not allow ${other}`);
+});
+
+test('the extension copy knows the approved groups and still rejects other origins', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const vm = await import('node:vm');
+  const source = await readFile(new URL('../extension/service-worker.js', import.meta.url), 'utf8');
+  const block = source.slice(source.indexOf('const SITE_ALIAS_GROUPS = ['), source.indexOf('async function assertLiveOrigin('));
+  const { sameSiteOrigin } = vm.runInNewContext(`${block}\n({ sameSiteOrigin })`, {});
+  assert.equal(sameSiteOrigin('https://career.levtech.jp', 'https://auth.levtech.jp'), true);
+  assert.equal(sameSiteOrigin('https://access.line.me', 'https://chat.line.biz'), true);
+  assert.equal(sameSiteOrigin('https://career.levtech.jp', 'https://accounts.google.com'), false);
+  assert.equal(sameSiteOrigin('https://www.hays.co.jp', 'https://www.jac-recruitment.jp'), false);
+});
