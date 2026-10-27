@@ -770,6 +770,10 @@ const SITE_ALIAS_GROUPS = [
   ["https://www.turing.com", "https://work.turing.com"],
   ["https://tiktok.com", "https://www.tiktok.com"],
   ["https://careerengine.jp", "https://www.careerengine.jp"],
+  // 2026-10-27 手入れ: Indeed の応募の流れは jp.indeed.com から cts.indeed.com へ実際に移る
+  // （本番の実行 ses_e860867b7ffeQJedR4yLloEOiH が jp/secure/myjobs だけを宣言し、cts.indeed.com に
+  // 着いて target_origin_mismatch で17回止まった）。同じサービスの別ドメインなので同じ組にする。
+  ["https://jp.indeed.com", "https://www.indeed.com", "https://secure.indeed.com", "https://myjobs.indeed.com", "https://profile.indeed.com", "https://cts.indeed.com"],
 ];
 
 function sameSiteOrigin(expected, actual) {

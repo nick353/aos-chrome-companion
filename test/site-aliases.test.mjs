@@ -44,6 +44,10 @@ test('the approved service groups allow their own names and nothing else', () =>
   assert.ok(withSiteAliases(['https://work.turing.com']).includes('https://www.turing.com'));
   assert.ok(withSiteAliases(['https://tiktok.com']).includes('https://www.tiktok.com'));
   assert.ok(withSiteAliases(['https://careerengine.jp']).includes('https://www.careerengine.jp'));
+  // 2026-10-27: Indeed の応募の流れで実際に着いた cts.indeed.com（17回止まった）を同じ組にした。
+  assert.ok(withSiteAliases(['https://jp.indeed.com']).includes('https://cts.indeed.com'));
+  assert.ok(withSiteAliases(['https://secure.indeed.com']).includes('https://jp.indeed.com'));
+  assert.ok(!withSiteAliases(['https://jp.indeed.com']).includes('https://www.indeed.com.evil.example'));
   // 入れていないもの: 別の会社、Google のログイン、Slack のワークスペース、Workday の別の区画、似せたドメイン。
   for (const [one, other] of [
     ['https://career.levtech.jp', 'https://accounts.google.com'],
