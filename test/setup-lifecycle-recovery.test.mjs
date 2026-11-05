@@ -5,7 +5,7 @@ import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import test from "node:test";
+import test, { after } from "node:test";
 import { acquireCompanionLock, releaseCompanionLock } from "../src/setup/auto-setup.mjs";
 import { companionLockTransaction } from "../src/setup/lock-transaction.mjs";
 
@@ -13,6 +13,9 @@ const api = new URL("../src/setup/auto-setup.mjs", import.meta.url).href;
 const helper = fileURLToPath(new URL("../src/setup/lock-transaction.pl", import.meta.url));
 const token = "12345678-1234-1234-1234-123456789abc";
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+// 試験が落ちたあと子が残ると、このファイルの実行が終わらず全体が止まる（2026-11-05 33分止まった）。
+const children = new Set();
+after(() => { for (const child of children) child.kill("SIGKILL"); });
 async function fixture(run) {
   const root = await realpath(await mkdtemp(join(tmpdir(), "setup-kernel-lifecycle-")));
   try { await run(join(root, "setup.lock"), root); } finally { await rm(root, { recursive: true, force: true }); }
@@ -47,8 +50,7 @@ function actor(path, phase, action = "acquire") {
     const result=action==='release'?await releaseCompanionLock(lease,hook):lease;
     console.log(JSON.stringify({result,pid:process.pid}));setInterval(()=>{},1000);`;
   const child = spawn(process.execPath, ["--input-type=module", "-e", code, path, phase, action], { stdio: ["ignore", "pipe", "pipe"] });
-  // 試験が落ちたあと子が残ると、このファイルの実行が終わらず全体が止まる（2026-11-05 33分止まった）。
-  child.unref(); child.stdout.unref?.(); child.stderr.unref?.();
+  children.add(child);
   child.stderr.on("data", () => {});
   return { child, read: reader(child) };
 }
