@@ -13,6 +13,9 @@ const GROUPS = [
   ["https://access.line.me", "https://chat.line.me", "https://line.me", "https://web.line.me", "https://chat.line.biz", "https://manager.line.biz", "https://account.line.biz"],
   ["https://career.levtech.jp", "https://auth.levtech.jp", "https://mypage.levtech.jp"],
   ["https://next.rikunabi.com", "https://rikunabi-next.yahoo.co.jp"],
+  // 2026-11-05: 実際の転送で確かめた分だけ足す。リクルートの ID のログイン（directscout から id・accounts・auth.r-recruit・point へ。
+  // 7日で19回止まった）。Indeed の応募フォーム（jp.indeed.com から smartapply へ。3日で6回止まった）。
+  ["https://directscout.recruit.co.jp", "https://id.recruit.co.jp", "https://accounts.recruit.co.jp", "https://auth.r-recruit.jp", "https://point.recruit.co.jp"],
   ["https://www.linkedin.com", "https://linkedin.com", "https://jp.linkedin.com", "https://lnkd.in"],
   ["https://www.facebook.com", "https://facebook.com", "https://business.facebook.com"],
   ["https://www.hays.co.jp", "https://m.hays.co.jp"],
@@ -22,7 +25,7 @@ const GROUPS = [
   // 2026-10-27 手入れ: Indeed の応募の流れは jp.indeed.com から cts.indeed.com へ実際に移る
   // （本番の実行 ses_e860867b7ffeQJedR4yLloEOiH が jp/secure/myjobs だけを宣言し、cts.indeed.com に
   // 着いて target_origin_mismatch で17回止まった）。同じサービスの別ドメインなので同じ組にする。
-  ["https://jp.indeed.com", "https://www.indeed.com", "https://secure.indeed.com", "https://myjobs.indeed.com", "https://profile.indeed.com", "https://cts.indeed.com"],
+  ["https://jp.indeed.com", "https://www.indeed.com", "https://secure.indeed.com", "https://myjobs.indeed.com", "https://profile.indeed.com", "https://cts.indeed.com", "https://smartapply.indeed.com"],
 ];
 export const SITE_ALIAS_GROUPS = GROUPS;
 const MAX_ORIGINS = 32;

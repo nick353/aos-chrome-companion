@@ -764,6 +764,9 @@ const SITE_ALIAS_GROUPS = [
   ["https://access.line.me", "https://chat.line.me", "https://line.me", "https://web.line.me", "https://chat.line.biz", "https://manager.line.biz", "https://account.line.biz"],
   ["https://career.levtech.jp", "https://auth.levtech.jp", "https://mypage.levtech.jp"],
   ["https://next.rikunabi.com", "https://rikunabi-next.yahoo.co.jp"],
+  // 2026-11-05: 実際の転送で確かめた分だけ足す。リクルートの ID のログイン（directscout から id・accounts・auth.r-recruit・point へ。
+  // 7日で19回止まった）。Indeed の応募フォーム（jp.indeed.com から smartapply へ。3日で6回止まった）。
+  ["https://directscout.recruit.co.jp", "https://id.recruit.co.jp", "https://accounts.recruit.co.jp", "https://auth.r-recruit.jp", "https://point.recruit.co.jp"],
   ["https://www.linkedin.com", "https://linkedin.com", "https://jp.linkedin.com", "https://lnkd.in"],
   ["https://www.facebook.com", "https://facebook.com", "https://business.facebook.com"],
   ["https://www.hays.co.jp", "https://m.hays.co.jp"],
@@ -773,7 +776,7 @@ const SITE_ALIAS_GROUPS = [
   // 2026-10-27 手入れ: Indeed の応募の流れは jp.indeed.com から cts.indeed.com へ実際に移る
   // （本番の実行 ses_e860867b7ffeQJedR4yLloEOiH が jp/secure/myjobs だけを宣言し、cts.indeed.com に
   // 着いて target_origin_mismatch で17回止まった）。同じサービスの別ドメインなので同じ組にする。
-  ["https://jp.indeed.com", "https://www.indeed.com", "https://secure.indeed.com", "https://myjobs.indeed.com", "https://profile.indeed.com", "https://cts.indeed.com"],
+  ["https://jp.indeed.com", "https://www.indeed.com", "https://secure.indeed.com", "https://myjobs.indeed.com", "https://profile.indeed.com", "https://cts.indeed.com", "https://smartapply.indeed.com"],
 ];
 
 function sameSiteOrigin(expected, actual) {
@@ -783,6 +786,15 @@ function sameSiteOrigin(expected, actual) {
 function allowedOriginsOf(value) {
   if (!Array.isArray(value) || value.length === 0) return null;
   return new Set(value.map((entry) => originOf(entry)).filter(Boolean));
+}
+
+// tabs.navigate only: the tab leaves one site and arrives at another, so one targetOrigin cannot match both ends.
+// Both ends must still be inside the signed allowlist; only the targetOrigin comparison is skipped for the end the
+// caller named by URL (2026-11-05: 24 of 27 cross-site navigations in 3 days stopped with target_origin_mismatch,
+// before leaving when targetOrigin was the destination, after arriving when it was the source).
+function navigationCheckParams(params) {
+  const { targetOrigin: _skipped, ...rest } = params;
+  return rest;
 }
 
 async function assertLiveOrigin(tabId, params, { allowBlank = false } = {}) {
@@ -1908,6 +1920,7 @@ async function runTrustedVisualInput(tabId, method, params) {
         throw companionError(error?.code ?? "visual_target_proof_stale_geometry", error?.message ?? "The click target cannot be verified after activation", {
           operationEffectState: "none", mutationDispatchAttempted: false,
           ...(overlayDismissal ? { overlayDismissal } : {}),
+          ...(error?.details?.coveredBy ? { coveredBy: error.details.coveredBy } : {}),
         });
       }
       if (sameElementMode) {
@@ -2467,9 +2480,10 @@ async function executeCommand(method, params) {
       return sanitizeTab(activated);
     }
     case "tabs.navigate": {
-      await assertLiveOrigin(requireTabId(params.tabId), params);
       const requestedUrl = requireSafeUrl(params.url);
       const requestedOrigin = originOf(requestedUrl);
+      await assertLiveOrigin(requireTabId(params.tabId),
+        sameSiteOrigin(params.targetOrigin, requestedOrigin) ? navigationCheckParams(params) : params);
       const allowed = allowedOriginsOf(params.allowedOrigins);
       if (params.mutation && (!allowed || !allowed.has(requestedOrigin))) throw companionError("target_origin_not_allowed", "Navigation target origin is not allowlisted");
       const before = await chrome.tabs.get(requireTabId(params.tabId));
@@ -2485,7 +2499,8 @@ async function executeCommand(method, params) {
       }), Math.max(1, deadline - Date.now()), "navigation_commit_timeout", "Timed out waiting for navigation commit");
       const committed = await waitForCommittedTab(tab.id, { requestedUrl, previousUrl, previousDocumentId: previousDocument.documentId, fragmentRequestedUrl,
         expectedWindowId: before.windowId, allowedOrigins: params.allowedOrigins, deadline });
-      if (params.mutation) await assertLiveOrigin(committed.id, params);
+      if (params.mutation) await assertLiveOrigin(committed.id,
+        sameSiteOrigin(requestedOrigin, originOf(committed.url)) ? navigationCheckParams(params) : params);
       return sanitizeTab(committed);
     }
     case "tabs.back": {
@@ -4825,7 +4840,14 @@ async function injectedPageOperation(action, payload) {
     if (payload.requireHitOwner === true) {
       const owned = hitOwnedPoint(element, clipped);
       if (!owned) {
-        throw operationError("visual_target_not_at_point", "The inspected point is covered by another element");
+        // Name what is on top so the caller can close or scroll past it instead of retrying the same point.
+        const cover = document.elementFromPoint?.(point.x, point.y);
+        throw operationError("visual_target_not_at_point", "The inspected point is covered by another element", cover?.getAttribute ? {
+          coveredBy: {
+            tag: cover.tagName.toLowerCase(), role: cover.getAttribute("role"),
+            name: String(cover.getAttribute("aria-label") ?? cover.textContent ?? "").replace(/\s+/gu, " ").trim().slice(0, 80),
+          },
+        } : {});
       }
       if (owned.x !== point.x || owned.y !== point.y) {
         point = owned;
@@ -5063,7 +5085,13 @@ async function injectedPageOperation(action, payload) {
     await visualize(element, requested ? "check" : "uncheck");
     const before = element instanceof HTMLInputElement ? element.checked : element.getAttribute("aria-checked") === "true";
     if (before !== requested) activateControl(element);
-    const after = element instanceof HTMLInputElement ? element.checked : element.getAttribute("aria-checked") === "true";
+    const readChecked = () => element instanceof HTMLInputElement ? element.checked : element.getAttribute("aria-checked") === "true";
+    // Controlled inputs (doda: 20 stops) re-render after the click, so one synchronous read saw the old value.
+    let after = readChecked();
+    for (let waited = 0; after !== requested && waited < 1000; waited += 100) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      after = readChecked();
+    }
     if (after !== requested) {
       throw operationError("checked_state_not_committed", "The control did not retain the requested checked state", { before, requested, after });
     }
@@ -6053,7 +6081,9 @@ async function injectedPageOperation(action, payload) {
   if (action === "type") {
     const element = payload.locator ? find(payload.locator) : targetOrActive(null, { allowBody: false });
     if (!(element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement || element instanceof HTMLSelectElement || element.isContentEditable)) {
-      throw new Error("Matched element does not accept text input");
+      // Nothing was typed: the check runs before focus, so this must not leave an unknown effect to reconcile.
+      throw operationError("text_input_required", "Matched element does not accept text input",
+        { operationEffectState: "none", mutationDispatchAttempted: false });
     }
     // page.type replaces a field; it does not replace a page.selectText range.
     // Never turn an omitted clear flag into deletion of an existing document.

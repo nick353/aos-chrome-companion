@@ -47,6 +47,10 @@ test('the approved service groups allow their own names and nothing else', () =>
   // 2026-10-27: Indeed の応募の流れで実際に着いた cts.indeed.com（17回止まった）を同じ組にした。
   assert.ok(withSiteAliases(['https://jp.indeed.com']).includes('https://cts.indeed.com'));
   assert.ok(withSiteAliases(['https://secure.indeed.com']).includes('https://jp.indeed.com'));
+  // 2026-11-05: 実際の転送で確かめた分。Indeed の応募フォームとリクルートの ID のログイン。
+  assert.ok(withSiteAliases(['https://jp.indeed.com']).includes('https://smartapply.indeed.com'));
+  assert.ok(withSiteAliases(['https://directscout.recruit.co.jp']).includes('https://id.recruit.co.jp'));
+  assert.ok(!withSiteAliases(['https://directscout.recruit.co.jp']).includes('https://accounts.google.com'));
   assert.ok(!withSiteAliases(['https://jp.indeed.com']).includes('https://www.indeed.com.evil.example'));
   // 入れていないもの: 別の会社、Google のログイン、Slack のワークスペース、Workday の別の区画、似せたドメイン。
   for (const [one, other] of [
