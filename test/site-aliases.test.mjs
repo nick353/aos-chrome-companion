@@ -51,6 +51,7 @@ test('the approved service groups allow their own names and nothing else', () =>
   assert.ok(withSiteAliases(['https://jp.indeed.com']).includes('https://smartapply.indeed.com'));
   assert.ok(withSiteAliases(['https://directscout.recruit.co.jp']).includes('https://id.recruit.co.jp'));
   assert.ok(!withSiteAliases(['https://directscout.recruit.co.jp']).includes('https://accounts.google.com'));
+  assert.ok(withSiteAliases(['https://next.rikunabi.com']).includes('https://id.recruit.co.jp'));
   assert.ok(!withSiteAliases(['https://jp.indeed.com']).includes('https://www.indeed.com.evil.example'));
   // 入れていないもの: 別の会社、Google のログイン、Slack のワークスペース、Workday の別の区画、似せたドメイン。
   for (const [one, other] of [

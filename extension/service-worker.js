@@ -763,7 +763,7 @@ const SITE_ALIAS_GROUPS = [
   // Google・Slack のワークスペース・Workday の会社ごとの区画・別の会社のサイトは入れない（手順書で宣言する）。
   ["https://access.line.me", "https://chat.line.me", "https://line.me", "https://web.line.me", "https://chat.line.biz", "https://manager.line.biz", "https://account.line.biz"],
   ["https://career.levtech.jp", "https://auth.levtech.jp", "https://mypage.levtech.jp"],
-  ["https://next.rikunabi.com", "https://rikunabi-next.yahoo.co.jp"],
+  ["https://next.rikunabi.com", "https://rikunabi-next.yahoo.co.jp", "https://id.recruit.co.jp", "https://point.recruit.co.jp"],
   // 2026-11-05: 実際の転送で確かめた分だけ足す。リクルートの ID のログイン（directscout から id・accounts・auth.r-recruit・point へ。
   // 7日で19回止まった）。Indeed の応募フォーム（jp.indeed.com から smartapply へ。3日で6回止まった）。
   ["https://directscout.recruit.co.jp", "https://id.recruit.co.jp", "https://accounts.recruit.co.jp", "https://auth.r-recruit.jp", "https://point.recruit.co.jp"],
