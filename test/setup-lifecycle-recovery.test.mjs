@@ -29,7 +29,7 @@ function reader(child) {
   });
   return predicate => new Promise((resolve, reject) => {
     const found = messages.find(predicate); if (found) return resolve(found);
-    const waiter = { predicate, resolve, timer: setTimeout(() => reject(Error("fixture child message timeout")), 4000) }; waiters.push(waiter);
+    const waiter = { predicate, resolve, timer: setTimeout(() => reject(Error("fixture child message timeout")), 20000) }; waiters.push(waiter);
   });
 }
 async function dead(pid) {
@@ -47,6 +47,8 @@ function actor(path, phase, action = "acquire") {
     const result=action==='release'?await releaseCompanionLock(lease,hook):lease;
     console.log(JSON.stringify({result,pid:process.pid}));setInterval(()=>{},1000);`;
   const child = spawn(process.execPath, ["--input-type=module", "-e", code, path, phase, action], { stdio: ["ignore", "pipe", "pipe"] });
+  // 試験が落ちたあと子が残ると、このファイルの実行が終わらず全体が止まる（2026-11-05 33分止まった）。
+  child.unref(); child.stdout.unref?.(); child.stderr.unref?.();
   child.stderr.on("data", () => {});
   return { child, read: reader(child) };
 }
@@ -240,7 +242,7 @@ test("parent EOF terminates the helper before work creation; coordinator replace
 }));
 
 test("ambiguous wait timeout kills one helper and returns exact marker reconciliation", async () => fixture(async path => {
-  const result = await acquireCompanionLock(path, { testPauseAt: "after_work", onPhase: () => new Promise(() => {}), transactionTimeoutMs: 500 });
+  const result = await acquireCompanionLock(path, { testPauseAt: "after_work", onPhase: () => new Promise(() => {}), transactionTimeoutMs: 3000 }); // 500ms だと負荷が高いとき子の起動に間に合わず落ちた（2026-11-05）
   assert.equal(result.acquired, true); assert.equal(result.originalCommitRecovered,true); assert.equal(result.retryAllowed, false); assert.equal(result.reconciliation.workTokenMatches, true);
   assert.equal((await releaseCompanionLock(result)).released, true);
 }));
